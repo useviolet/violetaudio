@@ -205,9 +205,9 @@ Register as a miner or validator on the subnet:
 btcli subnet register --netuid 49 --subtensor.network finney --wallet.name <your_wallet_name> --wallet.hotkey default
 ```
 
-**Testnet (NetUID 424):**
+**Testnet (NetUID 292):**
 ```bash
-btcli subnet register --netuid 424 --subtensor.network test --wallet.name <your_wallet_name> --wallet.hotkey default
+btcli subnet register --netuid 292 --subtensor.network test --wallet.name <your_wallet_name> --wallet.hotkey default
 ```
 
 **Note:** Registration requires 0.005 TAO for mainnet or test tokens for testnet.
@@ -244,7 +244,7 @@ export BT_WALLET_NAME=your_wallet_name
 export BT_WALLET_HOTKEY=default
 
 # For testnet
-export BT_NETUID=424         # Testnet subnet ID
+export BT_NETUID=292         # Testnet subnet ID
 export BT_NETWORK=test       # Testnet network
 ```
 
@@ -267,7 +267,7 @@ python neurons/miner.py \
 **Testnet:**
 ```bash
 python neurons/miner.py \
-  --netuid 424 \
+  --netuid 292 \
   --subtensor.network test \
   --wallet.name <your_wallet_name> \
   --wallet.hotkey <your_hotkey> \
@@ -299,7 +299,7 @@ python neurons/validator.py \
 **Testnet:**
 ```bash
 python neurons/validator.py \
-  --netuid 424 \
+  --netuid 292 \
   --subtensor.network test \
   --wallet.name <your_wallet_name> \
   --wallet.hotkey <your_hotkey> \
@@ -315,7 +315,7 @@ python neurons/validator.py \
 | Network | NetUID | Network Name | Registration Cost |
 |---------|--------|--------------|-------------------|
 | Mainnet | 49     | finney       | 0.005 TAO         |
-| Testnet | 424    | test         | 0.005 test tokens |
+| Testnet | 292    | test         | 0.005 test tokens |
 
 
 

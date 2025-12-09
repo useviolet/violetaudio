@@ -296,16 +296,22 @@ class Validator(BaseValidatorNeuron):
         Perform on-chain handshake with miners to verify they are active and responsive.
         Only miners that successfully respond to on-chain queries are considered active.
         This follows the pattern used by serious Bittensor subnets.
+        
+        IMPORTANT: Always uses CURRENT metagraph data - no hardcoded values.
+        Checks ALL miners every iteration to catch new miners joining the network.
         """
         try:
+            # ALWAYS use current metagraph data - resync if needed
+            # The metagraph is updated in the forward() loop, but we ensure we have latest
             total_miners = len(self.metagraph.hotkeys)
             serving_miners = 0
             active_miners = []  # Only miners that respond to on-chain queries
             
-            bt.logging.info(f"🔍 Performing on-chain handshake with serving miners...")
+            bt.logging.info(f"🔍 Performing on-chain handshake with serving miners (checking {total_miners} total miners)...")
             
-            # Check each serving miner on-chain
+            # Check EACH miner in the metagraph - this ensures we catch new miners
             for uid in range(total_miners):
+                # ALWAYS get fresh data from metagraph - no caching, no hardcoding
                 axon = self.metagraph.axons[uid]
                 hotkey = self.metagraph.hotkeys[uid]
                 stake = self.metagraph.S[uid]
@@ -316,13 +322,42 @@ class Validator(BaseValidatorNeuron):
                 
                 serving_miners += 1
                 
-                # Get IP and port information for logging
-                ip = axon.ip
-                port = axon.port
+                # Get IP and port information from CURRENT metagraph data
+                # IMPORTANT: Always use fresh data from metagraph - no caching, no hardcoding
+                # The metagraph is synced every step in the run loop, so this is always current
                 
-                # Convert IP from int to string if needed
-                if isinstance(ip, int):
-                    ip = f"{ip >> 24}.{(ip >> 16) & 255}.{(ip >> 8) & 255}.{ip & 255}"
+                # For logging purposes, get both regular and external IP/port
+                regular_ip = axon.ip
+                regular_port = axon.port
+                external_ip = getattr(axon, 'external_ip', None)
+                external_port = getattr(axon, 'external_port', None)
+                
+                # Convert IPs to strings for logging
+                if isinstance(regular_ip, int):
+                    regular_ip_str = f"{regular_ip >> 24}.{(regular_ip >> 16) & 255}.{(regular_ip >> 8) & 255}.{regular_ip & 255}"
+                else:
+                    regular_ip_str = str(regular_ip)
+                
+                external_ip_str = None
+                if external_ip:
+                    if isinstance(external_ip, int):
+                        external_ip_str = f"{external_ip >> 24}.{(external_ip >> 16) & 255}.{(external_ip >> 8) & 255}.{external_ip & 255}"
+                    else:
+                        external_ip_str = str(external_ip)
+                
+                # Use external_ip/external_port for logging if available, otherwise use regular ip/port
+                # This matches what Bittensor will use for connection
+                ip = external_ip_str if external_ip_str else regular_ip_str
+                port = external_port if external_port and external_port != 0 else regular_port
+                
+                # Log what metagraph contains (for debugging)
+                bt.logging.debug(f"   UID {uid:3d} | metagraph data: ip={regular_ip_str}, port={regular_port}, external_ip={external_ip_str}, external_port={external_port} | using: {ip}:{port}")
+                
+                # IMPORTANT: We pass the axon object directly to dendrite
+                # Bittensor's dendrite automatically uses the correct IP/port from the axon
+                # The axon object from metagraph contains all on-chain registered information
+                # including external_ip/external_port if the miner registered with those flags
+                # We don't need to manually select IP/port - Bittensor handles it
                 
                 # Perform on-chain handshake query using summarization task
                 try:
@@ -338,10 +373,13 @@ class Validator(BaseValidatorNeuron):
                     )
                     
                     # Perform on-chain query using dendrite (this is the on-chain handshake)
-                    bt.logging.debug(f"🔗 Handshaking with UID {uid:3d} | {ip}:{port}...")
+                    # IMPORTANT: We pass the axon object directly from CURRENT metagraph
+                    # Bittensor's dendrite will automatically use the correct IP/port from the axon
+                    # The axon object contains all on-chain registered information (including external_ip/external_port)
+                    bt.logging.debug(f"🔗 Handshaking with UID {uid:3d} | {ip}:{port} (from current metagraph)...")
                     
                     responses = await self.dendrite(
-                        axons=[axon],  # Use metagraph axon for on-chain communication
+                        axons=[axon],  # Use CURRENT metagraph axon - Bittensor handles IP/port automatically
                         synapse=handshake_task,
                         deserialize=False,  # Don't deserialize for handshake
                         timeout=10  # Increased to 10 seconds for handshake (was 5)

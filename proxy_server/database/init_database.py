@@ -90,29 +90,9 @@ class DatabaseInitializer:
         """Create sample data for testing and development"""
         print("🧪 Creating sample data...")
         
-        # Create sample miner
-        sample_miner = {
-            'uid': 48,
-            'hotkey': "5Gxwzb9gKBCE2a4Qb6VDfUSabKMRZt9nUWAsw",
-            'ip': "102.134.149.117",
-            'port': 8091,
-            'external_ip': "102.134.149.117",
-            'external_port': 8091,
-            'is_serving': True,
-            'stake': 1000.0,
-            'performance_score': 0.85,
-            'current_load': 0,
-            'max_capacity': 5,
-            'last_seen': datetime.now(),
-            'task_type_specialization': 'transcription,tts,summarization',
-            'reported_by_validators': ['validator_48'],
-            'updated_at': datetime.now()
-        }
-        
-        # Save sample miner
-        miner_ref = self.db.collection(COLLECTIONS['miner_status']).document(str(sample_miner['uid']))
-        miner_ref.set(sample_miner)
-        print(f"✅ Sample miner {sample_miner['uid']} created")
+        # NOTE: Sample miner creation removed - miners should be registered dynamically by validators
+        # No hardcoded miners should be created during initialization
+        print("ℹ️  Skipping sample miner creation - miners should be registered by validators")
         
         # Create sample file reference using existing real file
         sample_file = {
@@ -190,12 +170,13 @@ class DatabaseInitializer:
         
         # Check sample data
         try:
-            # Check miner
-            miner_doc = self.db.collection(COLLECTIONS['miner_status']).document('48').get()
-            if miner_doc.exists:
-                print(f"✅ Sample miner 48 verified")
+            # Check if any miners exist (but don't require specific miner 48)
+            miners = self.db.collection(COLLECTIONS['miner_status']).limit(1).stream()
+            miner_count = len(list(miners))
+            if miner_count > 0:
+                print(f"✅ Found {miner_count} miner(s) in database")
             else:
-                print(f"❌ Sample miner 48 not found")
+                print(f"ℹ️  No miners found (will be populated by validators)")
             
             # Check task
             task_doc = self.db.collection(COLLECTIONS['tasks']).document('sample_task_001').get()
@@ -214,7 +195,6 @@ class DatabaseInitializer:
         try:
             # Remove sample documents
             collections_to_clean = [
-                (COLLECTIONS['miner_status'], '48'),
                 (COLLECTIONS['tasks'], 'sample_task_001'),
                 (COLLECTIONS['assignments'], 'sample_task_001_48'),
                 (COLLECTIONS['files'], '7290cb3e-3c5c-4b53-8e49-c182e3357f5d')

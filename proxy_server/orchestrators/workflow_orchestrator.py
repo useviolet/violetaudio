@@ -33,6 +33,7 @@ class WorkflowOrchestrator:
         asyncio.create_task(self.miner_monitoring_loop())
         asyncio.create_task(self.workflow_status_monitoring())
         asyncio.create_task(self.cleanup_old_tasks())
+        asyncio.create_task(self.cleanup_stale_miners_loop())  # Clean up inactive miners
         
         print("✅ Workflow orchestration started successfully")
     
@@ -303,6 +304,77 @@ class WorkflowOrchestrator:
                 await asyncio.sleep(3600)
         
         print("🧹 Cleanup loop stopped")
+    
+    async def cleanup_stale_miners_loop(self):
+        """Periodically clean up stale/inactive miners from the database"""
+        print("🧹 Starting stale miner cleanup loop...")
+        
+        while self.running:
+            try:
+                current_time = datetime.utcnow()
+                miner_timeout = 900  # 15 minutes
+                
+                # Get all miners from database
+                miner_status_collection = self.db.collection('miner_status')
+                docs = miner_status_collection.stream()
+                
+                stale_miners = []
+                for doc in docs:
+                    miner_data = doc.to_dict()
+                    last_seen = miner_data.get('last_seen')
+                    miner_uid = miner_data.get('uid')
+                    
+                    if not last_seen:
+                        # No last_seen timestamp - mark as stale
+                        stale_miners.append((doc.id, miner_uid, 'No last_seen timestamp'))
+                        continue
+                    
+                    # Handle different timestamp formats
+                    try:
+                        if isinstance(last_seen, datetime):
+                            time_diff = (current_time - last_seen).total_seconds()
+                        elif hasattr(last_seen, 'timestamp'):  # Firestore Timestamp
+                            time_diff = (current_time.timestamp() - last_seen.timestamp())
+                        elif isinstance(last_seen, str):
+                            from dateutil import parser
+                            last_seen_dt = parser.parse(last_seen)
+                            time_diff = (current_time - last_seen_dt.replace(tzinfo=None)).total_seconds()
+                        else:
+                            # Unknown format - mark as stale
+                            stale_miners.append((doc.id, miner_uid, f'Unknown timestamp format: {type(last_seen)}'))
+                            continue
+                        
+                        # Check if miner is stale (not seen for more than timeout)
+                        if time_diff > miner_timeout:
+                            minutes_ago = time_diff / 60
+                            stale_miners.append((doc.id, miner_uid, f'Last seen {minutes_ago:.1f} minutes ago'))
+                    except Exception as e:
+                        print(f"⚠️  Error checking last_seen for miner {miner_uid}: {e}")
+                        stale_miners.append((doc.id, miner_uid, f'Error parsing timestamp: {e}'))
+                
+                # Remove stale miners from database
+                removed_count = 0
+                for miner_id, miner_uid, reason in stale_miners:
+                    try:
+                        miner_status_collection.document(miner_id).delete()
+                        print(f"🗑️  Removed stale miner UID {miner_uid} ({reason})")
+                        removed_count += 1
+                    except Exception as e:
+                        print(f"⚠️  Error removing stale miner {miner_uid}: {e}")
+                
+                if removed_count > 0:
+                    print(f"🧹 Cleaned up {removed_count} stale miners")
+                elif stale_miners:
+                    print(f"⚠️  Found {len(stale_miners)} stale miners but failed to remove them")
+                
+                # Run cleanup every 5 minutes
+                await asyncio.sleep(300)
+                
+            except Exception as e:
+                print(f"❌ Error in stale miner cleanup loop: {e}")
+                await asyncio.sleep(300)
+        
+        print("🧹 Stale miner cleanup loop stopped")
     
     async def get_old_completed_tasks(self, cutoff_date: datetime) -> List[Dict]:
         """Get old completed tasks for cleanup"""

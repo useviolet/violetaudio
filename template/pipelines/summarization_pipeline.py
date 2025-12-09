@@ -22,13 +22,33 @@ class SummarizationPipeline:
         Args:
             model_name: HuggingFace model name for summarization
         """
+        import time
+        start_time = time.time()
+        
         self.model_name = model_name
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
-        # Load model and tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-        self.model.to(self.device)
+        print(f"🔄 Loading summarization model: {model_name} on {self.device}...")
+        
+        try:
+            # Load tokenizer first (faster)
+            print(f"   Loading tokenizer...")
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            print(f"   ✅ Tokenizer loaded")
+            
+            # Load model (slower, may download if not cached)
+            print(f"   Loading model (this may take a while on first run)...")
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+            self.model.to(self.device)
+            print(f"   ✅ Model loaded and moved to {self.device}")
+            
+            load_time = time.time() - start_time
+            print(f"✅ Summarization pipeline initialized in {load_time:.2f}s")
+        except Exception as e:
+            print(f"❌ Failed to load summarization model: {e}")
+            import traceback
+            print(f"   Traceback: {traceback.format_exc()}")
+            raise
         
         # Language code mapping
         self.language_codes = {

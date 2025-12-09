@@ -6,6 +6,8 @@
 import time
 import json
 import asyncio
+import os
+import shutil
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 from collections import defaultdict, deque
@@ -164,35 +166,137 @@ class MinerTracker:
         self.load_metrics()
     
     def load_metrics(self):
-        """Load miner metrics from file"""
+        """Load miner metrics from file with robust error handling"""
         try:
+            # Check if file exists and is readable
+            if not os.path.exists(self.metrics_file):
+                bt.logging.info("📁 No existing metrics file found, starting fresh")
+                return
+            
+            # Check file size - if too small or empty, skip
+            if os.path.getsize(self.metrics_file) < 10:
+                bt.logging.info("📁 Metrics file is empty or too small, starting fresh")
+                return
+            
             with open(self.metrics_file, 'r') as f:
-                data = json.load(f)
+                content = f.read().strip()
+                
+                # Check if file is empty or just whitespace
+                if not content:
+                    bt.logging.info("📁 Metrics file is empty, starting fresh")
+                    return
+                
+                # Try to parse JSON
+                try:
+                    data = json.loads(content)
+                except json.JSONDecodeError as json_err:
+                    # Log at debug level since we're handling it gracefully
+                    bt.logging.debug(
+                        f"Corrupted metrics file detected (JSON error at line {json_err.lineno}): {json_err.msg}"
+                    )
+                    bt.logging.info(f"📁 Corrupted metrics file detected, backing up and starting fresh")
+                    # Backup corrupted file
+                    backup_file = f"{self.metrics_file}.corrupted.{int(time.time())}"
+                    try:
+                        os.rename(self.metrics_file, backup_file)
+                        bt.logging.debug(f"   Corrupted file backed up to: {backup_file}")
+                    except Exception as backup_err:
+                        # If rename fails, try to delete the corrupted file
+                        try:
+                            os.remove(self.metrics_file)
+                            bt.logging.debug(f"   Deleted corrupted file (backup failed)")
+                        except:
+                            pass
+                    return
+                
+                # Validate data structure
+                if not isinstance(data, dict):
+                    bt.logging.warning(f"⚠️  Invalid metrics file format, expected dict, got {type(data)}")
+                    return
+                
+                # Load miner data
+                loaded_count = 0
                 for uid_str, miner_data in data.items():
-                    uid = int(uid_str)
-                    miner = MinerMetrics(**miner_data)
-                    # Convert list back to deque
-                    if 'recent_response_times' in miner_data:
-                        miner.recent_response_times = deque(
-                            miner_data['recent_response_times'], 
-                            maxlen=50
-                        )
-                    self.miners[uid] = miner
-            bt.logging.info(f"✅ Loaded metrics for {len(self.miners)} miners")
+                    try:
+                        uid = int(uid_str)
+                        if not isinstance(miner_data, dict):
+                            bt.logging.debug(f"⚠️  Skipping invalid miner data for UID {uid_str}")
+                            continue
+                        
+                        miner = MinerMetrics(**miner_data)
+                        # Convert list back to deque
+                        if 'recent_response_times' in miner_data and isinstance(miner_data['recent_response_times'], list):
+                            miner.recent_response_times = deque(
+                                miner_data['recent_response_times'], 
+                                maxlen=50
+                            )
+                        self.miners[uid] = miner
+                        loaded_count += 1
+                    except Exception as e:
+                        bt.logging.debug(f"⚠️  Skipping invalid miner data for UID {uid_str}: {e}")
+                        continue
+                
+                if loaded_count > 0:
+                    bt.logging.info(f"✅ Loaded metrics for {loaded_count} miners")
+                else:
+                    bt.logging.info("📁 No valid miner data in metrics file, starting fresh")
+                    
         except FileNotFoundError:
             bt.logging.info("📁 No existing metrics file found, starting fresh")
         except Exception as e:
-            bt.logging.warning(f"⚠️  Failed to load metrics: {e}")
+            # Log at info level with clear message that it's being handled
+            bt.logging.info(f"📁 Metrics file issue detected: {e}")
+            bt.logging.info(f"   Starting with fresh metrics file")
+            # Try to backup/delete corrupted file
+            try:
+                if os.path.exists(self.metrics_file):
+                    backup_file = f"{self.metrics_file}.error.{int(time.time())}"
+                    try:
+                        os.rename(self.metrics_file, backup_file)
+                        bt.logging.debug(f"   Error file backed up to: {backup_file}")
+                    except:
+                        # If rename fails, try to delete
+                        try:
+                            os.remove(self.metrics_file)
+                            bt.logging.debug(f"   Deleted corrupted file")
+                        except:
+                            pass
+            except:
+                pass
     
     def save_metrics(self):
-        """Save miner metrics to file"""
+        """Save miner metrics to file with validation"""
         try:
             data = {str(uid): miner.to_dict() for uid, miner in self.miners.items()}
-            with open(self.metrics_file, 'w') as f:
-                json.dump(data, f, indent=2)
+            
+            # Validate data before saving (prevent corruption)
+            try:
+                # Try to serialize to ensure it's valid JSON
+                json_str = json.dumps(data, indent=2)
+                # Try to parse it back to ensure it's valid
+                json.loads(json_str)
+            except Exception as validation_err:
+                bt.logging.error(f"❌ Invalid data structure, skipping save: {validation_err}")
+                return
+            
+            # Write to temporary file first, then rename (atomic write)
+            temp_file = f"{self.metrics_file}.tmp"
+            with open(temp_file, 'w') as f:
+                f.write(json_str)
+            
+            # Atomic rename (prevents corruption if process crashes during write)
+            shutil.move(temp_file, self.metrics_file)
+            
             bt.logging.debug(f"💾 Saved metrics for {len(self.miners)} miners")
         except Exception as e:
             bt.logging.error(f"❌ Failed to save metrics: {e}")
+            # Clean up temp file if it exists
+            try:
+                temp_file = f"{self.metrics_file}.tmp"
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except:
+                pass
     
     def register_miner(self, uid: int, hotkey: str, stake: float):
         """Register a new miner or update existing one"""

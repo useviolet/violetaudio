@@ -405,7 +405,7 @@ async def startup_event():
         global file_manager, task_manager, workflow_orchestrator, validator_api, miner_response_handler
         file_manager = FileManager(db_manager.get_db())
         task_manager = TaskManager(db_manager.get_db())
-        workflow_orchestrator = WorkflowOrchestrator(db_manager.get_db(), task_manager)
+        # Note: workflow_orchestrator will be initialized after miner_status_manager is created
         validator_api = ValidatorIntegrationAPI(db_manager.get_db())
         miner_response_handler = MinerResponseHandler(db_manager.get_db(), task_manager)
         
@@ -424,25 +424,44 @@ async def startup_event():
                 self.miner_status_collection = db.collection('miner_status')
                 self.consensus_collection = db.collection('miner_consensus')
             
-            async def get_available_miners(self):
+            async def get_available_miners(self, task_type=None, min_count=1, max_count=5):
                 """Get real miners from Bittensor network via multi-validator consensus"""
                 try:
                     # First try to get consensus-based miner status
-                    consensus_miners = await self._get_consensus_miners()
+                    consensus_miners = await self._get_consensus_miners(task_type)
                     if consensus_miners:
                         print(f"🔍 Multi-validator consensus: Found {len(consensus_miners)} available miners")
-                        return consensus_miners
+                        # Filter by task type if specified and limit to max_count
+                        filtered_miners = self._filter_miners_by_task_type(consensus_miners, task_type)
+                        return filtered_miners[:max_count]
                     
                     # Fallback to individual validator reports
                     print(f"⚠️ No consensus available, falling back to individual validator reports")
-                    return await self._get_fallback_miners()
+                    fallback_miners = await self._get_fallback_miners(task_type)
+                    filtered_miners = self._filter_miners_by_task_type(fallback_miners, task_type)
+                    return filtered_miners[:max_count]
                     
                 except Exception as e:
                     print(f"❌ Error getting network miners: {e}")
-                    # Final fallback to basic miner info
-                    return [{'uid': 48, 'availability_score': 0.8, 'task_type_specialization': None, 'current_load': 0, 'max_capacity': 5}]
+                    # Return empty list instead of hardcoded miner - let the system handle no miners gracefully
+                    print(f"⚠️  No miners available - returning empty list")
+                    return []
             
-            async def _get_consensus_miners(self):
+            def _filter_miners_by_task_type(self, miners, task_type):
+                """Filter miners by task type specialization if specified"""
+                if not task_type:
+                    return miners
+                
+                filtered = []
+                for miner in miners:
+                    specialization = miner.get('task_type_specialization')
+                    # If miner has no specialization, assume it can handle all tasks
+                    if not specialization or task_type in specialization:
+                        filtered.append(miner)
+                
+                return filtered
+            
+            async def _get_consensus_miners(self, task_type=None):
                 """Get miners based on multi-validator consensus"""
                 try:
                     # Query consensus collection
@@ -500,7 +519,7 @@ async def startup_event():
                     print(f"❌ Error getting consensus miners: {e}")
                     return []
             
-            async def _get_fallback_miners(self):
+            async def _get_fallback_miners(self, task_type=None):
                 """Fallback to individual validator reports"""
                 try:
                     # Query miner status collection (populated by validators)
@@ -556,6 +575,13 @@ async def startup_event():
         app.state.task_distributor = TaskDistributor(
             db_manager.get_db(), 
             task_manager, 
+            app.state.miner_status_manager
+        )
+        
+        # Initialize workflow orchestrator with miner_status_manager
+        workflow_orchestrator = WorkflowOrchestrator(
+            db_manager.get_db(), 
+            task_manager,
             app.state.miner_status_manager
         )
         
@@ -2089,6 +2115,141 @@ async def health_check():
                 "healthy": file_system_healthy,
                 "errors": file_system_errors
             }
+        }
+    
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+@app.get("/api/v1/health")
+async def api_health_check():
+    """API v1 health check endpoint"""
+    try:
+        # Get system metrics
+        metrics = system_metrics.get_metrics()
+        
+        # Check database connectivity
+        db_healthy = True
+        db_errors = []
+        try:
+            if 'db_manager' in globals() and db_manager:
+                # Try a simple database operation
+                test_collection = db_manager.get_db().collection('health_check')
+                # Just check if we can access the database
+                db_healthy = True
+            else:
+                db_healthy = False
+                db_errors.append("Database manager not initialized")
+        except Exception as e:
+            db_healthy = False
+            db_errors.append(f"Database check error: {str(e)}")
+        
+        # Check file system health
+        file_system_healthy = True
+        file_system_errors = []
+        try:
+            if 'file_manager' in globals() and file_manager:
+                storage_stats = await file_manager.get_storage_statistics()
+                if 'error' in storage_stats:
+                    file_system_healthy = False
+                    file_system_errors.append(f"Firebase Cloud Storage error: {storage_stats['error']}")
+            else:
+                file_system_healthy = False
+                file_system_errors.append("File manager not initialized")
+        except Exception as e:
+            file_system_healthy = False
+            file_system_errors.append(f"File system check error: {str(e)}")
+        
+        # Check task manager
+        task_manager_healthy = True
+        task_manager_errors = []
+        try:
+            if 'task_manager' in globals() and task_manager:
+                task_manager_healthy = True
+            else:
+                task_manager_healthy = False
+                task_manager_errors.append("Task manager not initialized")
+        except Exception as e:
+            task_manager_healthy = False
+            task_manager_errors.append(f"Task manager check error: {str(e)}")
+        
+        # Check workflow orchestrator
+        orchestrator_healthy = True
+        orchestrator_errors = []
+        try:
+            if 'workflow_orchestrator' in globals() and workflow_orchestrator:
+                orchestrator_healthy = workflow_orchestrator.running if hasattr(workflow_orchestrator, 'running') else True
+            else:
+                orchestrator_healthy = False
+                orchestrator_errors.append("Workflow orchestrator not initialized")
+        except Exception as e:
+            orchestrator_healthy = False
+            orchestrator_errors.append(f"Orchestrator check error: {str(e)}")
+        
+        # Overall health status
+        overall_healthy = db_healthy and file_system_healthy and task_manager_healthy
+        health_status = "healthy" if overall_healthy else "degraded"
+        
+        # Log health check to wandb
+        if wandb_monitor.initialized:
+            wandb_monitor.log_system_metrics({
+                "health_check": True,
+                "api_health_check": True,
+                "db_healthy": db_healthy,
+                "file_system_healthy": file_system_healthy,
+                "task_manager_healthy": task_manager_healthy,
+                "orchestrator_healthy": orchestrator_healthy,
+                "timestamp": datetime.now().isoformat(),
+                "uptime_seconds": metrics["uptime_seconds"],
+                "total_requests": metrics["total_requests"],
+                "cache_hit_rate": metrics["cache_hit_rate"],
+                "error_rate": metrics["errors"] / max(metrics["total_requests"], 1)
+            })
+        
+        return {
+            "status": health_status,
+            "service": "violet-proxy-server",
+            "version": "1.0.0",
+            "timestamp": datetime.now().isoformat(),
+            "uptime_seconds": metrics["uptime_seconds"],
+            "components": {
+                "database": {
+                    "healthy": db_healthy,
+                    "errors": db_errors
+                },
+                "file_system": {
+                    "healthy": file_system_healthy,
+                    "errors": file_system_errors
+                },
+                "task_manager": {
+                    "healthy": task_manager_healthy,
+                    "errors": task_manager_errors
+                },
+                "workflow_orchestrator": {
+                    "healthy": orchestrator_healthy,
+                    "errors": orchestrator_errors
+                }
+            },
+            "metrics": {
+                "total_requests": metrics["total_requests"],
+                "cache_hit_rate": f"{metrics['cache_hit_rate']:.2%}",
+                "requests_per_second": f"{metrics['requests_per_second']:.2f}",
+                "total_tasks": metrics["total_tasks"],
+                "total_miner_responses": metrics["total_miner_responses"],
+                "errors": metrics["errors"]
+            },
+            "wandb_active": wandb_monitor.initialized
+        }
+    
+    except Exception as e:
+        return {
+            "status": "error",
+            "service": "violet-proxy-server",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
         }
         
     except Exception as e:

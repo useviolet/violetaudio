@@ -588,8 +588,12 @@ async def startup_event():
         print("🔒 Duplicate protection components assigned to app.state")
         print("🌐 Network-aware miner status manager initialized")
         
-        # Start workflow orchestrator
+        # Start workflow orchestrator (includes task distribution loop every 5 seconds)
         await workflow_orchestrator.start_orchestration()
+        
+        # Start TaskDistributor as a backup distribution mechanism (runs every 30 seconds)
+        asyncio.create_task(app.state.task_distributor.start_distribution())
+        print("✅ TaskDistributor polling started (30 second interval)")
         
         # Log system startup to wandb
         if wandb_monitor.initialized:
@@ -3098,10 +3102,15 @@ async def _legacy_miner_status_processing(validator_uid: int, miner_data: List[D
                     
                     # Add timestamp and validator info
                     miner_status['last_updated'] = datetime.now()
+                    miner_status['last_seen'] = datetime.now()  # Ensure last_seen is set for cleanup
                     miner_status['reported_by_validator'] = validator_uid
                     miner_status['epoch'] = epoch
                     
-                    # Store in database
+                    # Ensure uid is set in the document
+                    if 'uid' not in miner_status:
+                        miner_status['uid'] = miner_uid
+                    
+                    # Store in database (use set instead of merge to ensure all fields are present)
                     miner_ref.set(miner_status, merge=True)
                     updated_count += 1
                     
@@ -3136,19 +3145,99 @@ async def _legacy_miner_status_processing(validator_uid: int, miner_data: List[D
 # Add endpoint to get current miner status
 @app.get("/api/v1/miners/network-status")
 async def get_network_miner_status():
-    """Get current miner status from Bittensor network (via validator reports)"""
+    """Get current miner status from Bittensor network (via validator reports) - only shows active miners"""
     try:
+        from datetime import datetime, timedelta
+        from dateutil import parser
+        
         # Query miner status collection
         miner_status_collection = db_manager.get_db().collection('miner_status')
         docs = miner_status_collection.stream()
         
+        current_time = datetime.utcnow()
+        miner_timeout = 900  # 15 minutes - same as cleanup timeout
+        
         miners = []
+        stale_count = 0
+        
         for doc in docs:
             miner_data = doc.to_dict()
+            last_seen = miner_data.get('last_seen')
+            
+            # Filter out stale miners (not seen in last 15 minutes)
+            # Try last_seen first, then fall back to last_updated
+            timestamp_to_check = last_seen or miner_data.get('last_updated')
+            
+            if timestamp_to_check:
+                try:
+                    # Handle different timestamp formats
+                    if isinstance(timestamp_to_check, datetime):
+                        time_diff = (current_time - timestamp_to_check).total_seconds()
+                    elif hasattr(timestamp_to_check, 'replace'):  # DatetimeWithNanoseconds or similar datetime-like
+                        # It's a datetime-like object (Firestore DatetimeWithNanoseconds)
+                        try:
+                            ts_dt = timestamp_to_check.replace(tzinfo=None)
+                            time_diff = (current_time - ts_dt).total_seconds()
+                        except Exception as replace_error:
+                            # If replace fails, try converting via timestamp
+                            try:
+                                if hasattr(timestamp_to_check, 'timestamp'):
+                                    ts_dt = datetime.fromtimestamp(timestamp_to_check.timestamp())
+                                    time_diff = (current_time - ts_dt).total_seconds()
+                                else:
+                                    raise replace_error
+                            except:
+                                raise replace_error
+                    elif hasattr(timestamp_to_check, 'timestamp'):  # Firestore Timestamp
+                        # It's a timestamp object
+                        time_diff = (current_time.timestamp() - timestamp_to_check.timestamp())
+                    elif isinstance(timestamp_to_check, str):
+                        try:
+                            last_seen_dt = parser.parse(timestamp_to_check)
+                            # Handle timezone-aware datetime
+                            if last_seen_dt.tzinfo:
+                                last_seen_dt = last_seen_dt.replace(tzinfo=None)
+                            time_diff = (current_time - last_seen_dt).total_seconds()
+                        except Exception as parse_error:
+                            print(f"⚠️  Error parsing timestamp string '{timestamp_to_check}': {parse_error}")
+                            stale_count += 1
+                            continue
+                    else:
+                        # Try to convert unknown type to datetime
+                        try:
+                            if hasattr(timestamp_to_check, 'replace'):
+                                # DatetimeWithNanoseconds or similar
+                                ts_dt = timestamp_to_check.replace(tzinfo=None)
+                                time_diff = (current_time - ts_dt).total_seconds()
+                            else:
+                                print(f"⚠️  Unknown timestamp format for miner {miner_data.get('uid')}: {type(timestamp_to_check)}")
+                                stale_count += 1
+                                continue
+                        except Exception as conv_error:
+                            print(f"⚠️  Error converting timestamp for miner {miner_data.get('uid')}: {conv_error}")
+                            stale_count += 1
+                            continue
+                    
+                    # Only include miners seen within the timeout period
+                    if time_diff > miner_timeout:
+                        minutes_ago = time_diff / 60
+                        print(f"⏰ Filtering stale miner {miner_data.get('uid')} - last seen {minutes_ago:.1f} minutes ago")
+                        stale_count += 1
+                        continue  # Skip stale miners
+                except Exception as e:
+                    print(f"⚠️  Error checking timestamp for miner {miner_data.get('uid')}: {e}")
+                    stale_count += 1
+                    continue  # Skip miners with timestamp parsing errors
+            else:
+                # No timestamp at all - mark as stale
+                print(f"⚠️  Miner {miner_data.get('uid')} has no timestamp - filtering out")
+                stale_count += 1
+                continue  # Skip miners with no timestamp
+            
             miner_data['miner_id'] = doc.id
             miners.append(miner_data)
         
-        # Calculate network statistics
+        # Calculate network statistics (only for active miners)
         total_miners = len(miners)
         active_miners = len([m for m in miners if m.get('is_serving', False)])
         total_stake = sum(float(m.get('stake', 0)) for m in miners)
@@ -3159,6 +3248,7 @@ async def get_network_miner_status():
                 "total_miners": total_miners,
                 "active_miners": active_miners,
                 "total_stake": total_stake,
+                "stale_miners_filtered": stale_count,
                 "last_updated": datetime.now().isoformat()
             },
             "miners": miners

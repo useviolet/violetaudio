@@ -396,13 +396,33 @@ class DatabaseOperations:
                 # Check if miner is recently seen (within timeout)
                 last_seen = miner_data.get('last_seen')
                 if last_seen:
-                    if isinstance(last_seen, datetime):
-                        time_diff = (current_time - last_seen).total_seconds()
-                    else:
-                        # Handle Firestore timestamp
-                        time_diff = (current_time - last_seen).total_seconds()
-                    if time_diff > miner_timeout:
-                        continue  # Skip stale miners
+                    try:
+                        # Handle different timestamp formats
+                        if isinstance(last_seen, datetime):
+                            time_diff = (current_time - last_seen).total_seconds()
+                        elif hasattr(last_seen, 'timestamp'):  # Firestore Timestamp
+                            time_diff = (current_time.timestamp() - last_seen.timestamp())
+                        elif isinstance(last_seen, str):
+                            # Parse ISO format string
+                            from dateutil import parser
+                            last_seen_dt = parser.parse(last_seen)
+                            time_diff = (current_time - last_seen_dt.replace(tzinfo=None)).total_seconds()
+                        else:
+                            # Unknown format, skip this miner
+                            print(f"⚠️  Unknown last_seen format for miner {miner_data.get('uid')}: {type(last_seen)}")
+                            continue
+                        
+                        # Skip miners that haven't been seen recently (stale miners)
+                        if time_diff > miner_timeout:
+                            print(f"⏰ Skipping stale miner {miner_data.get('uid')} - last seen {time_diff/60:.1f} minutes ago")
+                            continue
+                    except Exception as e:
+                        print(f"⚠️  Error checking last_seen for miner {miner_data.get('uid')}: {e}")
+                        continue
+                else:
+                    # No last_seen timestamp - skip this miner (too old or invalid)
+                    print(f"⚠️  Miner {miner_data.get('uid')} has no last_seen timestamp - skipping")
+                    continue
                 
                 # Only include miners with available capacity
                 current_load = miner_data.get('current_load', 0)

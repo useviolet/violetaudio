@@ -12,10 +12,11 @@ from managers.miner_response_handler import MinerResponseHandler
 from database.enhanced_schema import TaskStatus, TaskPriority, COLLECTIONS, DatabaseOperations
 
 class WorkflowOrchestrator:
-    def __init__(self, db, task_manager=None):
+    def __init__(self, db, task_manager=None, miner_status_manager=None):
         self.db = db
         self.task_manager = task_manager or TaskManager(db)
         self.miner_response_handler = MinerResponseHandler(db, self.task_manager)
+        self.miner_status_manager = miner_status_manager
         self.running = False
         
     async def start_orchestration(self):
@@ -32,6 +33,7 @@ class WorkflowOrchestrator:
         asyncio.create_task(self.miner_monitoring_loop())
         asyncio.create_task(self.workflow_status_monitoring())
         asyncio.create_task(self.cleanup_old_tasks())
+        asyncio.create_task(self.cleanup_stale_miners_loop())  # Clean up inactive miners
         
         print("✅ Workflow orchestration started successfully")
     
@@ -81,35 +83,74 @@ class WorkflowOrchestrator:
         print("🔄 Task distribution loop stopped")
     
     async def select_optimal_miners(self, task: Dict) -> List[Dict]:
-        """Select optimal miners for a specific task"""
+        """Select optimal miners for a specific task using dynamic miner selection"""
         try:
             print(f"🔍 Selecting optimal miners for task {task['task_id']} ({task['task_type']})")
             
-            # Get available miners from the database
-            # Since we don't have miner_status_manager, we'll use a simple approach
-            # Look for miners that have been active recently
-            
-            # For now, let's use a simple strategy: assign to any available miner UIDs
-            # In a real implementation, this would query miner status and performance
-            
             # Get the task's required miner count
             required_count = task.get('required_miner_count', 3)
+            task_type = task.get('task_type', 'transcription')
             
-            # Simple miner selection: use UID 48 (your miner) if available
-            # This is a temporary fix until we restore the full miner status system
-            available_miners = []
+            # Use miner_status_manager if available for dynamic miner selection
+            if self.miner_status_manager:
+                try:
+                    available_miners = await self.miner_status_manager.get_available_miners(
+                        task_type=task_type,
+                        min_count=1,
+                        max_count=required_count
+                    )
+                    
+                    if available_miners:
+                        print(f"🎯 Selected {len(available_miners)} miners dynamically: {[m['uid'] for m in available_miners]}")
+                        return available_miners
+                    else:
+                        print(f"⚠️  No available miners found via miner_status_manager for task type: {task_type}")
+                except Exception as e:
+                    print(f"⚠️  Error getting miners from miner_status_manager: {e}")
             
-            # Check if we can find any real miners in the system
-            # For now, let's use a simple approach
-            if required_count >= 1:
-                # Use your miner UID 48
-                available_miners.append({'uid': 48, 'score': 0.9, 'current_load': 0})
+            # Fallback: Query miner status directly from database
+            try:
+                miner_status_collection = self.db.collection('miner_status')
+                docs = miner_status_collection.stream()
+                
+                available_miners = []
+                for doc in docs:
+                    miner_data = doc.to_dict()
+                    
+                    # Check if miner is serving and available
+                    if (miner_data.get('is_serving', False) and 
+                        miner_data.get('current_load', 0) < miner_data.get('max_capacity', 5)):
+                        
+                        # Check task type specialization if specified
+                        if task_type and miner_data.get('task_type_specialization'):
+                            if task_type not in miner_data['task_type_specialization']:
+                                continue
+                        
+                        available_miners.append({
+                            'uid': miner_data.get('uid'),
+                            'score': miner_data.get('performance_score', 0.5),
+                            'current_load': miner_data.get('current_load', 0),
+                            'availability_score': miner_data.get('availability_score', 0.5)
+                        })
+                
+                # Sort by availability score (higher is better)
+                available_miners.sort(key=lambda x: x.get('availability_score', 0), reverse=True)
+                
+                # Return up to required_count miners
+                selected_miners = available_miners[:required_count]
+                
+                if selected_miners:
+                    print(f"🎯 Selected {len(selected_miners)} miners from database: {[m['uid'] for m in selected_miners]}")
+                    return selected_miners
+                else:
+                    print(f"⚠️  No available miners found in database for task type: {task_type}")
+                    
+            except Exception as e:
+                print(f"⚠️  Error querying miner status from database: {e}")
             
-            # If we need more miners, we could add logic here
-            # For now, just return what we have
-            print(f"🎯 Selected {len(available_miners)} miners: {[m['uid'] for m in available_miners]}")
-            
-            return available_miners
+            # Final fallback: Return empty list if no miners found
+            print(f"❌ No available miners found for task {task['task_id']}")
+            return []
             
         except Exception as e:
             print(f"❌ Error selecting optimal miners: {e}")
@@ -263,6 +304,77 @@ class WorkflowOrchestrator:
                 await asyncio.sleep(3600)
         
         print("🧹 Cleanup loop stopped")
+    
+    async def cleanup_stale_miners_loop(self):
+        """Periodically clean up stale/inactive miners from the database"""
+        print("🧹 Starting stale miner cleanup loop...")
+        
+        while self.running:
+            try:
+                current_time = datetime.utcnow()
+                miner_timeout = 900  # 15 minutes
+                
+                # Get all miners from database
+                miner_status_collection = self.db.collection('miner_status')
+                docs = miner_status_collection.stream()
+                
+                stale_miners = []
+                for doc in docs:
+                    miner_data = doc.to_dict()
+                    last_seen = miner_data.get('last_seen')
+                    miner_uid = miner_data.get('uid')
+                    
+                    if not last_seen:
+                        # No last_seen timestamp - mark as stale
+                        stale_miners.append((doc.id, miner_uid, 'No last_seen timestamp'))
+                        continue
+                    
+                    # Handle different timestamp formats
+                    try:
+                        if isinstance(last_seen, datetime):
+                            time_diff = (current_time - last_seen).total_seconds()
+                        elif hasattr(last_seen, 'timestamp'):  # Firestore Timestamp
+                            time_diff = (current_time.timestamp() - last_seen.timestamp())
+                        elif isinstance(last_seen, str):
+                            from dateutil import parser
+                            last_seen_dt = parser.parse(last_seen)
+                            time_diff = (current_time - last_seen_dt.replace(tzinfo=None)).total_seconds()
+                        else:
+                            # Unknown format - mark as stale
+                            stale_miners.append((doc.id, miner_uid, f'Unknown timestamp format: {type(last_seen)}'))
+                            continue
+                        
+                        # Check if miner is stale (not seen for more than timeout)
+                        if time_diff > miner_timeout:
+                            minutes_ago = time_diff / 60
+                            stale_miners.append((doc.id, miner_uid, f'Last seen {minutes_ago:.1f} minutes ago'))
+                    except Exception as e:
+                        print(f"⚠️  Error checking last_seen for miner {miner_uid}: {e}")
+                        stale_miners.append((doc.id, miner_uid, f'Error parsing timestamp: {e}'))
+                
+                # Remove stale miners from database
+                removed_count = 0
+                for miner_id, miner_uid, reason in stale_miners:
+                    try:
+                        miner_status_collection.document(miner_id).delete()
+                        print(f"🗑️  Removed stale miner UID {miner_uid} ({reason})")
+                        removed_count += 1
+                    except Exception as e:
+                        print(f"⚠️  Error removing stale miner {miner_uid}: {e}")
+                
+                if removed_count > 0:
+                    print(f"🧹 Cleaned up {removed_count} stale miners")
+                elif stale_miners:
+                    print(f"⚠️  Found {len(stale_miners)} stale miners but failed to remove them")
+                
+                # Run cleanup every 5 minutes
+                await asyncio.sleep(300)
+                
+            except Exception as e:
+                print(f"❌ Error in stale miner cleanup loop: {e}")
+                await asyncio.sleep(300)
+        
+        print("🧹 Stale miner cleanup loop stopped")
     
     async def get_old_completed_tasks(self, cutoff_date: datetime) -> List[Dict]:
         """Get old completed tasks for cleanup"""

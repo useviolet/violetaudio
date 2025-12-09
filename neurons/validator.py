@@ -17,6 +17,13 @@
 # DEALINGS IN THE SOFTWARE.
 
 
+import sys
+import os
+# Ensure we use the local template from this project, not from other projects
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import time
 import asyncio
 import requests
@@ -51,7 +58,7 @@ class Validator(BaseValidatorNeuron):
     def __init__(self, config=None):
         # Initialize critical attributes BEFORE calling parent constructor
         self.proxy_tasks_processed_this_epoch = False
-        self.proxy_server_url = "https://violet-proxy.onrender.com"  # Hosted proxy server URL
+        self.proxy_server_url = "https://violet-proxy-bl4w.onrender.com"  # Production proxy server URL
         self.last_miner_status_report = 0
         self.miner_status_report_interval = 100  # Report every 100 blocks (1 epoch)
         
@@ -81,7 +88,7 @@ class Validator(BaseValidatorNeuron):
         os.makedirs("logs/validator", exist_ok=True)
 
         # Proxy server integration settings
-        self.proxy_server_url = os.getenv('PROXY_SERVER_URL', 'https://violet-proxy.onrender.com')
+        self.proxy_server_url = os.getenv('PROXY_SERVER_URL', 'https://violet-proxy-bl4w.onrender.com')
         self.enable_proxy_integration = os.getenv('ENABLE_PROXY_INTEGRATION', 'True').lower() == 'true'
         self.proxy_check_interval = int(os.getenv('PROXY_CHECK_INTERVAL', '30'))  # seconds
         
@@ -285,89 +292,126 @@ class Validator(BaseValidatorNeuron):
             bt.logging.error(f"❌ Error logging block status: {str(e)}")
 
     async def check_miner_connectivity(self):
-        """Check miner connectivity and populate reachable_miners list"""
+        """
+        Perform on-chain handshake with miners to verify they are active and responsive.
+        Only miners that successfully respond to on-chain queries are considered active.
+        This follows the pattern used by serious Bittensor subnets.
+        """
         try:
             total_miners = len(self.metagraph.hotkeys)
             serving_miners = 0
-            reachable_miners = []
+            active_miners = []  # Only miners that respond to on-chain queries
             
-            bt.logging.info(f"🔍 Checking miner connectivity...")
+            bt.logging.info(f"🔍 Performing on-chain handshake with serving miners...")
             
-            # Test connectivity to each serving miner
+            # Check each serving miner on-chain
             for uid in range(total_miners):
                 axon = self.metagraph.axons[uid]
                 hotkey = self.metagraph.hotkeys[uid]
                 stake = self.metagraph.S[uid]
                 is_serving = axon.is_serving
                 
-                if is_serving:
-                    serving_miners += 1
-                    
-                    # Get IP and port information
-                    ip = axon.ip
-                    port = axon.port
-                    
-                    # Convert IP from int to string if needed
-                    if isinstance(ip, int):
-                        ip = f"{ip >> 24}.{(ip >> 16) & 255}.{(ip >> 8) & 255}.{ip & 255}"
-                    
-                    # Test connectivity with a simple ping
-                    try:
-                        # Create a simple test task to check connectivity
-                        from template.protocol import AudioTask
-                        test_task = AudioTask(
-                            task_type="transcription",
-                            input_data="dGVzdA==",  # base64 for "test"
-                            language="en"
-                        )
-                        
-                        # Try to connect with short timeout
-                        responses = await self.dendrite(
-                            axons=[axon],
-                            synapse=test_task,
-                            deserialize=False,
-                            timeout=3
-                        )
-                        
-                        if responses and len(responses) > 0:
-                            response = responses[0]
-                            status = response.dendrite.status_code if hasattr(response, 'dendrite') else "Unknown"
-                            
-                            # Consider miner reachable if we get any response (even errors are better than no response)
-                            if status in [200, 400, 500]:  # Any HTTP response means it's reachable
-                                reachable_miners.append(uid)
-                                # Only log active miners - no more verbose logging for inactive ones
-                                bt.logging.info(f"✅ UID {uid:3d} | {ip}:{port} | Stake: {stake:,.0f} TAO | Status: {status}")
-                            else:
-                                # Silent for inactive miners - only debug level
-                                bt.logging.debug(f"⚠️  UID {uid:3d} | {ip}:{port} | Unresponsive (Status: {status})")
-                        else:
-                            # Silent for inactive miners - only debug level
-                            bt.logging.debug(f"❌ UID {uid:3d} | {ip}:{port} | No response")
-                        
-                    except Exception as e:
-                        # Silent for inactive miners - only debug level
-                        bt.logging.debug(f"❌ UID {uid:3d} | {ip}:{port} | Connection failed: {str(e)[:30]}...")
-                    # No logging for offline miners - completely silent
-            
-            # Clean connectivity summary - only show active miners
-            if reachable_miners:
-                # Only show active miners by stake
-                top_miners = sorted(reachable_miners, key=lambda x: self.metagraph.S[x], reverse=True)[:3]
-                bt.logging.info(f"🎯 Active Miners: {len(reachable_miners)} reachable")
-                bt.logging.info(f"   Top by stake: {top_miners}")
+                if not is_serving:
+                    continue  # Skip non-serving miners
                 
-                # Store reachable miners for use in task assignment
-                self.reachable_miners = reachable_miners
+                serving_miners += 1
+                
+                # Get IP and port information for logging
+                ip = axon.ip
+                port = axon.port
+                
+                # Convert IP from int to string if needed
+                if isinstance(ip, int):
+                    ip = f"{ip >> 24}.{(ip >> 16) & 255}.{(ip >> 8) & 255}.{ip & 255}"
+                
+                # Perform on-chain handshake query using summarization task
+                try:
+                    # Create a simple handshake/test task - use summarization for consistency
+                    from template.protocol import AudioTask
+                    # Use a small text for summarization handshake
+                    test_text = "This is a test for handshake verification."
+                    import base64
+                    handshake_task = AudioTask(
+                        task_type="summarization",
+                        input_data=base64.b64encode(test_text.encode('utf-8')).decode('utf-8'),
+                        language="en"
+                    )
+                    
+                    # Perform on-chain query using dendrite (this is the on-chain handshake)
+                    bt.logging.debug(f"🔗 Handshaking with UID {uid:3d} | {ip}:{port}...")
+                    
+                    responses = await self.dendrite(
+                        axons=[axon],  # Use metagraph axon for on-chain communication
+                        synapse=handshake_task,
+                        deserialize=False,  # Don't deserialize for handshake
+                        timeout=10  # Increased to 10 seconds for handshake (was 5)
+                    )
+                    
+                    # Check if miner responded successfully
+                    if responses and len(responses) > 0:
+                        response = responses[0]
+                        
+                        # Get status code from dendrite response
+                        if hasattr(response, 'dendrite') and hasattr(response.dendrite, 'status_code'):
+                            status_code = response.dendrite.status_code
+                        else:
+                            # If response exists, consider it successful (miner is online)
+                            status_code = 200
+                        
+                        # Only consider miner active if we get a valid response (200, 400, or 500)
+                        # 200 = success, 400/500 = error but miner is online and responding
+                        if status_code in [200, 400, 500]:
+                            active_miners.append(uid)
+                            bt.logging.info(
+                                f"✅ UID {uid:3d} | {ip}:{port} | "
+                                f"Stake: {stake:,.0f} TAO | "
+                                f"On-chain handshake: SUCCESS (Status: {status_code})"
+                            )
+                        else:
+                            bt.logging.debug(
+                                f"❌ UID {uid:3d} | {ip}:{port} | "
+                                f"On-chain handshake: FAILED (Status: {status_code})"
+                            )
+                    else:
+                        bt.logging.debug(
+                            f"❌ UID {uid:3d} | {ip}:{port} | "
+                            f"On-chain handshake: NO RESPONSE"
+                        )
+                        
+                except Exception as e:
+                    # Miner did not respond to on-chain query - not active
+                    bt.logging.debug(
+                        f"❌ UID {uid:3d} | {ip}:{port} | "
+                        f"On-chain handshake: EXCEPTION ({str(e)[:50]}...)"
+                    )
+            
+            # Summary of on-chain handshake results
+            bt.logging.info("─" * 60)
+            if active_miners:
+                # Sort by stake for display
+                top_miners = sorted(active_miners, key=lambda x: self.metagraph.S[x], reverse=True)[:5]
+                bt.logging.info(
+                    f"🎯 On-Chain Handshake Results: "
+                    f"{len(active_miners)}/{serving_miners} miners active "
+                    f"({(len(active_miners)/serving_miners*100):.1f}% success rate)"
+                )
+                bt.logging.info(f"   Top active miners by stake: {top_miners}")
+                
+                # Store active miners (only those that passed on-chain handshake)
+                self.reachable_miners = active_miners
             else:
-                bt.logging.warning("⚠️  No active miners available!")
+                bt.logging.warning(
+                    f"⚠️  On-chain handshake: No active miners found "
+                    f"({serving_miners} serving but none responded)"
+                )
                 self.reachable_miners = []
             
-            # Clean separator
-            bt.logging.info("─" * 50)
+            bt.logging.info("─" * 60)
             
         except Exception as e:
-            bt.logging.error(f"❌ Error checking miner connectivity: {str(e)}")
+            bt.logging.error(f"❌ Error performing on-chain handshake: {str(e)}")
+            import traceback
+            bt.logging.debug(f"   Traceback: {traceback.format_exc()}")
             self.reachable_miners = []
     
     async def forward(self):
@@ -923,17 +967,26 @@ class Validator(BaseValidatorNeuron):
             bt.logging.error(f"❌ Error submitting result to proxy server: {str(e)}")
 
     async def report_miner_status_to_proxy(self):
-        """Report current miner status to proxy server"""
+        """
+        Report ONLY active miners (those that passed on-chain handshake) to proxy server.
+        This ensures proxy server only knows about miners that are actually online and responsive.
+        """
         try:
+            # Only report miners that passed on-chain handshake (are in reachable_miners)
             if not hasattr(self, 'reachable_miners') or not self.reachable_miners:
-                bt.logging.debug("🔄 No reachable miners to report")
+                bt.logging.debug("🔄 No active miners to report (none passed on-chain handshake)")
                 return
             
-            bt.logging.info("📊 Reporting miner status to proxy server...")
+            active_miners = self.reachable_miners  # These are miners that passed on-chain handshake
+            
+            bt.logging.info(
+                f"📊 Reporting {len(active_miners)} active miner(s) to proxy server "
+                f"(passed on-chain handshake)..."
+            )
             
             miner_statuses = []
             
-            for uid in self.reachable_miners:
+            for uid in active_miners:
                 try:
                     # Get miner information from metagraph
                     axon = self.metagraph.axons[uid]
@@ -1002,16 +1055,18 @@ class Validator(BaseValidatorNeuron):
     async def send_miner_status_to_proxy(self, miner_statuses: List[Dict]) -> bool:
         """Send miner status to proxy server via HTTP API"""
         try:
+            import json
             proxy_endpoint = f"{self.proxy_server_url}/api/v1/validators/miner-status"
             
-            payload = {
-                'validator_uid': self.uid,
-                'miner_statuses': miner_statuses,
-                'epoch': self.step // 100
+            # Proxy server expects Form data, not JSON
+            data = {
+                'validator_uid': str(self.uid),
+                'miner_statuses': json.dumps(miner_statuses),  # JSON string for Form field
+                'epoch': str(self.step // 100)
             }
             
             async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(proxy_endpoint, json=payload)
+                response = await client.post(proxy_endpoint, data=data)
                 
                 if response.status_code == 200:
                     return True
@@ -3882,7 +3937,7 @@ if __name__ == "__main__":
     
     # Create argument parser
     parser = argparse.ArgumentParser(description="Bittensor Audio Processing Validator")
-    parser.add_argument("--proxy_server_url", type=str, default="https://violet-proxy.onrender.com",
+    parser.add_argument("--proxy_server_url", type=str, default="https://violet-proxy-bl4w.onrender.com",
                        help="URL of the proxy server for task integration")
     parser.add_argument("--enable_proxy_integration", action="store_true", default=True,
                        help="Enable integration with proxy server")

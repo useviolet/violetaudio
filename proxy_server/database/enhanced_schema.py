@@ -376,31 +376,87 @@ class DatabaseOperations:
 
     @staticmethod
     def get_available_miners(db, task_type: str = None, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get available miners that can process tasks"""
+        """Get available miners that can process tasks - dynamically queries miner_status collection"""
         try:
-            query = db.collection(COLLECTIONS['miners'])
+            # Use miner_status collection (populated by validators) for dynamic miner selection
+            query = db.collection(COLLECTIONS.get('miner_status', 'miner_status'))
             
-            # Filter by availability
+            # Filter by availability - must be serving
             query = query.where('is_serving', '==', True)
             
-            # If task type is specified, filter by specialization
-            if task_type:
-                query = query.where('task_type_specialization', 'in', [task_type, None, ''])
-            
-            # Limit results
-            query = query.limit(limit)
-            
+            # Get all serving miners first, then filter in Python for better control
             docs = query.stream()
             miners = []
+            current_time = datetime.utcnow()
+            miner_timeout = 900  # 15 minutes
             
             for doc in docs:
                 miner_data = doc.to_dict()
-                # Only include miners with reasonable load
-                if miner_data.get('current_load', 0) < miner_data.get('max_capacity', 100):
-                    miners.append(miner_data)
+                
+                # Check if miner is recently seen (within timeout)
+                last_seen = miner_data.get('last_seen')
+                if last_seen:
+                    try:
+                        # Handle different timestamp formats
+                        if isinstance(last_seen, datetime):
+                            time_diff = (current_time - last_seen).total_seconds()
+                        elif hasattr(last_seen, 'timestamp'):  # Firestore Timestamp
+                            time_diff = (current_time.timestamp() - last_seen.timestamp())
+                        elif isinstance(last_seen, str):
+                            # Parse ISO format string
+                            from dateutil import parser
+                            last_seen_dt = parser.parse(last_seen)
+                            time_diff = (current_time - last_seen_dt.replace(tzinfo=None)).total_seconds()
+                        else:
+                            # Unknown format, skip this miner
+                            print(f"⚠️  Unknown last_seen format for miner {miner_data.get('uid')}: {type(last_seen)}")
+                            continue
+                        
+                        # Skip miners that haven't been seen recently (stale miners)
+                        if time_diff > miner_timeout:
+                            print(f"⏰ Skipping stale miner {miner_data.get('uid')} - last seen {time_diff/60:.1f} minutes ago")
+                            continue
+                    except Exception as e:
+                        print(f"⚠️  Error checking last_seen for miner {miner_data.get('uid')}: {e}")
+                        continue
+                else:
+                    # No last_seen timestamp - skip this miner (too old or invalid)
+                    print(f"⚠️  Miner {miner_data.get('uid')} has no last_seen timestamp - skipping")
+                    continue
+                
+                # Only include miners with available capacity
+                current_load = miner_data.get('current_load', 0)
+                max_capacity = miner_data.get('max_capacity', 5)
+                if current_load >= max_capacity:
+                    continue  # Skip overloaded miners
+                
+                # Check task type specialization if specified
+                if task_type:
+                    specialization = miner_data.get('task_type_specialization')
+                    if specialization and task_type not in specialization:
+                        continue  # Skip miners that don't support this task type
+                
+                # Calculate availability score for sorting
+                performance_score = miner_data.get('performance_score', 0.5)
+                load_factor = 1.0 - (current_load / max_capacity)
+                stake = miner_data.get('stake', 0.0)
+                stake_factor = min(1.0, stake / 1000.0)
+                
+                availability_score = (performance_score * 0.4 + load_factor * 0.3 + stake_factor * 0.2)
+                
+                miners.append({
+                    **miner_data,
+                    'availability_score': availability_score
+                })
             
-            print(f"🔍 Found {len(miners)} available miners for task type '{task_type or 'any'}'")
-            return miners
+            # Sort by availability score (higher is better)
+            miners.sort(key=lambda x: x.get('availability_score', 0), reverse=True)
+            
+            # Return top miners up to limit
+            selected_miners = miners[:limit]
+            
+            print(f"🔍 Found {len(selected_miners)} available miners (from {len(miners)} total) for task type '{task_type or 'any'}'")
+            return selected_miners
             
         except Exception as e:
             print(f"❌ Error getting available miners: {e}")

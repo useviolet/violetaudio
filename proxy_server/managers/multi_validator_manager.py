@@ -155,14 +155,18 @@ class MultiValidatorManager:
             report_ref = self.validator_reports_collection.document(doc_id)
             report_ref.set(report.to_dict())
             
-            # Also update miner_status collection with latest report
+            # Also update miner_status collection with latest report - store full miner data
             miner_ref = self.miner_status_collection.document(str(report.miner_uid))
-            miner_ref.set({
+            miner_status_data = report.miner_status.copy() if isinstance(report.miner_status, dict) else {}
+            miner_status_data.update({
+                'uid': report.miner_uid,  # Ensure uid is set
                 'last_updated': report.timestamp,
+                'last_seen': report.timestamp,  # Set last_seen for cleanup
                 'last_reported_by_validator': report.validator_uid,
                 'epoch': report.epoch,
                 'validator_reports_count': firestore.Increment(1)
-            }, merge=True)
+            })
+            miner_ref.set(miner_status_data, merge=True)
             
         except Exception as e:
             print(f"❌ Error storing validator report: {e}")

@@ -405,7 +405,7 @@ async def startup_event():
         global file_manager, task_manager, workflow_orchestrator, validator_api, miner_response_handler
         file_manager = FileManager(db_manager.get_db())
         task_manager = TaskManager(db_manager.get_db())
-        workflow_orchestrator = WorkflowOrchestrator(db_manager.get_db(), task_manager)
+        # Note: workflow_orchestrator will be initialized after miner_status_manager is created
         validator_api = ValidatorIntegrationAPI(db_manager.get_db())
         miner_response_handler = MinerResponseHandler(db_manager.get_db(), task_manager)
         
@@ -424,25 +424,44 @@ async def startup_event():
                 self.miner_status_collection = db.collection('miner_status')
                 self.consensus_collection = db.collection('miner_consensus')
             
-            async def get_available_miners(self):
+            async def get_available_miners(self, task_type=None, min_count=1, max_count=5):
                 """Get real miners from Bittensor network via multi-validator consensus"""
                 try:
                     # First try to get consensus-based miner status
-                    consensus_miners = await self._get_consensus_miners()
+                    consensus_miners = await self._get_consensus_miners(task_type)
                     if consensus_miners:
                         print(f"🔍 Multi-validator consensus: Found {len(consensus_miners)} available miners")
-                        return consensus_miners
+                        # Filter by task type if specified and limit to max_count
+                        filtered_miners = self._filter_miners_by_task_type(consensus_miners, task_type)
+                        return filtered_miners[:max_count]
                     
                     # Fallback to individual validator reports
                     print(f"⚠️ No consensus available, falling back to individual validator reports")
-                    return await self._get_fallback_miners()
+                    fallback_miners = await self._get_fallback_miners(task_type)
+                    filtered_miners = self._filter_miners_by_task_type(fallback_miners, task_type)
+                    return filtered_miners[:max_count]
                     
                 except Exception as e:
                     print(f"❌ Error getting network miners: {e}")
-                    # Final fallback to basic miner info
-                    return [{'uid': 48, 'availability_score': 0.8, 'task_type_specialization': None, 'current_load': 0, 'max_capacity': 5}]
+                    # Return empty list instead of hardcoded miner - let the system handle no miners gracefully
+                    print(f"⚠️  No miners available - returning empty list")
+                    return []
             
-            async def _get_consensus_miners(self):
+            def _filter_miners_by_task_type(self, miners, task_type):
+                """Filter miners by task type specialization if specified"""
+                if not task_type:
+                    return miners
+                
+                filtered = []
+                for miner in miners:
+                    specialization = miner.get('task_type_specialization')
+                    # If miner has no specialization, assume it can handle all tasks
+                    if not specialization or task_type in specialization:
+                        filtered.append(miner)
+                
+                return filtered
+            
+            async def _get_consensus_miners(self, task_type=None):
                 """Get miners based on multi-validator consensus"""
                 try:
                     # Query consensus collection
@@ -500,7 +519,7 @@ async def startup_event():
                     print(f"❌ Error getting consensus miners: {e}")
                     return []
             
-            async def _get_fallback_miners(self):
+            async def _get_fallback_miners(self, task_type=None):
                 """Fallback to individual validator reports"""
                 try:
                     # Query miner status collection (populated by validators)
@@ -559,11 +578,22 @@ async def startup_event():
             app.state.miner_status_manager
         )
         
+        # Initialize workflow orchestrator with miner_status_manager
+        workflow_orchestrator = WorkflowOrchestrator(
+            db_manager.get_db(), 
+            task_manager,
+            app.state.miner_status_manager
+        )
+        
         print("🔒 Duplicate protection components assigned to app.state")
         print("🌐 Network-aware miner status manager initialized")
         
-        # Start workflow orchestrator
+        # Start workflow orchestrator (includes task distribution loop every 5 seconds)
         await workflow_orchestrator.start_orchestration()
+        
+        # Start TaskDistributor as a backup distribution mechanism (runs every 30 seconds)
+        asyncio.create_task(app.state.task_distributor.start_distribution())
+        print("✅ TaskDistributor polling started (30 second interval)")
         
         # Log system startup to wandb
         if wandb_monitor.initialized:
@@ -2090,6 +2120,141 @@ async def health_check():
                 "errors": file_system_errors
             }
         }
+    
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+@app.get("/api/v1/health")
+async def api_health_check():
+    """API v1 health check endpoint"""
+    try:
+        # Get system metrics
+        metrics = system_metrics.get_metrics()
+        
+        # Check database connectivity
+        db_healthy = True
+        db_errors = []
+        try:
+            if 'db_manager' in globals() and db_manager:
+                # Try a simple database operation
+                test_collection = db_manager.get_db().collection('health_check')
+                # Just check if we can access the database
+                db_healthy = True
+            else:
+                db_healthy = False
+                db_errors.append("Database manager not initialized")
+        except Exception as e:
+            db_healthy = False
+            db_errors.append(f"Database check error: {str(e)}")
+        
+        # Check file system health
+        file_system_healthy = True
+        file_system_errors = []
+        try:
+            if 'file_manager' in globals() and file_manager:
+                storage_stats = await file_manager.get_storage_statistics()
+                if 'error' in storage_stats:
+                    file_system_healthy = False
+                    file_system_errors.append(f"Firebase Cloud Storage error: {storage_stats['error']}")
+            else:
+                file_system_healthy = False
+                file_system_errors.append("File manager not initialized")
+        except Exception as e:
+            file_system_healthy = False
+            file_system_errors.append(f"File system check error: {str(e)}")
+        
+        # Check task manager
+        task_manager_healthy = True
+        task_manager_errors = []
+        try:
+            if 'task_manager' in globals() and task_manager:
+                task_manager_healthy = True
+            else:
+                task_manager_healthy = False
+                task_manager_errors.append("Task manager not initialized")
+        except Exception as e:
+            task_manager_healthy = False
+            task_manager_errors.append(f"Task manager check error: {str(e)}")
+        
+        # Check workflow orchestrator
+        orchestrator_healthy = True
+        orchestrator_errors = []
+        try:
+            if 'workflow_orchestrator' in globals() and workflow_orchestrator:
+                orchestrator_healthy = workflow_orchestrator.running if hasattr(workflow_orchestrator, 'running') else True
+            else:
+                orchestrator_healthy = False
+                orchestrator_errors.append("Workflow orchestrator not initialized")
+        except Exception as e:
+            orchestrator_healthy = False
+            orchestrator_errors.append(f"Orchestrator check error: {str(e)}")
+        
+        # Overall health status
+        overall_healthy = db_healthy and file_system_healthy and task_manager_healthy
+        health_status = "healthy" if overall_healthy else "degraded"
+        
+        # Log health check to wandb
+        if wandb_monitor.initialized:
+            wandb_monitor.log_system_metrics({
+                "health_check": True,
+                "api_health_check": True,
+                "db_healthy": db_healthy,
+                "file_system_healthy": file_system_healthy,
+                "task_manager_healthy": task_manager_healthy,
+                "orchestrator_healthy": orchestrator_healthy,
+                "timestamp": datetime.now().isoformat(),
+                "uptime_seconds": metrics["uptime_seconds"],
+                "total_requests": metrics["total_requests"],
+                "cache_hit_rate": metrics["cache_hit_rate"],
+                "error_rate": metrics["errors"] / max(metrics["total_requests"], 1)
+            })
+        
+        return {
+            "status": health_status,
+            "service": "violet-proxy-server",
+            "version": "1.0.0",
+            "timestamp": datetime.now().isoformat(),
+            "uptime_seconds": metrics["uptime_seconds"],
+            "components": {
+                "database": {
+                    "healthy": db_healthy,
+                    "errors": db_errors
+                },
+                "file_system": {
+                    "healthy": file_system_healthy,
+                    "errors": file_system_errors
+                },
+                "task_manager": {
+                    "healthy": task_manager_healthy,
+                    "errors": task_manager_errors
+                },
+                "workflow_orchestrator": {
+                    "healthy": orchestrator_healthy,
+                    "errors": orchestrator_errors
+                }
+            },
+            "metrics": {
+                "total_requests": metrics["total_requests"],
+                "cache_hit_rate": f"{metrics['cache_hit_rate']:.2%}",
+                "requests_per_second": f"{metrics['requests_per_second']:.2f}",
+                "total_tasks": metrics["total_tasks"],
+                "total_miner_responses": metrics["total_miner_responses"],
+                "errors": metrics["errors"]
+            },
+            "wandb_active": wandb_monitor.initialized
+        }
+    
+    except Exception as e:
+        return {
+            "status": "error",
+            "service": "violet-proxy-server",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
         
     except Exception as e:
         # Log error to wandb
@@ -2937,10 +3102,15 @@ async def _legacy_miner_status_processing(validator_uid: int, miner_data: List[D
                     
                     # Add timestamp and validator info
                     miner_status['last_updated'] = datetime.now()
+                    miner_status['last_seen'] = datetime.now()  # Ensure last_seen is set for cleanup
                     miner_status['reported_by_validator'] = validator_uid
                     miner_status['epoch'] = epoch
                     
-                    # Store in database
+                    # Ensure uid is set in the document
+                    if 'uid' not in miner_status:
+                        miner_status['uid'] = miner_uid
+                    
+                    # Store in database (use set instead of merge to ensure all fields are present)
                     miner_ref.set(miner_status, merge=True)
                     updated_count += 1
                     
@@ -2975,19 +3145,99 @@ async def _legacy_miner_status_processing(validator_uid: int, miner_data: List[D
 # Add endpoint to get current miner status
 @app.get("/api/v1/miners/network-status")
 async def get_network_miner_status():
-    """Get current miner status from Bittensor network (via validator reports)"""
+    """Get current miner status from Bittensor network (via validator reports) - only shows active miners"""
     try:
+        from datetime import datetime, timedelta
+        from dateutil import parser
+        
         # Query miner status collection
         miner_status_collection = db_manager.get_db().collection('miner_status')
         docs = miner_status_collection.stream()
         
+        current_time = datetime.utcnow()
+        miner_timeout = 900  # 15 minutes - same as cleanup timeout
+        
         miners = []
+        stale_count = 0
+        
         for doc in docs:
             miner_data = doc.to_dict()
+            last_seen = miner_data.get('last_seen')
+            
+            # Filter out stale miners (not seen in last 15 minutes)
+            # Try last_seen first, then fall back to last_updated
+            timestamp_to_check = last_seen or miner_data.get('last_updated')
+            
+            if timestamp_to_check:
+                try:
+                    # Handle different timestamp formats
+                    if isinstance(timestamp_to_check, datetime):
+                        time_diff = (current_time - timestamp_to_check).total_seconds()
+                    elif hasattr(timestamp_to_check, 'replace'):  # DatetimeWithNanoseconds or similar datetime-like
+                        # It's a datetime-like object (Firestore DatetimeWithNanoseconds)
+                        try:
+                            ts_dt = timestamp_to_check.replace(tzinfo=None)
+                            time_diff = (current_time - ts_dt).total_seconds()
+                        except Exception as replace_error:
+                            # If replace fails, try converting via timestamp
+                            try:
+                                if hasattr(timestamp_to_check, 'timestamp'):
+                                    ts_dt = datetime.fromtimestamp(timestamp_to_check.timestamp())
+                                    time_diff = (current_time - ts_dt).total_seconds()
+                                else:
+                                    raise replace_error
+                            except:
+                                raise replace_error
+                    elif hasattr(timestamp_to_check, 'timestamp'):  # Firestore Timestamp
+                        # It's a timestamp object
+                        time_diff = (current_time.timestamp() - timestamp_to_check.timestamp())
+                    elif isinstance(timestamp_to_check, str):
+                        try:
+                            last_seen_dt = parser.parse(timestamp_to_check)
+                            # Handle timezone-aware datetime
+                            if last_seen_dt.tzinfo:
+                                last_seen_dt = last_seen_dt.replace(tzinfo=None)
+                            time_diff = (current_time - last_seen_dt).total_seconds()
+                        except Exception as parse_error:
+                            print(f"⚠️  Error parsing timestamp string '{timestamp_to_check}': {parse_error}")
+                            stale_count += 1
+                            continue
+                    else:
+                        # Try to convert unknown type to datetime
+                        try:
+                            if hasattr(timestamp_to_check, 'replace'):
+                                # DatetimeWithNanoseconds or similar
+                                ts_dt = timestamp_to_check.replace(tzinfo=None)
+                                time_diff = (current_time - ts_dt).total_seconds()
+                            else:
+                                print(f"⚠️  Unknown timestamp format for miner {miner_data.get('uid')}: {type(timestamp_to_check)}")
+                                stale_count += 1
+                                continue
+                        except Exception as conv_error:
+                            print(f"⚠️  Error converting timestamp for miner {miner_data.get('uid')}: {conv_error}")
+                            stale_count += 1
+                            continue
+                    
+                    # Only include miners seen within the timeout period
+                    if time_diff > miner_timeout:
+                        minutes_ago = time_diff / 60
+                        print(f"⏰ Filtering stale miner {miner_data.get('uid')} - last seen {minutes_ago:.1f} minutes ago")
+                        stale_count += 1
+                        continue  # Skip stale miners
+                except Exception as e:
+                    print(f"⚠️  Error checking timestamp for miner {miner_data.get('uid')}: {e}")
+                    stale_count += 1
+                    continue  # Skip miners with timestamp parsing errors
+            else:
+                # No timestamp at all - mark as stale
+                print(f"⚠️  Miner {miner_data.get('uid')} has no timestamp - filtering out")
+                stale_count += 1
+                continue  # Skip miners with no timestamp
+            
             miner_data['miner_id'] = doc.id
             miners.append(miner_data)
         
-        # Calculate network statistics
+        # Calculate network statistics (only for active miners)
         total_miners = len(miners)
         active_miners = len([m for m in miners if m.get('is_serving', False)])
         total_stake = sum(float(m.get('stake', 0)) for m in miners)
@@ -2998,6 +3248,7 @@ async def get_network_miner_status():
                 "total_miners": total_miners,
                 "active_miners": active_miners,
                 "total_stake": total_stake,
+                "stale_miners_filtered": stale_count,
                 "last_updated": datetime.now().isoformat()
             },
             "miners": miners

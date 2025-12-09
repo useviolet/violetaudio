@@ -107,15 +107,79 @@ class BaseMinerNeuron(BaseNeuron):
         # Check that miner is registered on the network.
         self.sync()
 
+        # Check if axon is already serving before attempting to serve
+        is_already_serving = False
+        try:
+            if hasattr(self, 'uid') and self.uid is not None:
+                # Check if the axon is already serving using metagraph
+                metagraph_axon = self.metagraph.axons[self.uid]
+                if metagraph_axon and hasattr(metagraph_axon, 'is_serving'):
+                    if metagraph_axon.is_serving:
+                        # Axon is already registered and serving
+                        is_already_serving = True
+                        bt.logging.info(
+                            f"✅ Miner axon already serving on network: {self.config.subtensor.chain_endpoint} with netuid: {self.config.netuid}"
+                        )
+                        bt.logging.info(
+                            f"   Current axon info: {metagraph_axon.ip}:{metagraph_axon.port}"
+                        )
+                elif metagraph_axon and metagraph_axon.ip != "0.0.0.0":
+                    # Fallback: check if IP is set (indicates serving)
+                    is_already_serving = True
+                    bt.logging.info(
+                        f"✅ Miner axon already serving on network: {self.config.subtensor.chain_endpoint} with netuid: {self.config.netuid}"
+                    )
+                    bt.logging.info(
+                        f"   Current axon info: {metagraph_axon.ip}:{metagraph_axon.port}"
+                    )
+        except (IndexError, AttributeError, Exception) as e:
+            # If we can't check, assume not serving and try to serve
+            bt.logging.debug(f"Could not check serving status: {e}, will attempt to serve")
+
         # Serve passes the axon information to the network + netuid we are hosting on.
         # This will auto-update if the axon port of external ip have changed.
-        bt.logging.info(
-            f"Serving miner axon {self.axon} on network: {self.config.subtensor.chain_endpoint} with netuid: {self.config.netuid}"
-        )
-        self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
+        if not is_already_serving:
+            bt.logging.info(
+                f"Serving miner axon {self.axon} on network: {self.config.subtensor.chain_endpoint} with netuid: {self.config.netuid}"
+            )
+            try:
+                self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
+                bt.logging.info("✅ Successfully served axon to network")
+            except Exception as e:
+                error_str = str(e)
+                # Check if error is due to already serving (Custom error: 11)
+                if "Custom error: 11" in error_str or "Invalid Transaction" in error_str:
+                    # Check again if it's actually serving now
+                    try:
+                        if hasattr(self, 'uid') and self.uid is not None:
+                            metagraph_axon = self.metagraph.axons[self.uid]
+                            if metagraph_axon and metagraph_axon.ip != "0.0.0.0":
+                                bt.logging.info(
+                                    f"✅ Axon is already serving (error was expected): {metagraph_axon.ip}:{metagraph_axon.port}"
+                                )
+                            else:
+                                bt.logging.warning(
+                                    f"⚠️  Failed to serve axon (may need retry): {error_str[:100]}"
+                                )
+                    except Exception:
+                        bt.logging.warning(
+                            f"⚠️  Failed to serve axon: {error_str[:100]}"
+                        )
+                else:
+                    # Different error, log it
+                    bt.logging.error(f"❌ Failed to serve axon: {error_str[:200]}")
+        else:
+            # Already serving, just start the axon locally
+            bt.logging.info("Axon already registered on chain, starting local server...")
 
         # Start  starts the miner's axon, making it active on the network.
         self.axon.start()
+        
+        # Verify axon is actually running and listening
+        bt.logging.info(f"✅ Axon started - listening for connections")
+        bt.logging.info(f"   Local: {self.axon.ip}:{self.axon.port}")
+        bt.logging.info(f"   External: {self.axon.external_ip}:{self.axon.external_port}")
+        bt.logging.info(f"   Axon is_serving: {self.axon.is_serving if hasattr(self.axon, 'is_serving') else 'N/A'}")
 
         bt.logging.info(f"Miner starting at block: {self.block}")
 

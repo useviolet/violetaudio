@@ -257,22 +257,39 @@ class WorkflowOrchestrator:
             # Get task counts by status using enhanced operations
             pending_count = len(DatabaseOperations.get_tasks_by_status(self.db, TaskStatus.PENDING))
             distributed_count = len(DatabaseOperations.get_tasks_by_status(self.db, TaskStatus.ASSIGNED))
+            in_progress_count = len(DatabaseOperations.get_tasks_by_status(self.db, TaskStatus.IN_PROGRESS))
             completed_count = len(DatabaseOperations.get_tasks_by_status(self.db, TaskStatus.COMPLETED))
             approved_count = len(DatabaseOperations.get_tasks_by_status(self.db, TaskStatus.APPROVED))
             failed_count = len(DatabaseOperations.get_tasks_by_status(self.db, TaskStatus.FAILED))
+            
+            # Also count tasks with "processing" status (legacy/invalid status that should be "in_progress")
+            # Query directly to catch status mismatches
+            processing_count = 0
+            try:
+                processing_tasks = self.db.collection('tasks').where('status', '==', 'processing').stream()
+                processing_count = len(list(processing_tasks))
+            except Exception as e:
+                print(f"⚠️ Error counting 'processing' status tasks: {e}")
+            
+            # Total includes all statuses
+            total_tasks = pending_count + distributed_count + in_progress_count + processing_count + completed_count + approved_count + failed_count
             
             return {
                 'timestamp': datetime.now().isoformat(),
                 'pending_tasks': pending_count,
                 'distributed_tasks': distributed_count,
+                'in_progress_tasks': in_progress_count + processing_count,  # Combine both
+                'processing_tasks': processing_count,  # Legacy status count
                 'completed_tasks': completed_count,
                 'approved_tasks': approved_count,
                 'failed_tasks': failed_count,
-                'total_tasks': pending_count + distributed_count + completed_count + approved_count + failed_count
+                'total_tasks': total_tasks
             }
             
         except Exception as e:
             print(f"❌ Error getting workflow statistics: {e}")
+            import traceback
+            traceback.print_exc()
             return {'error': str(e)}
     
     async def cleanup_old_tasks(self):

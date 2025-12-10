@@ -92,6 +92,14 @@ class Validator(BaseValidatorNeuron):
         self.enable_proxy_integration = os.getenv('ENABLE_PROXY_INTEGRATION', 'True').lower() == 'true'
         self.proxy_check_interval = int(os.getenv('PROXY_CHECK_INTERVAL', '30'))  # seconds
         
+        # Load validator API key from environment variable (like HF_TOKEN)
+        self.validator_api_key = os.getenv('VALIDATOR_API_KEY')
+        if not self.validator_api_key:
+            bt.logging.warning("⚠️  VALIDATOR_API_KEY not found in .env file. Validator endpoints will be rejected.")
+            bt.logging.warning("   Add VALIDATOR_API_KEY=<your_api_key> to your .env file")
+        else:
+            bt.logging.info(f"✅ Validator API key loaded from .env (length: {len(self.validator_api_key)})")
+        
         # Initialize proxy integration if enabled
         if self.enable_proxy_integration:
             bt.logging.info(f"🔗 Proxy server integration enabled: {self.proxy_server_url}")
@@ -117,53 +125,40 @@ class Validator(BaseValidatorNeuron):
         bt.logging.info("🚀 Enhanced validator initialized with comprehensive monitoring and evaluation tracking")
     
     def initialize_miner_pipelines(self):
-        """Initialize the exact same pipelines that miners use for fair comparison"""
+        """Initialize pipeline manager for on-demand model loading (same as miner)"""
         try:
-            bt.logging.info("🔧 Initializing miner pipelines for fair comparison...")
+            bt.logging.info("🔧 Initializing pipeline manager for on-demand model loading...")
             
-            # Initialize transcription pipeline (same as miner)
-            try:
-                from template.pipelines.transcription_pipeline import TranscriptionPipeline
-                self.transcription_pipeline = TranscriptionPipeline()
-                bt.logging.info("✅ Transcription pipeline initialized (same as miner)")
-            except Exception as e:
-                bt.logging.error(f"❌ Failed to initialize transcription pipeline: {e}")
-                self.transcription_pipeline = None
+            # Initialize pipeline manager for dynamic model loading (same as miner)
+            # Models will be loaded only when tasks are assigned
+            # Use importlib to avoid any module-level side effects
+            import importlib
+            import sys
             
-            # Initialize TTS pipeline (same as miner)
-            try:
-                from template.pipelines.tts_pipeline import TTSPipeline
-                self.tts_pipeline = TTSPipeline()
-                bt.logging.info("✅ TTS pipeline initialized (same as miner)")
-            except ImportError as e:
-                bt.logging.warning(f"⚠️ TTS pipeline not available (TTS module not installed): {e}")
-                self.tts_pipeline = None
-            except Exception as e:
-                bt.logging.error(f"❌ Failed to initialize TTS pipeline: {e}")
-                self.tts_pipeline = None
+            # Check if pipeline_manager module is already imported
+            if 'template.pipelines.pipeline_manager' in sys.modules:
+                bt.logging.warning("⚠️ pipeline_manager module already imported - this might cause side effects")
             
-            # Initialize summarization pipeline (same as miner)
-            try:
-                from template.pipelines.summarization_pipeline import SummarizationPipeline
-                self.summarization_pipeline = SummarizationPipeline()
-                bt.logging.info("✅ Summarization pipeline initialized (same as miner)")
-            except Exception as e:
-                bt.logging.error(f"❌ Failed to initialize summarization pipeline: {e}")
-                self.summarization_pipeline = None
+            # Import the module and get the class
+            pipeline_manager_module = importlib.import_module('template.pipelines.pipeline_manager')
+            PipelineManager = pipeline_manager_module.PipelineManager
             
-            # Initialize translation pipeline (same as miner)
-            try:
-                from template.pipelines.translation_pipeline import translation_pipeline
-                self.translation_pipeline = translation_pipeline
-                bt.logging.info("✅ Translation pipeline initialized (same as miner)")
-            except Exception as e:
-                bt.logging.error(f"❌ Failed to initialize translation pipeline: {e}")
-                self.translation_pipeline = None
+            # Create a new instance - PipelineManager.__init__ only sets up empty dicts, no model loading
+            bt.logging.debug("Creating PipelineManager instance...")
+            self.pipeline_manager = PipelineManager()
+            bt.logging.debug("PipelineManager instance created successfully")
             
-            bt.logging.info("🎯 Miner pipelines initialization complete - validator now uses EXACTLY the same pipelines!")
+            # Verify no models were loaded
+            cache_stats = self.pipeline_manager.get_cache_stats()
+            if any(count > 0 for count in cache_stats.values()):
+                bt.logging.warning(f"⚠️ Models were loaded during initialization! Cache stats: {cache_stats}")
+            else:
+                bt.logging.info("✅ Pipeline manager initialized - models will be loaded on-demand when tasks are assigned")
             
         except Exception as e:
-            bt.logging.error(f"❌ Error initializing miner pipelines: {str(e)}")
+            bt.logging.error(f"❌ Error initializing pipeline manager: {str(e)}")
+            import traceback
+            bt.logging.error(f"   Traceback: {traceback.format_exc()}")
     
     def initialize_enhanced_monitoring(self):
         """Initialize enhanced monitoring and tracking systems"""
@@ -479,6 +474,15 @@ class Validator(BaseValidatorNeuron):
                 bt.logging.info(f"🔍 Evaluation trigger activated at block {self.block}")
                 await self.trigger_task_evaluation()
             
+            # ALWAYS check miner connectivity and report status to proxy (regardless of proxy tasks)
+            # This ensures proxy server always has current miner status
+            await self.check_miner_connectivity()
+            
+            # Report miner status to proxy server EVERY forward pass
+            # This ensures proxy always has up-to-date miner information
+            if hasattr(self, 'reachable_miners') and self.reachable_miners:
+                await self.report_miner_status_to_proxy()
+            
             # Check proxy server for tasks if integration is enabled
             proxy_tasks_processed = False
             if self.enable_proxy_integration:
@@ -521,12 +525,8 @@ class Validator(BaseValidatorNeuron):
     async def _run_standard_forward(self):
         """Standard forward pass implementation with enhanced monitoring"""
         try:
-            # Check miner connectivity and register them
-            await self.check_miner_connectivity()
-            
-            # Report miner status to proxy server
-            if hasattr(self, 'reachable_miners') and self.reachable_miners:
-                await self.report_miner_status_to_proxy()
+            # Note: Miner connectivity check and status reporting are now done in forward() 
+            # before this method is called, to ensure they happen every forward pass
             
             # Check if we have any reachable miners
             if not hasattr(self, 'reachable_miners') or not self.reachable_miners:
@@ -662,11 +662,19 @@ class Validator(BaseValidatorNeuron):
             bt.logging.error(f"❌ Error checking proxy server tasks: {str(e)}")
             return False # Indicate no new tasks processed
     
+    def _get_auth_headers(self) -> dict:
+        """Get authentication headers with API key"""
+        headers = {}
+        if self.validator_api_key:
+            headers["X-API-Key"] = self.validator_api_key
+        return headers
+    
     async def get_proxy_pending_tasks(self):
         """Get tasks ready for evaluation from proxy server (only 'done' status)"""
         try:
             # Only get tasks that are ready for evaluation (status = 'done')
-            response = requests.get(f"{self.proxy_server_url}/api/v1/validator/tasks", timeout=10)
+            headers = self._get_auth_headers()
+            response = requests.get(f"{self.proxy_server_url}/api/v1/validator/tasks", headers=headers, timeout=10)
             if response.status_code == 200:
                 data = response.json()
                 tasks = data.get('tasks', [])
@@ -994,8 +1002,10 @@ class Validator(BaseValidatorNeuron):
             if self.miner_tracker:
                 self.miner_tracker.save_metrics()
             
+            headers = self._get_auth_headers()
             response = requests.post(
                 f"{self.proxy_server_url}/api/v1/validator/submit_result",
+                headers=headers,
                 data=data,
                 timeout=10
             )
@@ -1118,7 +1128,8 @@ class Validator(BaseValidatorNeuron):
             }
             
             async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(proxy_endpoint, data=data)
+                headers = self._get_auth_headers()
+                response = await client.post(proxy_endpoint, headers=headers, data=data)
                 
                 if response.status_code == 200:
                     return True
@@ -1661,8 +1672,10 @@ class Validator(BaseValidatorNeuron):
             bt.logging.info(f"🔍 Fetching completed tasks from proxy server: {self.proxy_server_url}")
             
             async with httpx.AsyncClient(timeout=30.0) as client:
+                headers = self._get_auth_headers()
                 response = await client.get(
                     f"{self.proxy_server_url}/api/v1/tasks/completed",
+                    headers=headers,
                     timeout=30.0
                 )
                 
@@ -1842,7 +1855,9 @@ class Validator(BaseValidatorNeuron):
             
             # ENHANCED: Process task using the same pipeline execution pattern as miner
             start_time = time.time()
-            result = await self._execute_pipeline_robust(task_type, input_data, task_id)
+            # Get model_id from task_data if available
+            model_id = task_data.get('model_id')
+            result = await self._execute_pipeline_robust(task_type, input_data, task_id, model_id=model_id)
             total_time = time.time() - start_time
             
             if result:
@@ -2020,7 +2035,8 @@ class Validator(BaseValidatorNeuron):
             # Download file from proxy server
             download_url = f"{self.proxy_server_url}/api/v1/files/{file_id}/download"
             async with httpx.AsyncClient() as client:
-                response = await client.get(download_url, timeout=30.0)
+                headers = self._get_auth_headers()
+                response = await client.get(download_url, headers=headers, timeout=30.0)
                 
                 if response.status_code == 200:
                     file_content = response.content
@@ -2036,7 +2052,7 @@ class Validator(BaseValidatorNeuron):
             bt.logging.error(f"      ❌ Error downloading file content: {str(e)}")
             return None
 
-    async def _execute_pipeline_robust(self, task_type: str, input_data: Any, task_id: str) -> Optional[Dict]:
+    async def _execute_pipeline_robust(self, task_type: str, input_data: Any, task_id: str, model_id: Optional[str] = None) -> Optional[Dict]:
         """
         ENHANCED: Execute pipeline using the same robust pattern as miner.
         Handles errors gracefully and provides consistent output format.
@@ -2044,6 +2060,8 @@ class Validator(BaseValidatorNeuron):
         try:
             bt.logging.info(f"   🔄 EXECUTING PIPELINE (ROBUST METHOD):")
             bt.logging.info(f"      Pipeline: {self._get_pipeline_name(task_type)}")
+            if model_id:
+                bt.logging.info(f"      Model: {model_id}")
             
             # Check pipeline availability (same as miner)
             pipeline_available = await self._check_pipeline_availability(task_type)
@@ -2056,22 +2074,22 @@ class Validator(BaseValidatorNeuron):
             
             if task_type == 'transcription':
                 bt.logging.info(f"      🎵 Executing TRANSCRIPTION pipeline...")
-                result = await self.execute_transcription_task({'input_data': input_data, 'task_id': task_id})
+                result = await self.execute_transcription_task({'input_data': input_data, 'task_id': task_id, 'model_id': model_id})
             elif task_type == 'video_transcription':
                 bt.logging.info(f"      🎬 Executing VIDEO TRANSCRIPTION pipeline...")
-                result = await self.execute_video_transcription_task({'input_data': input_data, 'task_id': task_id})
+                result = await self.execute_video_transcription_task({'input_data': input_data, 'task_id': task_id, 'model_id': model_id})
             elif task_type == 'tts':
                 bt.logging.info(f"      🔊 Executing TTS pipeline...")
-                result = await self.execute_tts_task({'input_data': input_data, 'task_id': task_id})
+                result = await self.execute_tts_task({'input_data': input_data, 'task_id': task_id, 'model_id': model_id})
             elif task_type == 'summarization':
                 bt.logging.info(f"      📝 Executing SUMMARIZATION pipeline...")
-                result = await self.execute_summarization_task({'input_data': input_data, 'task_id': task_id})
+                result = await self.execute_summarization_task({'input_data': input_data, 'task_id': task_id, 'model_id': model_id})
             elif task_type == 'text_translation':
                 bt.logging.info(f"      🌐 Executing TEXT TRANSLATION pipeline...")
-                result = await self.execute_text_translation_task({'input_data': input_data, 'task_id': task_id})
+                result = await self.execute_text_translation_task({'input_data': input_data, 'task_id': task_id, 'model_id': model_id})
             elif task_type == 'document_translation':
                 bt.logging.info(f"      📄 Executing DOCUMENT TRANSLATION pipeline...")
-                result = await self.execute_document_translation_task({'input_data': input_data, 'task_id': task_id})
+                result = await self.execute_document_translation_task({'input_data': input_data, 'task_id': task_id, 'model_id': model_id})
             else:
                 bt.logging.error(f"      ❌ Unknown task type: {task_type}")
                 return None
@@ -2096,20 +2114,9 @@ class Validator(BaseValidatorNeuron):
         ENHANCED: Check pipeline availability using the same logic as miner.
         """
         try:
-            if task_type in ["transcription", "video_transcription"]:
-                if self.transcription_pipeline is None:
-                    return {'available': False, 'reason': 'Transcription pipeline not available'}
-            elif task_type == "tts":
-                if self.tts_pipeline is None:
-                    return {'available': False, 'reason': 'TTS pipeline not available'}
-            elif task_type == "summarization":
-                if self.summarization_pipeline is None:
-                    return {'available': False, 'reason': 'Summarization pipeline not available'}
-            elif task_type in ["text_translation", "document_translation"]:
-                if self.translation_pipeline is None:
-                    return {'available': False, 'reason': 'Translation pipeline not available'}
-            
-            return {'available': True, 'reason': 'Pipeline available'}
+            # Pipelines are loaded on-demand, so they're always available through pipeline_manager
+            # The actual availability will be checked when the pipeline is loaded
+            return {'available': True, 'reason': 'Pipeline manager ready - models load on-demand'}
             
         except Exception as e:
             return {'available': False, 'reason': f'Pipeline check error: {str(e)}'}
@@ -2146,12 +2153,14 @@ class Validator(BaseValidatorNeuron):
     async def execute_transcription_task(self, task: Dict) -> Dict:
         """Execute transcription task as validator using the SAME pipeline as miners"""
         try:
+            # Get model_id from task if specified
+            model_id = task.get('model_id')
             bt.logging.info(f"🔧 EXECUTING TRANSCRIPTION TASK AS VALIDATOR (ENHANCED)")
-            bt.logging.info(f"   Using: {self._get_pipeline_name('transcription')}")
-            
-            # ENHANCED: Check if pipeline is available (same check as miner)
-            if self.transcription_pipeline is None:
-                bt.logging.error("❌ Transcription pipeline not available (same as miner)")
+            bt.logging.info(f"   Loading pipeline with model: {model_id or 'default'}")
+            # Get pipeline with specified model (loads on-demand)
+            pipeline = self.pipeline_manager.get_transcription_pipeline(model_id)
+            if pipeline is None:
+                bt.logging.error("❌ Transcription pipeline not available")
                 return None
             
             # ENHANCED: Get input data with robust extraction
@@ -2188,12 +2197,17 @@ class Validator(BaseValidatorNeuron):
             if len(audio_bytes) < 1000:  # Less than 1KB is suspicious for audio files
                 bt.logging.warning(f"⚠️ Audio file is suspiciously small ({len(audio_bytes)} bytes) - may be corrupted")
             
+            # Get language from task if specified
+            task_language = task.get('source_language', 'en')
+            task_language = task_language.lower() if task_language else "en"
+            
             bt.logging.info(f"🎵 Processing {len(audio_bytes)} bytes of audio data (same as miner)...")
+            bt.logging.info(f"   Language: {task_language}")
             
             # ENHANCED: Execute transcription using EXACTLY the same method as miner
             start_time = time.time()
-            transcribed_text, processing_time = self.transcription_pipeline.transcribe(
-                audio_bytes, language="en"  # Same parameters as miner
+            transcribed_text, processing_time = pipeline.transcribe(
+                audio_bytes, language=task_language  # Use language from task
             )
             total_time = time.time() - start_time
             
@@ -2228,12 +2242,14 @@ class Validator(BaseValidatorNeuron):
     async def execute_tts_task(self, task: Dict) -> Dict:
         """Execute TTS task as validator using the SAME pipeline as miners"""
         try:
+            # Get model_id from task if specified
+            model_id = task.get('model_id')
             bt.logging.info(f"🔧 EXECUTING TTS TASK AS VALIDATOR (ENHANCED)")
-            bt.logging.info(f"   Using: {self._get_pipeline_name('tts')}")
-            
-            # ENHANCED: Check if pipeline is available (same check as miner)
-            if self.tts_pipeline is None:
-                bt.logging.error("❌ TTS pipeline not available (same as miner)")
+            bt.logging.info(f"   Loading pipeline with model: {model_id or 'default'}")
+            # Get pipeline with specified model (loads on-demand)
+            pipeline = self.pipeline_manager.get_tts_pipeline(model_id)
+            if pipeline is None:
+                bt.logging.error("❌ TTS pipeline not available")
                 return None
             
             # ENHANCED: Get input text with robust extraction
@@ -2263,9 +2279,11 @@ class Validator(BaseValidatorNeuron):
             bt.logging.info(f"   🔊 Starting TTS synthesis (same as miner)...")
             start_time = time.time()
             
+            # Get language from task
+            language = task.get('language', 'en')
             # Use the same pipeline call as miner
-            audio_bytes, processing_time = self.tts_pipeline.synthesize(
-                input_text, language="en"  # Same parameters as miner
+            audio_bytes, processing_time = pipeline.synthesize(
+                input_text, language=language
             )
             
             total_time = time.time() - start_time
@@ -2316,12 +2334,14 @@ class Validator(BaseValidatorNeuron):
     async def execute_summarization_task(self, task: Dict) -> Dict:
         """Execute summarization task as validator using the SAME pipeline as miners with language support"""
         try:
+            # Get model_id from task if specified
+            model_id = task.get('model_id')
             bt.logging.info(f"🔧 EXECUTING SUMMARIZATION TASK AS VALIDATOR (ENHANCED)")
-            bt.logging.info(f"   Using: {self._get_pipeline_name('summarization')}")
-            
-            # ENHANCED: Check if pipeline is available (same check as miner)
-            if self.summarization_pipeline is None:
-                bt.logging.error("❌ Summarization pipeline not available (same as miner)")
+            bt.logging.info(f"   Loading pipeline with model: {model_id or 'default'}")
+            # Get pipeline with specified model (loads on-demand)
+            pipeline = self.pipeline_manager.get_summarization_pipeline(model_id)
+            if pipeline is None:
+                bt.logging.error("❌ Summarization pipeline not available")
                 return None
             
             # ENHANCED: Get input data with robust extraction
@@ -2378,7 +2398,7 @@ class Validator(BaseValidatorNeuron):
             processing_language = source_language
             
             # Use the same pipeline call as miner with language support
-            summary_text, processing_time = self.summarization_pipeline.summarize(
+            summary_text, processing_time = pipeline.summarize(
                 input_text, language=processing_language
             )
             
@@ -2423,12 +2443,14 @@ class Validator(BaseValidatorNeuron):
     async def execute_video_transcription_task(self, task: Dict) -> Dict:
         """Execute video transcription task as validator using the SAME pipeline as miners"""
         try:
+            # Get model_id from task if specified
+            model_id = task.get('model_id')
             bt.logging.info(f"🔧 EXECUTING VIDEO TRANSCRIPTION TASK AS VALIDATOR (ENHANCED)")
-            bt.logging.info(f"   Using: {self._get_pipeline_name('transcription')}")
-            
-            # ENHANCED: Check if pipeline is available (same check as miner)
-            if self.transcription_pipeline is None:
-                bt.logging.error("❌ Transcription pipeline not available (same as miner)")
+            bt.logging.info(f"   Loading pipeline with model: {model_id or 'default'}")
+            # Get pipeline with specified model (loads on-demand)
+            pipeline = self.pipeline_manager.get_transcription_pipeline(model_id)
+            if pipeline is None:
+                bt.logging.error("❌ Transcription pipeline not available")
                 return None
             
             # ENHANCED: Check if video processing utilities are available
@@ -2494,7 +2516,7 @@ class Validator(BaseValidatorNeuron):
             # Transcribe the extracted audio using same method as miner
             bt.logging.info(f"🎵 Transcribing extracted audio...")
             start_time = time.time()
-            transcribed_text, processing_time = self.transcription_pipeline.transcribe(
+            transcribed_text, processing_time = pipeline.transcribe(
                 audio_bytes, language=source_language
             )
             total_time = time.time() - start_time
@@ -2538,12 +2560,14 @@ class Validator(BaseValidatorNeuron):
     async def execute_text_translation_task(self, task: Dict) -> Dict:
         """Execute text translation task as validator using the SAME pipeline as miners"""
         try:
+            # Get model_id from task if specified
+            model_id = task.get('model_id')
             bt.logging.info(f"🔧 EXECUTING TEXT TRANSLATION TASK AS VALIDATOR (ENHANCED)")
-            bt.logging.info(f"   Using: {self._get_pipeline_name('translation')}")
-            
-            # ENHANCED: Check if pipeline is available (same check as miner)
-            if self.translation_pipeline is None:
-                bt.logging.error("❌ Translation pipeline not available (same as miner)")
+            bt.logging.info(f"   Loading pipeline with model: {model_id or 'default'}")
+            # Get pipeline with specified model (loads on-demand)
+            pipeline = self.pipeline_manager.get_translation_pipeline(model_id)
+            if pipeline is None:
+                bt.logging.error("❌ Translation pipeline not available")
                 return None
             
             # ENHANCED: Get input data with robust extraction
@@ -2567,7 +2591,7 @@ class Validator(BaseValidatorNeuron):
             # Process text translation using same method as miner
             bt.logging.info(f"🎵 Translating text...")
             start_time = time.time()
-            translated_text, processing_time = self.translation_pipeline.translate_text(
+            translated_text, processing_time = pipeline.translate_text(
                 text, source_language, target_language
             )
             total_time = time.time() - start_time
@@ -2609,12 +2633,14 @@ class Validator(BaseValidatorNeuron):
     async def execute_document_translation_task(self, task: Dict) -> Dict:
         """Execute document translation task as validator using the SAME pipeline as miners"""
         try:
+            # Get model_id from task if specified
+            model_id = task.get('model_id')
             bt.logging.info(f"🔧 EXECUTING DOCUMENT TRANSLATION TASK AS VALIDATOR (ENHANCED)")
-            bt.logging.info(f"   Using: {self._get_pipeline_name('translation')}")
-            
-            # ENHANCED: Check if pipeline is available (same check as miner)
-            if self.translation_pipeline is None:
-                bt.logging.error("❌ Translation pipeline not available (same as miner)")
+            bt.logging.info(f"   Loading pipeline with model: {model_id or 'default'}")
+            # Get pipeline with specified model (loads on-demand)
+            pipeline = self.pipeline_manager.get_translation_pipeline(model_id)
+            if pipeline is None:
+                bt.logging.error("❌ Translation pipeline not available")
                 return None
             
             # ENHANCED: Check if video processing utilities are available (for document processing)
@@ -2653,7 +2679,7 @@ class Validator(BaseValidatorNeuron):
             # Process document translation using same method as miner
             bt.logging.info(f"🎵 Translating document...")
             start_time = time.time()
-            translated_text, processing_time, metadata = self.translation_pipeline.translate_document(
+            translated_text, processing_time, metadata = pipeline.translate_document(
                 file_data, filename, source_language, target_language
             )
             total_time = time.time() - start_time
@@ -3391,8 +3417,10 @@ class Validator(BaseValidatorNeuron):
                 
                 # Test completed tasks endpoint
                 bt.logging.info("🔍 Testing completed tasks endpoint...")
+                headers = self._get_auth_headers()
                 response = await client.get(
                     f"{self.proxy_server_url}/api/v1/tasks/completed",
+                    headers=headers,
                     timeout=10.0
                 )
                 
@@ -3569,8 +3597,10 @@ class Validator(BaseValidatorNeuron):
                     'evaluation_data': json.dumps(evaluation_data)
                 }
                 
+                headers = self._get_auth_headers()
                 response = await client.post(
                     f"{self.proxy_server_url}/api/v1/validator/evaluation",
+                    headers=headers,
                     data=form_data,  # Use data instead of json
                     timeout=30.0
                 )
@@ -3593,8 +3623,10 @@ class Validator(BaseValidatorNeuron):
             
             # Try to get from proxy server
             async with httpx.AsyncClient(timeout=30.0) as client:
+                headers = self._get_auth_headers()
                 response = await client.get(
                     f"{self.proxy_server_url}/api/v1/validator/{getattr(self, 'uid', 'unknown')}/evaluated_tasks",
+                    headers=headers,
                     timeout=30.0
                 )
                 

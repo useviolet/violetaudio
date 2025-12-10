@@ -175,7 +175,8 @@ class ValidatorIntegrationAPI:
             # Get task info
             task_doc = self.tasks_collection.document(task_id).get()  # Remove await
             if not task_doc.exists:
-                raise Exception(f"Task {task_id} not found")
+                # Raise a proper exception that will be caught and converted to 404
+                raise ValueError(f"Task {task_id} not found")
             
             task_data = task_doc.to_dict()
             

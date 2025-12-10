@@ -22,12 +22,17 @@ class FileManager:
         try:
             from .firebase_storage_manager import FirebaseStorageManager
             self.firebase_storage_manager = FirebaseStorageManager(db)
-            print("✅ Firebase Cloud Storage manager initialized")
+            if self.firebase_storage_manager.enabled:
+                print("✅ Firebase Cloud Storage manager initialized")
+            else:
+                print("⚠️  Firebase Cloud Storage manager initialized but disabled (no credentials)")
         except ImportError as e:
             print(f"❌ Could not import Firebase Cloud Storage manager: {e}")
             raise Exception("Firebase Cloud Storage manager is required")
-        
-        print(f"✅ Firebase Cloud Storage initialized")
+        except Exception as e:
+            print(f"⚠️  Firebase Cloud Storage manager initialization failed: {e}")
+            # Don't raise - allow server to start without Firebase for local testing
+            self.firebase_storage_manager = None
     
     async def upload_file(self, file_data: bytes, file_name: str, content_type: str, file_type: str = "audio") -> str:
         """Upload file using Firebase Cloud Storage"""

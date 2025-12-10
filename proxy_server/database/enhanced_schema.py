@@ -140,6 +140,7 @@ class TaskModel:
     # Task details
     source_language: str = "en"
     target_language: Optional[str] = None
+    model_id: Optional[str] = None  # HuggingFace model ID for dynamic model selection
     estimated_completion_time: Optional[float] = None
     actual_completion_time: Optional[float] = None
     deadline: Optional[datetime] = None
@@ -172,7 +173,9 @@ COLLECTIONS = {
     'assignments': 'task_assignments',
     'responses': 'miner_responses',
     'evaluations': 'task_evaluations',
-    'system_metrics': 'system_metrics'
+    'system_metrics': 'system_metrics',
+    'users': 'users',
+    'user_emails': 'user_emails'
 }
 
 # Required indexes for Firestore
@@ -267,14 +270,16 @@ class DatabaseOperations:
                 }
                 assignments.append(assignment)
             
-            # Update task
+            # Update task - ensure status is stored as string value
             task_ref.update({
                 'assigned_miners': miner_uids,
                 'task_assignments': assignments,
-                'status': TaskStatus.ASSIGNED,
+                'status': TaskStatus.ASSIGNED.value,  # Store as string value
                 'distributed_at': datetime.utcnow(),
                 'updated_at': datetime.utcnow()
             })
+            
+            print(f"✅ Updated task {task_id} status to 'assigned' with miners {miner_uids}")
             
             return True
         except Exception as e:
@@ -285,11 +290,21 @@ class DatabaseOperations:
     def get_tasks_by_status(db, status: TaskStatus, limit: int = 100) -> List[Dict[str, Any]]:
         """Get tasks by status"""
         try:
-            query = db.collection(COLLECTIONS['tasks']).where('status', '==', status).limit(limit)
+            # Normalize status to string if it's an enum
+            status_str = status.value if isinstance(status, TaskStatus) else status
+            
+            query = db.collection(COLLECTIONS['tasks']).where('status', '==', status_str).limit(limit)
             docs = query.stream()
-            return [doc.to_dict() for doc in docs]
+            tasks = []
+            for doc in docs:
+                task_data = doc.to_dict()
+                task_data['task_id'] = doc.id  # CRITICAL: Add task_id from document ID
+                tasks.append(task_data)
+            return tasks
         except Exception as e:
             print(f"❌ Error getting tasks by status: {e}")
+            import traceback
+            traceback.print_exc()
             return []
     
     @staticmethod
@@ -298,44 +313,68 @@ class DatabaseOperations:
         try:
             doc = db.collection(COLLECTIONS['tasks']).document(task_id).get()
             if doc.exists:
-                return doc.to_dict()
+                task_data = doc.to_dict()
+                task_data['task_id'] = doc.id  # CRITICAL: Add task_id from document ID
+                return task_data
             else:
                 return None
         except Exception as e:
             print(f"❌ Error getting task {task_id}: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     @staticmethod
     def get_miner_tasks(db, miner_uid: int, status: Optional[TaskStatus] = None) -> List[Dict[str, Any]]:
         """Get tasks assigned to a specific miner with proper status filtering"""
         try:
-            # Start with base query
+            # Normalize status to string if it's an enum
+            status_str = status.value if isinstance(status, TaskStatus) else (status or 'assigned')
+            
+            # Query for tasks with the specified status OR pending (in case assignment is in progress)
+            # This ensures miners get tasks even if status update is delayed
             query = db.collection(COLLECTIONS['tasks'])
             
-            # Always filter by status first - miners should only get assigned tasks
-            if status:
-                # If status is provided, use it (for flexibility)
-                query = query.where('status', '==', status)
-            else:
-                # Default: only return assigned tasks (not completed, failed, etc.)
-                query = query.where('status', '==', 'assigned')
-            
-            # Execute the status-filtered query
-            docs = query.stream()
+            # Query for both 'assigned' and 'pending' status to catch tasks in transition
+            # Firestore doesn't support OR queries directly, so we'll query separately and merge
             tasks = []
             
-            # Then filter by miner assignment
+            # Query 1: Get tasks with the requested status
+            status_query = query.where('status', '==', status_str)
+            docs = status_query.stream()
+            
             for doc in docs:
                 task_data = doc.to_dict()
+                task_data['task_id'] = doc.id  # CRITICAL: Add task_id from document ID
+                
                 # Only include tasks assigned to this specific miner
-                if miner_uid in task_data.get('assigned_miners', []):
+                assigned_miners = task_data.get('assigned_miners', [])
+                if miner_uid in assigned_miners:
                     tasks.append(task_data)
             
-            print(f"🔍 Found {len(tasks)} tasks for miner {miner_uid} with status '{status or 'assigned'}'")
+            # Query 2: Also check for 'pending' tasks if status was 'assigned' (to catch tasks being assigned)
+            if status_str == 'assigned':
+                pending_query = query.where('status', '==', 'pending')
+                pending_docs = pending_query.stream()
+                
+                for doc in pending_docs:
+                    task_data = doc.to_dict()
+                    task_data['task_id'] = doc.id
+                    
+                    # Check if this pending task is assigned to this miner
+                    assigned_miners = task_data.get('assigned_miners', [])
+                    if miner_uid in assigned_miners:
+                        # Only add if not already in tasks list (avoid duplicates)
+                        if not any(t.get('task_id') == doc.id for t in tasks):
+                            tasks.append(task_data)
+            
+            print(f"🔍 Found {len(tasks)} tasks for miner {miner_uid} with status '{status_str}' (including pending if applicable)")
             return tasks
             
         except Exception as e:
             print(f"❌ Error getting miner tasks for miner {miner_uid}: {e}")
+            import traceback
+            traceback.print_exc()
             return []
     
     @staticmethod
@@ -373,6 +412,32 @@ class DatabaseOperations:
         except Exception as e:
             print(f"❌ Error getting all miners: {e}")
             return []
+    
+    @staticmethod
+    def register_miner(db, miner_data: Dict[str, Any]) -> bool:
+        """Register or update a miner in the database"""
+        try:
+            miner_uid = miner_data.get('uid')
+            if not miner_uid:
+                print("❌ Cannot register miner without UID")
+                return False
+            
+            # Set default values
+            miner_data['updated_at'] = datetime.utcnow()
+            if 'registered_at' not in miner_data:
+                miner_data['registered_at'] = datetime.utcnow()
+            if 'last_seen' not in miner_data:
+                miner_data['last_seen'] = datetime.utcnow()
+            
+            # Store in miners collection
+            db.collection(COLLECTIONS['miners']).document(str(miner_uid)).set(miner_data, merge=True)
+            
+            print(f"✅ Miner {miner_uid} registered/updated successfully")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error registering miner: {e}")
+            return False
 
     @staticmethod
     def get_available_miners(db, task_type: str = None, limit: int = 10) -> List[Dict[str, Any]]:

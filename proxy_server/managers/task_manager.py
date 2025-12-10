@@ -24,7 +24,7 @@ class TaskManager:
         
         # Import and initialize batch database manager
         try:
-            from ..database.batch_manager import BatchDatabaseManager
+            from database.batch_manager import BatchDatabaseManager
             self.batch_manager = BatchDatabaseManager(db)
             print("✅ Batch database manager initialized")
         except ImportError as e:

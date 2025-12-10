@@ -11,15 +11,24 @@ _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+# Load environment variables from .env file early (before other imports)
+from dotenv import load_dotenv
+from pathlib import Path
+_env_file = Path(_project_root) / ".env"
+if _env_file.exists():
+    load_dotenv(_env_file)
+    print(f"✅ Loaded .env file from: {_env_file}")
+else:
+    load_dotenv()  # Try loading from current directory
+    print(f"ℹ️ No .env file found at {_env_file}, using system environment variables")
+
 import time
 import typing
 import bittensor as bt
 import httpx
 import asyncio
 import json
-import os
 from datetime import datetime
-from pathlib import Path
 import threading
 
 # Bittensor Miner Template:
@@ -67,62 +76,30 @@ class Miner(BaseMinerNeuron):
         self.last_task_query = 0
         self.task_query_interval = 10  # Query every 10 seconds
         
+        # Load miner API key from environment variable (like HF_TOKEN)
+        self.miner_api_key = os.getenv('MINER_API_KEY')
+        if not self.miner_api_key:
+            bt.logging.warning("⚠️  MINER_API_KEY not found in .env file. Miner endpoints will be rejected.")
+            bt.logging.warning("   Add MINER_API_KEY=<your_api_key> to your .env file")
+        else:
+            bt.logging.info(f"✅ Miner API key loaded from .env (length: {len(self.miner_api_key)})")
+        
         # Enhanced logging setup
         self.setup_enhanced_logging()
         
         # Record start time for uptime tracking
         self._start_time = time.time()
         
-        bt.logging.info("Initializing audio processing pipelines...")
+        bt.logging.info("Initializing pipeline manager for on-demand model loading...")
         
-        # Initialize transcription pipeline
-        try:
-            from template.pipelines.transcription_pipeline import TranscriptionPipeline
-            self.transcription_pipeline = TranscriptionPipeline()
-            bt.logging.info("✅ Transcription pipeline initialized")
-        except Exception as e:
-            bt.logging.error(f"❌ Failed to initialize transcription pipeline: {e}")
-            self.transcription_pipeline = None
+        # Initialize pipeline manager for dynamic model loading
+        # Models will be loaded only when tasks are assigned
+        # Import only the class definition, avoiding any module-level execution
+        from template.pipelines.pipeline_manager import PipelineManager
+        # Create a new instance - PipelineManager.__init__ only sets up empty dicts, no model loading
+        self.pipeline_manager = PipelineManager()
         
-        # Initialize TTS pipeline
-        try:
-            from template.pipelines.tts_pipeline import TTSPipeline
-            self.tts_pipeline = TTSPipeline()
-            bt.logging.info("✅ TTS pipeline initialized")
-        except ImportError as e:
-            bt.logging.warning(f"⚠️ TTS pipeline not available (TTS module not installed): {e}")
-            self.tts_pipeline = None
-        except Exception as e:
-            bt.logging.error(f"❌ Failed to initialize TTS pipeline: {e}")
-            self.tts_pipeline = None
-        
-        # Initialize summarization pipeline
-        try:
-            from template.pipelines.summarization_pipeline import SummarizationPipeline
-            bt.logging.info("🔄 Loading summarization pipeline (this may take a moment)...")
-            self.summarization_pipeline = SummarizationPipeline()
-            bt.logging.info("✅ Summarization pipeline initialized successfully")
-        except ImportError as e:
-            bt.logging.error(f"❌ Failed to import summarization pipeline: {e}")
-            bt.logging.error(f"   Make sure transformers and torch are properly installed")
-            self.summarization_pipeline = None
-        except Exception as e:
-            bt.logging.error(f"❌ Failed to initialize summarization pipeline: {e}")
-            bt.logging.error(f"   Error type: {type(e).__name__}")
-            import traceback
-            bt.logging.error(f"   Traceback: {traceback.format_exc()}")
-            self.summarization_pipeline = None
-        
-        # Initialize translation pipeline
-        try:
-            from template.pipelines.translation_pipeline import translation_pipeline
-            self.translation_pipeline = translation_pipeline
-            bt.logging.info("✅ Translation pipeline initialized")
-        except Exception as e:
-            bt.logging.error(f"❌ Failed to initialize translation pipeline: {e}")
-            self.translation_pipeline = None
-        
-        bt.logging.info("Audio processing pipelines initialization complete!")
+        bt.logging.info("✅ Pipeline manager initialized - models will be loaded on-demand when tasks are assigned")
         
         # Log configuration
         bt.logging.info(f"Axon IP: {self.config.axon.ip}")
@@ -323,9 +300,9 @@ class Miner(BaseMinerNeuron):
                     "uptime": time.time() - getattr(self, '_start_time', time.time())
                 },
                 "pipeline_status": {
-                    "transcription_pipeline": self.transcription_pipeline is not None,
-                    "tts_pipeline": self.tts_pipeline is not None,
-                    "summarization_pipeline": self.summarization_pipeline is not None
+                    "pipeline_manager": "ready",
+                    "models_loaded_on_demand": True,
+                    "cache_stats": self.pipeline_manager.get_cache_stats()
                 },
                 "system_info": {
                     "proxy_server_url": self.proxy_server_url,
@@ -510,8 +487,10 @@ Report generated automatically by Bittensor Miner
             # 🔒 DUPLICATE PROTECTION: Enhanced task filtering
             # Only request tasks that are actually eligible for processing
             async with httpx.AsyncClient(timeout=10.0) as client:
+                headers = self._get_auth_headers()
                 response = await client.get(
                     f"{self.proxy_server_url}/api/v1/miners/{miner_uid}/tasks",
+                    headers=headers,
                     params={
                         "status": "assigned",  # Only assigned tasks
                         "exclude_processing": "true"  # Exclude tasks already being processed
@@ -606,8 +585,10 @@ Report generated automatically by Bittensor Miner
             # Query for assigned tasks to find a real file to test with
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
+                    headers = self._get_auth_headers()
                     response = await client.get(
-                        f"{self.proxy_server_url}/api/v1/miners/{miner_uid}/tasks"
+                        f"{self.proxy_server_url}/api/v1/miners/{miner_uid}/tasks",
+                        headers=headers
                     )
                     
                     if response.status_code == 200:
@@ -644,17 +625,16 @@ Report generated automatically by Bittensor Miner
                                 if len(downloaded_data) > 1000:  # Should be at least 1KB
                                     bt.logging.info("✅ File download test PASSED - file size is valid")
                                     
-                                    # Test if we can process it (only if transcription pipeline is available)
-                                    if self.transcription_pipeline:
-                                        try:
-                                            result = await self.process_transcription_task(downloaded_data)
-                                            if result and "error" not in result:
-                                                bt.logging.info("✅ Transcription pipeline test PASSED")
-                                                bt.logging.info(f"   Transcript: {result.get('transcript', '')[:100]}...")
-                                            else:
-                                                bt.logging.debug("ℹ️ Transcription pipeline test - pipeline returned error (this is OK for testing)")
-                                        except Exception as e:
-                                            bt.logging.debug(f"ℹ️ Transcription pipeline test - {e} (this is OK for testing)")
+                                    # Test if we can process it (pipeline loads on-demand)
+                                    try:
+                                        result = await self.process_transcription_task(downloaded_data)
+                                        if result and "error" not in result:
+                                            bt.logging.info("✅ Transcription pipeline test PASSED")
+                                            bt.logging.info(f"   Transcript: {result.get('transcript', '')[:100]}...")
+                                        else:
+                                            bt.logging.debug("ℹ️ Transcription pipeline test - pipeline returned error (this is OK for testing)")
+                                    except Exception as e:
+                                        bt.logging.debug(f"ℹ️ Transcription pipeline test - {e} (this is OK for testing)")
                                     else:
                                         bt.logging.info("ℹ️ Transcription pipeline not available, skipping pipeline test")
                                 else:
@@ -684,8 +664,10 @@ Report generated automatically by Bittensor Miner
             
             # Test the endpoint with "assigned" status (tasks assigned to this miner)
             async with httpx.AsyncClient(timeout=10.0) as client:
+                headers = self._get_auth_headers()
                 response = await client.get(
                     f"{self.proxy_server_url}/api/v1/miners/{miner_uid}/tasks",
+                    headers=headers,
                     params={"status": "assigned"}  # Correct: Miner should process assigned tasks
                 )
                 
@@ -922,48 +904,36 @@ Report generated automatically by Bittensor Miner
                 # Process task using existing pipeline
                 bt.logging.info(f"🔄 Routing task {task_id} to {task_type} pipeline...")
                 
-                # Check pipeline availability first
-                if task_type == "transcription" and self.transcription_pipeline is None:
-                    error_msg = f"Transcription pipeline not available for task {task_id}"
-                    bt.logging.error(f"❌ {error_msg}")
-                    self.log_task_completion(task_id, task_type, miner_uid, 0.0, False, {}, error_msg)
-                    return
-                elif task_type == "tts" and self.tts_pipeline is None:
-                    error_msg = f"TTS pipeline not available for task {task_id}"
-                    bt.logging.error(f"❌ {error_msg}")
-                    self.log_task_completion(task_id, task_type, miner_uid, 0.0, False, {}, error_msg)
-                    return
-                elif task_type == "summarization" and self.summarization_pipeline is None:
-                    error_msg = f"Summarization pipeline not available for task {task_id}"
-                    bt.logging.error(f"❌ {error_msg}")
-                    self.log_task_completion(task_id, task_type, miner_uid, 0.0, False, {}, error_msg)
-                    return
-                elif task_type == "video_transcription" and self.transcription_pipeline is None:
-                    error_msg = f"Transcription pipeline not available for video transcription task {task_id}"
-                    bt.logging.error(f"❌ {error_msg}")
-                    self.log_task_completion(task_id, task_type, miner_uid, 0.0, False, {}, error_msg)
-                    return
-                elif task_type in ["text_translation", "document_translation"] and not hasattr(self, 'translation_pipeline'):
-                    error_msg = f"Translation pipeline not available for {task_type} task {task_id}"
-                    bt.logging.error(f"❌ {error_msg}")
-                    self.log_task_completion(task_id, task_type, miner_uid, 0.0, False, {}, error_msg)
-                    return
+                # Pipeline availability will be checked when loading models on-demand
+                # No need to check here since models load when tasks are assigned
+                
+                # Get model_id and language from task if specified
+                model_id = task_data.get("model_id")
+                source_language = task_data.get("source_language", "en")
+                target_language = task_data.get("target_language")
+                
+                if model_id:
+                    bt.logging.info(f"📦 Task {task_id} specifies model: {model_id}")
+                if source_language:
+                    bt.logging.info(f"🌐 Task {task_id} specifies source language: {source_language}")
+                if target_language:
+                    bt.logging.info(f"🌐 Task {task_id} specifies target language: {target_language}")
                 
                 # Process task using appropriate pipeline
                 start_time = time.time()
                 try:
                     if task_type == "transcription":
-                        result = await self.process_transcription_task(input_data)
+                        result = await self.process_transcription_task(input_data, model_id=model_id, language=source_language)
                     elif task_type == "tts":
-                        result = await self.process_tts_task(input_data)
+                        result = await self.process_tts_task(input_data, model_id=model_id, language=source_language)
                     elif task_type == "summarization":
-                        result = await self.process_summarization_task(input_data)
+                        result = await self.process_summarization_task(input_data, model_id=model_id, language=source_language)
                     elif task_type == "video_transcription":
-                        result = await self.process_video_transcription_task(input_data, task_data)
+                        result = await self.process_video_transcription_task(input_data, task_data, model_id=model_id, language=source_language)
                     elif task_type == "text_translation":
-                        result = await self.process_text_translation_task(task_data)
+                        result = await self.process_text_translation_task(task_data, model_id=model_id, source_language=source_language, target_language=target_language)
                     elif task_type == "document_translation":
-                        result = await self.process_document_translation_task(input_data, task_data)
+                        result = await self.process_document_translation_task(input_data, task_data, model_id=model_id, source_language=source_language, target_language=target_language)
                     else:
                         error_msg = f"Unknown task type: {task_type}"
                         bt.logging.error(f"❌ {error_msg}")
@@ -1017,13 +987,21 @@ Report generated automatically by Bittensor Miner
             else:
                 bt.logging.error(f"❌ Error processing task: {e}")
 
+    def _get_auth_headers(self) -> dict:
+        """Get authentication headers with API key"""
+        headers = {}
+        if self.miner_api_key:
+            headers["X-API-Key"] = self.miner_api_key
+        return headers
+    
     async def download_file_from_proxy(self, file_url: str):
         """Download input file from proxy server"""
         try:
             bt.logging.info(f"📥 Downloading file from: {file_url}")
             
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(file_url)
+                headers = self._get_auth_headers()
+                response = await client.get(file_url, headers=headers)
                 response.raise_for_status()
                 
                 # Log response details for debugging
@@ -1131,7 +1109,8 @@ Report generated automatically by Bittensor Miner
             
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
-                    response = await client.get(f"{self.proxy_server_url}/api/v1/miner/summarization/{task_id}")
+                    headers = self._get_auth_headers()
+                    response = await client.get(f"{self.proxy_server_url}/api/v1/miner/summarization/{task_id}", headers=headers)
                     
                     if response.status_code == 200:
                         response_data = response.json()
@@ -1194,7 +1173,8 @@ Report generated automatically by Bittensor Miner
             
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
-                    response = await client.get(f"{self.proxy_server_url}/api/v1/miner/tts/{task_id}")
+                    headers = self._get_auth_headers()
+                    response = await client.get(f"{self.proxy_server_url}/api/v1/miner/tts/{task_id}", headers=headers)
                     
                     if response.status_code == 200:
                         response_data = response.json()
@@ -1226,10 +1206,13 @@ Report generated automatically by Bittensor Miner
             bt.logging.error(f"❌ Error extracting TTS data: {e}")
             return None
     
-    async def process_transcription_task(self, audio_data: bytes):
-        """Process transcription task using existing pipeline"""
+    async def process_transcription_task(self, audio_data: bytes, model_id: Optional[str] = None, language: str = "en"):
+        """Process transcription task using pipeline with specified model and language"""
         try:
-            if self.transcription_pipeline is None:
+            # Get pipeline with specified model (loads on-demand)
+            bt.logging.info(f"🔄 Loading transcription pipeline with model: {model_id or 'default'}")
+            pipeline = self.pipeline_manager.get_transcription_pipeline(model_id)
+            if pipeline is None:
                 raise Exception("Transcription pipeline not available")
             
             # Validate input data
@@ -1239,11 +1222,17 @@ Report generated automatically by Bittensor Miner
             if len(audio_data) == 0:
                 raise Exception("Audio data is empty")
             
-            bt.logging.info(f"🎵 Processing {len(audio_data)} bytes of audio data...")
+            # Validate and normalize language code
+            language = language.lower() if language else "en"
+            supported_languages = pipeline.language_codes.keys()
+            if language not in supported_languages:
+                bt.logging.warning(f"⚠️ Language '{language}' may not be fully supported, using anyway")
             
-            # Process audio data
-            transcribed_text, processing_time = self.transcription_pipeline.transcribe(
-                audio_data, language="en"
+            bt.logging.info(f"🎵 Processing {len(audio_data)} bytes of audio data in language: {language}...")
+            
+            # Process audio data with specified language
+            transcribed_text, processing_time = pipeline.transcribe(
+                audio_data, language=language
             )
             
             bt.logging.info(f"✅ Transcription completed: {len(transcribed_text)} characters in {processing_time:.2f}s")
@@ -1252,7 +1241,7 @@ Report generated automatically by Bittensor Miner
                 "transcript": transcribed_text,
                 "confidence": 0.95,  # Mock confidence score
                 "processing_time": processing_time,
-                "language": "en"
+                "language": language  # Return the actual language used
             }
             
         except Exception as e:
@@ -1281,14 +1270,17 @@ Report generated automatically by Bittensor Miner
                 "error": str(e)
             }
     
-    async def process_tts_task(self, text_data: str):
-        """Process TTS task using existing pipeline"""
+    async def process_tts_task(self, text_data: str, model_id: Optional[str] = None):
+        """Process TTS task using pipeline with specified model (loads on-demand)"""
         try:
-            if self.tts_pipeline is None:
+            # Get pipeline with specified model (loads on-demand)
+            bt.logging.info(f"🔄 Loading TTS pipeline with model: {model_id or 'default'}")
+            pipeline = self.pipeline_manager.get_tts_pipeline(model_id)
+            if pipeline is None:
                 raise Exception("TTS pipeline not available")
             
             # Process text data
-            audio_bytes, processing_time = self.tts_pipeline.synthesize(
+            audio_bytes, processing_time = pipeline.synthesize(
                 text_data, language="en"
             )
             
@@ -1424,20 +1416,14 @@ Report generated automatically by Bittensor Miner
             miner_uid = self.uid if hasattr(self, 'uid') else 0
             self.log_response(task_id, "tts", miner_uid, {}, 0.0, 0, False, error_msg)
 
-    async def process_summarization_task(self, summarization_data: dict):
-        """Process summarization task using existing pipeline with language support"""
+    async def process_summarization_task(self, summarization_data: dict, model_id: Optional[str] = None):
+        """Process summarization task using pipeline with specified model (loads on-demand)"""
         try:
-            # Check if pipeline is available, try to reinitialize if needed
-            if self.summarization_pipeline is None:
-                bt.logging.warning("⚠️ Summarization pipeline not initialized, attempting to initialize now...")
-                try:
-                    from template.pipelines.summarization_pipeline import SummarizationPipeline
-                    self.summarization_pipeline = SummarizationPipeline()
-                    bt.logging.info("✅ Summarization pipeline initialized successfully (lazy init)")
-                except Exception as e:
-                    error_msg = f"Summarization pipeline not available and failed to initialize: {str(e)}"
-                    bt.logging.error(f"❌ {error_msg}")
-                    raise Exception(error_msg)
+            # Get pipeline with specified model (loads on-demand)
+            bt.logging.info(f"🔄 Loading summarization pipeline with model: {model_id or 'default'}")
+            pipeline = self.pipeline_manager.get_summarization_pipeline(model_id)
+            if pipeline is None:
+                raise Exception("Summarization pipeline not available")
             
             # Extract text and language information
             text = summarization_data.get("text", "")
@@ -1463,7 +1449,7 @@ Report generated automatically by Bittensor Miner
             processing_language = source_language
             
             # Process text data with language support
-            summary_text, processing_time = self.summarization_pipeline.summarize(
+            summary_text, processing_time = pipeline.summarize(
                 text, language=processing_language
             )
             
@@ -1502,10 +1488,13 @@ Report generated automatically by Bittensor Miner
             }
             return error_result
 
-    async def process_tts_task(self, tts_data: dict):
-        """Process TTS task using existing pipeline with language support"""
+    async def process_tts_task(self, tts_data: dict, model_id: Optional[str] = None):
+        """Process TTS task using pipeline with specified model or default"""
         try:
-            if self.tts_pipeline is None:
+            # Get pipeline with specified model (loads on-demand)
+            bt.logging.info(f"🔄 Loading TTS pipeline with model: {model_id or 'default'}")
+            pipeline = self.pipeline_manager.get_tts_pipeline(model_id)
+            if pipeline is None:
                 raise Exception("TTS pipeline not available")
             
             # Extract text and language information
@@ -1532,7 +1521,7 @@ Report generated automatically by Bittensor Miner
             processing_language = source_language
             
             # Process text data with language support
-            audio_data, processing_time = self.tts_pipeline.synthesize(
+            audio_data, processing_time = pipeline.synthesize(
                 text, language=processing_language
             )
             
@@ -1641,10 +1630,17 @@ Report generated automatically by Bittensor Miner
                 "error": str(e)
             }
     
-    async def process_video_transcription_task(self, video_data: bytes, task_data: dict):
+    async def process_video_transcription_task(self, video_data: bytes, task_data: dict, model_id: Optional[str] = None):
         """Process video transcription task - extract audio and transcribe"""
         try:
-            if self.transcription_pipeline is None:
+            # Get model_id from task_data if not provided
+            if model_id is None:
+                model_id = task_data.get("model_id")
+            
+            # Get pipeline with specified model (loads on-demand)
+            bt.logging.info(f"🔄 Loading transcription pipeline with model: {model_id or 'default'} for video transcription")
+            pipeline = self.pipeline_manager.get_transcription_pipeline(model_id)
+            if pipeline is None:
                 raise Exception("Transcription pipeline not available")
             
             # Import video processing utilities
@@ -1680,7 +1676,7 @@ Report generated automatically by Bittensor Miner
             
             # Transcribe the extracted audio
             bt.logging.info(f"🎵 Transcribing extracted audio...")
-            transcribed_text, processing_time = self.transcription_pipeline.transcribe(
+            transcribed_text, processing_time = pipeline.transcribe(
                 audio_bytes, language=source_language
             )
             
@@ -1718,10 +1714,14 @@ Report generated automatically by Bittensor Miner
                 "error": str(e)
             }
     
-    async def process_text_translation_task(self, task_data: dict):
+    async def process_text_translation_task(self, task_data: dict, model_id: Optional[str] = None):
         """Process text translation task from proxy server"""
         try:
             task_id = task_data.get("task_id")
+            # Get model_id from task_data if not provided
+            if model_id is None:
+                model_id = task_data.get("model_id")
+            
             bt.logging.info(f"🌐 Processing text translation task {task_id} from proxy server")
             
             # Extract translation data
@@ -1736,7 +1736,7 @@ Report generated automatically by Bittensor Miner
             
             # Process the text translation task
             start_time = time.time()
-            result = await self.process_text_translation(translation_data)
+            result = await self.process_text_translation(translation_data, model_id=model_id)
             processing_time = time.time() - start_time
             
             # Validate result before submission
@@ -1800,10 +1800,14 @@ Report generated automatically by Bittensor Miner
             miner_uid = self.uid if hasattr(self, 'uid') else 0
             self.log_response(task_id, "document_translation", miner_uid, {}, 0.0, 0, False, error_msg)
 
-    async def process_document_translation_task(self, document_data, task_data: dict):
+    async def process_document_translation_task(self, document_data, task_data: dict, model_id: Optional[str] = None):
         """Process document translation task from proxy server"""
         try:
             task_id = task_data.get("task_id")
+            # Get model_id from task_data if not provided
+            if model_id is None:
+                model_id = task_data.get("model_id")
+            
             bt.logging.info(f"📄 Processing document translation task {task_id} from proxy server")
             
             # Extract translation data
@@ -1818,7 +1822,7 @@ Report generated automatically by Bittensor Miner
             
             # Process the document translation task
             start_time = time.time()
-            result = await self.process_document_translation(document_data, translation_data)
+            result = await self.process_document_translation(document_data, translation_data, model_id=model_id)
             processing_time = time.time() - start_time
             
             # Validate result before submission
@@ -1868,7 +1872,8 @@ Report generated automatically by Bittensor Miner
             bt.logging.info(f"🔍 Fetching text translation data from proxy API for task {task_id}")
             
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(f"{self.proxy_server_url}/api/v1/miner/text-translation/{task_id}")
+                headers = self._get_auth_headers()
+                response = await client.get(f"{self.proxy_server_url}/api/v1/miner/text-translation/{task_id}", headers=headers)
                 
                 if response.status_code == 200:
                     data = response.json()
@@ -1910,7 +1915,8 @@ Report generated automatically by Bittensor Miner
             bt.logging.info(f"🔍 Fetching document translation data from proxy API for task {task_id}")
             
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(f"{self.proxy_server_url}/api/v1/miner/document-translation/{task_id}")
+                headers = self._get_auth_headers()
+                response = await client.get(f"{self.proxy_server_url}/api/v1/miner/document-translation/{task_id}", headers=headers)
                 
                 if response.status_code == 200:
                     data = response.json()
@@ -1933,10 +1939,13 @@ Report generated automatically by Bittensor Miner
             bt.logging.error(f"❌ Error extracting document translation data: {e}")
             return None
     
-    async def process_text_translation(self, translation_data: dict) -> dict:
-        """Process text translation using translation pipeline"""
+    async def process_text_translation(self, translation_data: dict, model_id: Optional[str] = None) -> dict:
+        """Process text translation using translation pipeline with specified model or default"""
         try:
-            if self.translation_pipeline is None:
+            # Get pipeline with specified model (loads on-demand)
+            bt.logging.info(f"🔄 Loading translation pipeline with model: {model_id or 'default'} for text translation")
+            pipeline = self.pipeline_manager.get_translation_pipeline(model_id)
+            if pipeline is None:
                 raise Exception("Translation pipeline not available")
             
             # Extract translation parameters
@@ -1952,7 +1961,7 @@ Report generated automatically by Bittensor Miner
                 raise Exception("No text provided for translation")
             
             # Process text translation
-            translated_text, processing_time = self.translation_pipeline.translate_text(
+            translated_text, processing_time = pipeline.translate_text(
                 text, source_language, target_language
             )
             
@@ -1981,10 +1990,13 @@ Report generated automatically by Bittensor Miner
                 "error": str(e)
             }
     
-    async def process_document_translation(self, document_data, translation_data: dict) -> dict:
-        """Process document translation using translation pipeline"""
+    async def process_document_translation(self, document_data, translation_data: dict, model_id: Optional[str] = None) -> dict:
+        """Process document translation using translation pipeline with specified model or default"""
         try:
-            if self.translation_pipeline is None:
+            # Get pipeline with specified model (loads on-demand)
+            bt.logging.info(f"🔄 Loading translation pipeline with model: {model_id or 'default'} for document translation")
+            pipeline = self.pipeline_manager.get_translation_pipeline(model_id)
+            if pipeline is None:
                 raise Exception("Translation pipeline not available")
             
             # Extract translation parameters
@@ -2001,7 +2013,7 @@ Report generated automatically by Bittensor Miner
                 raise Exception("No document data provided for translation")
             
             # Process document translation
-            translated_text, processing_time, metadata = self.translation_pipeline.translate_document(
+            translated_text, processing_time, metadata = pipeline.translate_document(
                 document_data, filename, source_language, target_language
             )
             
@@ -2051,7 +2063,8 @@ Report generated automatically by Bittensor Miner
             bt.logging.info(f"📤 Submitting text translation result to proxy server for task {task_id}")
             
             async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(callback_url, data=form_data)
+                headers = self._get_auth_headers()
+                response = await client.post(callback_url, headers=headers, data=form_data)
                 
                 if response.status_code == 200:
                     bt.logging.info(f"✅ Text translation result submitted successfully for task {task_id}")
@@ -2083,7 +2096,8 @@ Report generated automatically by Bittensor Miner
             bt.logging.info(f"📤 Submitting document translation result to proxy server for task {task_id}")
             
             async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(callback_url, data=form_data)
+                headers = self._get_auth_headers()
+                response = await client.post(callback_url, headers=headers, data=form_data)
                 
                 if response.status_code == 200:
                     bt.logging.info(f"✅ Document translation result submitted successfully for task {task_id}")
@@ -2128,6 +2142,7 @@ Report generated automatically by Bittensor Miner
             bt.logging.info(f"   Speed Score: {response_payload['speed_score']:.2f}")
             
             async with httpx.AsyncClient(timeout=10.0) as client:
+                headers = self._get_auth_headers()
                 # Convert to Form data as expected by proxy
                 form_data = {
                     'task_id': response_payload['task_id'],
@@ -2139,7 +2154,7 @@ Report generated automatically by Bittensor Miner
                 }
                 
                 submit_start_time = time.time()
-                response = await client.post(callback_url, data=form_data)
+                response = await client.post(callback_url, headers=headers, data=form_data)
                 submit_time = time.time() - submit_start_time
                 
                 if response.status_code == 200:
@@ -2515,7 +2530,8 @@ Report generated automatically by Bittensor Miner
                 }
                 
                 submit_start_time = time.time()
-                response = await client.post(callback_url, files=files, data=data)
+                headers = self._get_auth_headers()
+                response = await client.post(callback_url, headers=headers, files=files, data=data)
                 submit_time = time.time() - submit_start_time
                 
                 if response.status_code == 200:

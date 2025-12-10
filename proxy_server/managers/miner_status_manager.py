@@ -229,9 +229,33 @@ class MinerStatusManager:
                 miner_data = doc.to_dict()
                 
                 # Check if miner is currently serving and recently seen
-                if (miner_data.get('is_serving', False) and 
-                    miner_data.get('last_seen') and
-                    (current_time - miner_data['last_seen']).total_seconds() < self.miner_timeout):
+                if miner_data.get('is_serving', False) and miner_data.get('last_seen'):
+                    try:
+                        # Handle different timestamp formats (timezone-aware/naive)
+                        last_seen = miner_data['last_seen']
+                        if isinstance(last_seen, datetime):
+                            # If timezone-aware, convert to naive
+                            if last_seen.tzinfo is not None:
+                                last_seen = last_seen.replace(tzinfo=None)
+                            time_diff = (current_time - last_seen).total_seconds()
+                        elif hasattr(last_seen, 'timestamp'):  # Firestore Timestamp
+                            time_diff = (current_time.timestamp() - last_seen.timestamp())
+                        elif isinstance(last_seen, str):
+                            from dateutil import parser
+                            last_seen_dt = parser.parse(last_seen)
+                            if last_seen_dt.tzinfo:
+                                last_seen_dt = last_seen_dt.replace(tzinfo=None)
+                            time_diff = (current_time - last_seen_dt).total_seconds()
+                        else:
+                            # Unknown format, skip this miner
+                            continue
+                        
+                        # Check if miner was seen recently
+                        if time_diff >= self.miner_timeout:
+                            continue
+                    except Exception as e:
+                        print(f"⚠️ Error checking last_seen for miner {miner_data.get('uid', 'unknown')}: {e}")
+                        continue
                     
                     # Check task type specialization if specified
                     if task_type and miner_data.get('task_type_specialization'):

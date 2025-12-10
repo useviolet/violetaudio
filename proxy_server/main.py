@@ -10,7 +10,7 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from enum import Enum
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, File, UploadFile, Form, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, File, UploadFile, Form, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, validator
@@ -29,6 +29,13 @@ from managers.file_manager import FileManager
 from managers.miner_response_handler import MinerResponseHandler
 from orchestrators.workflow_orchestrator import WorkflowOrchestrator
 from api.validator_integration import ValidatorIntegrationAPI
+
+# Import AuthMiddleware for type hints (lazy import to avoid circular dependencies)
+try:
+    from middleware.auth_middleware import AuthMiddleware
+except ImportError:
+    # Fallback for type checking - will be imported when needed
+    AuthMiddleware = None  # type: ignore
 
 def create_safe_filename(original_filename: str) -> str:
     """Create a safe filename for storage by removing problematic characters"""
@@ -472,12 +479,18 @@ async def startup_event():
                         consensus_data = doc.to_dict()
                         consensus_status = consensus_data.get('consensus_status', {})
                         
-                        # Only include miners with high consensus confidence
+                        # Only include miners with consensus confidence (lower threshold for single validator)
                         consensus_confidence = consensus_data.get('consensus_confidence', 0.0)
-                        if consensus_confidence < 0.7:  # Minimum confidence threshold
+                        if consensus_confidence < 0.3:  # Lower threshold to allow single-validator scenarios
                             continue
                         
-                        if consensus_status.get('is_serving') and consensus_status.get('stake', 0) > 0:
+                        # Remove stake requirement - allow miners with 0 stake (they can still be active)
+                        if consensus_status.get('is_serving'):
+                            # Get miner_uid from consensus_data or consensus_status
+                            miner_uid = consensus_data.get('miner_uid') or consensus_status.get('uid')
+                            if not miner_uid:
+                                continue
+                            
                             # Calculate availability score based on consensus data
                             performance_score = consensus_status.get('performance_score', 0.5)
                             stake = float(consensus_status.get('stake', 0))
@@ -492,7 +505,7 @@ async def startup_event():
                                 performance_score * (1 - current_load/max_capacity) + consensus_boost))
                             
                             consensus_miners.append({
-                                'uid': consensus_status['uid'],
+                                'uid': miner_uid,
                                 'hotkey': consensus_status.get('hotkey', 'unknown'),
                                 'stake': stake,
                                 'availability_score': availability_score,
@@ -527,9 +540,41 @@ async def startup_event():
                     docs = query.stream()
                     
                     available_miners = []
+                    current_time = datetime.utcnow()
                     for doc in docs:
                         miner_data = doc.to_dict()
-                        if miner_data.get('is_serving') and miner_data.get('stake', 0) > 0:
+                        # Remove stake requirement - allow miners with 0 stake
+                        if miner_data.get('is_serving'):
+                            # Check last_seen with timezone handling
+                            last_seen = miner_data.get('last_seen')
+                            if last_seen:
+                                try:
+                                    # Handle different timestamp formats
+                                    if isinstance(last_seen, datetime):
+                                        if last_seen.tzinfo is not None:
+                                            last_seen = last_seen.replace(tzinfo=None)
+                                        time_diff = (current_time - last_seen).total_seconds()
+                                    elif hasattr(last_seen, 'timestamp'):  # Firestore Timestamp
+                                        time_diff = (current_time.timestamp() - last_seen.timestamp())
+                                    elif isinstance(last_seen, str):
+                                        from dateutil import parser
+                                        last_seen_dt = parser.parse(last_seen)
+                                        if last_seen_dt.tzinfo:
+                                            last_seen_dt = last_seen_dt.replace(tzinfo=None)
+                                        time_diff = (current_time - last_seen_dt).total_seconds()
+                                    else:
+                                        # Unknown format, skip
+                                        continue
+                                    
+                                    # Skip stale miners (not seen in last 15 minutes)
+                                    if time_diff >= 900:  # 15 minutes
+                                        continue
+                                except Exception as e:
+                                    print(f"⚠️ Error checking last_seen for miner {miner_data.get('uid', 'unknown')}: {e}")
+                                    continue
+                            else:
+                                # No last_seen, skip this miner
+                                continue
                             # Calculate availability score based on performance and stake
                             performance_score = miner_data.get('performance_score', 0.5)
                             stake = float(miner_data.get('stake', 0))
@@ -644,11 +689,66 @@ async def shutdown_event():
 
 # API Endpoints
 
+def get_auth_middleware():
+    """Dependency to get auth middleware instance"""
+    from middleware.auth_middleware import AuthMiddleware
+    return AuthMiddleware(db_manager.get_db())
+
+def require_miner_auth(
+    http_request: Request,
+    auth_middleware: AuthMiddleware = Depends(get_auth_middleware)
+):
+    """Dependency to require miner authentication (admin can also access)"""
+    api_key = http_request.headers.get("X-API-Key") or http_request.query_params.get("api_key")
+    user_info = auth_middleware.verify_api_key(api_key)
+    
+    # Role is already validated in verify_api_key, but double-check for security
+    role = user_info.get('role')
+    allowed_roles = {'miner', 'admin'}
+    if not role or role not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Miner or admin role required")
+    
+    return user_info
+
+def require_validator_auth(
+    http_request: Request,
+    auth_middleware: AuthMiddleware = Depends(get_auth_middleware)
+):
+    """Dependency to require validator authentication (admin can also access)"""
+    api_key = http_request.headers.get("X-API-Key") or http_request.query_params.get("api_key")
+    user_info = auth_middleware.verify_api_key(api_key)
+    
+    # Role is already validated in verify_api_key, but double-check for security
+    role = user_info.get('role')
+    allowed_roles = {'validator', 'admin'}
+    if not role or role not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Validator or admin role required")
+    
+    return user_info
+
+def require_client_auth(
+    http_request: Request,
+    auth_middleware: AuthMiddleware = Depends(get_auth_middleware)
+):
+    """Dependency to require client authentication (admin can also access)"""
+    api_key = http_request.headers.get("X-API-Key") or http_request.query_params.get("api_key")
+    user_info = auth_middleware.verify_api_key(api_key)
+    
+    # Role is already validated in verify_api_key, but double-check for security
+    role = user_info.get('role')
+    allowed_roles = {'client', 'admin'}
+    if not role or role not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Client or admin role required")
+    
+    return user_info
+
 @app.post("/api/v1/transcription")
 async def submit_transcription_task(
+    user_info: dict = Depends(require_client_auth),
     audio_file: UploadFile = File(...),
     source_language: str = Form("en"),
-    priority: str = Form("normal")
+    priority: str = Form("normal"),
+    model_id: str = Form(None)  # Optional HuggingFace model ID (e.g., "openai/whisper-tiny", "openai/whisper-base", etc.)
 ):
     """Submit transcription task"""
     try:
@@ -695,6 +795,7 @@ async def submit_transcription_task(
             },
             'priority': priority,
             'source_language': source_language,
+            'model_id': model_id if model_id else None,  # Store model_id if provided
             'required_miner_count': 3
         }
         
@@ -726,19 +827,42 @@ async def submit_transcription_task(
             "message": "Transcription task submitted successfully"
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
+        error_msg = str(e)
+        # Check if it's a Firebase storage error
+        if "403" in error_msg or "storage.googleapis.com" in error_msg or "Firebase" in error_msg or "not configured" in error_msg:
+            raise HTTPException(
+                status_code=503,
+                detail="File storage is not configured. Please configure Firebase credentials to enable file uploads."
+            )
         raise HTTPException(status_code=500, detail=f"Failed to submit task: {str(e)}")
 
 @app.post("/api/v1/tts")
 async def submit_tts_task(
-    text: str = Form(...),
-    source_language: str = Form("en"),
-    priority: str = Form("normal")
+    request: Request,
+    user_info: dict = Depends(require_client_auth)
 ):
-    """Submit text-to-speech task with text stored directly in database"""
+    """Submit text-to-speech task with text stored directly in database - accepts both JSON and Form data"""
     try:
+        # Try to parse as JSON first, fallback to Form
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+            text = body.get("text", "")
+            source_language = body.get("source_language", "en")
+            priority = body.get("priority", "normal")
+            model_id = body.get("model_id", None)  # Optional HuggingFace model ID
+        else:
+            form_data = await request.form()
+            text = form_data.get("text", "")
+            source_language = form_data.get("source_language", "en")
+            priority = form_data.get("priority", "normal")
+            model_id = form_data.get("model_id", None)  # Optional HuggingFace model ID
+        
         # Validate text length
-        if len(text.strip()) < 10:
+        if not text or len(text.strip()) < 10:
             raise HTTPException(status_code=400, detail="Text too short for TTS (min 10 characters)")
         
         # Use the source language provided by the user
@@ -768,6 +892,7 @@ async def submit_tts_task(
             'input_text': text_content,
             'priority': priority,
             'source_language': detected_language,
+            'model_id': model_id if model_id else None,  # Store model_id if provided
             'required_miner_count': 3
         }
         
@@ -822,14 +947,28 @@ async def submit_tts_task(
 
 @app.post("/api/v1/summarization")
 async def submit_summarization_task(
-    text: str = Form(...),
-    source_language: str = Form("en"),
-    priority: str = Form("normal")
+    request: Request,
+    user_info: dict = Depends(require_client_auth)
 ):
-    """Submit summarization task with text stored directly in database"""
+    """Submit summarization task with text stored directly in database - accepts both JSON and Form data"""
     try:
+        # Try to parse as JSON first, fallback to Form
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+            text = body.get("text", "")
+            source_language = body.get("source_language", "en")
+            priority = body.get("priority", "normal")
+            model_id = body.get("model_id", None)  # Optional HuggingFace model ID
+        else:
+            form_data = await request.form()
+            text = form_data.get("text", "")
+            source_language = form_data.get("source_language", "en")
+            priority = form_data.get("priority", "normal")
+            model_id = form_data.get("model_id", None)  # Optional HuggingFace model ID
+        
         # Validate text length
-        if len(text.strip()) < 50:
+        if not text or len(text.strip()) < 50:
             raise HTTPException(status_code=400, detail="Text too short for summarization (min 50 characters)")
         
         # Use the source language provided by the user
@@ -859,6 +998,7 @@ async def submit_summarization_task(
             'input_text': text_content,
             'priority': priority,
             'source_language': detected_language,
+            'model_id': model_id if model_id else None,  # Store model_id if provided
             'required_miner_count': 3
         }
         
@@ -916,11 +1056,20 @@ async def submit_summarization_task(
 @app.post("/api/v1/video-transcription")
 async def submit_video_transcription_task(
     video_file: UploadFile = File(...),
+    user_info: dict = Depends(require_client_auth),
     source_language: str = Form("en"),
-    priority: str = Form("normal")
+    priority: str = Form("normal"),
+    model_id: str = Form(None)  # Optional HuggingFace model ID
 ):
     """Submit video transcription task - miner will extract audio and transcribe"""
     try:
+        # Check if Firebase storage is enabled
+        if not file_manager.firebase_storage_manager or not file_manager.firebase_storage_manager.enabled:
+            raise HTTPException(
+                status_code=503, 
+                detail="File storage is not configured. Please configure Firebase credentials to enable file uploads."
+            )
+        
         # Validate file type
         if not video_file.content_type.startswith('video/'):
             raise HTTPException(status_code=400, detail="File must be a video file")
@@ -970,6 +1119,7 @@ async def submit_video_transcription_task(
             },
             'priority': priority,
             'source_language': source_language,
+            'model_id': model_id if model_id else None,  # Store model_id if provided
             'required_miner_count': 3
         }
         
@@ -1019,19 +1169,41 @@ async def submit_video_transcription_task(
     except HTTPException:
         raise
     except Exception as e:
+        error_msg = str(e)
+        # Check if it's a Firebase storage error
+        if "403" in error_msg or "storage.googleapis.com" in error_msg or "Firebase" in error_msg or "not configured" in error_msg:
+            raise HTTPException(
+                status_code=503,
+                detail="File storage is not configured. Please configure Firebase credentials to enable file uploads."
+            )
         raise HTTPException(status_code=500, detail=f"Failed to submit video transcription task: {str(e)}")
 
 @app.post("/api/v1/text-translation")
 async def submit_text_translation_task(
-    text: str = Form(...),
-    source_language: str = Form(...),
-    target_language: str = Form(...),
-    priority: str = Form("normal")
+    request: Request,
+    user_info: dict = Depends(require_client_auth)
 ):
-    """Submit text translation task with text stored directly in database"""
+    """Submit text translation task with text stored directly in database - accepts both JSON and Form data"""
     try:
+        # Try to parse as JSON first, fallback to Form
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+            text = body.get("text", "")
+            source_language = body.get("source_language", "")
+            target_language = body.get("target_language", "")
+            priority = body.get("priority", "normal")
+            model_id = body.get("model_id", None)  # Optional HuggingFace model ID
+        else:
+            form_data = await request.form()
+            text = form_data.get("text", "")
+            source_language = form_data.get("source_language", "")
+            target_language = form_data.get("target_language", "")
+            priority = form_data.get("priority", "normal")
+            model_id = form_data.get("model_id", None)  # Optional HuggingFace model ID
+        
         # Validate text length
-        if len(text.strip()) < 10:
+        if not text or len(text.strip()) < 10:
             raise HTTPException(status_code=400, detail="Text too short for translation (min 10 characters)")
         
         # Validate language codes
@@ -1062,6 +1234,7 @@ async def submit_text_translation_task(
             'priority': priority,
             'source_language': source_language,
             'target_language': target_language,
+            'model_id': model_id if model_id else None,  # Store model_id if provided
             'required_miner_count': 3
         }
         
@@ -1117,10 +1290,12 @@ async def submit_text_translation_task(
 
 @app.post("/api/v1/document-translation")
 async def submit_document_translation_task(
+    user_info: dict = Depends(require_client_auth),
     document_file: UploadFile = File(...),
     source_language: str = Form(...),
     target_language: str = Form(...),
-    priority: str = Form("normal")
+    priority: str = Form("normal"),
+    model_id: str = Form(None)  # Optional HuggingFace model ID
 ):
     """Submit document translation task - miner will extract text and translate"""
     try:
@@ -1184,6 +1359,7 @@ async def submit_document_translation_task(
             'priority': priority,
             'source_language': source_language,
             'target_language': target_language,
+            'model_id': model_id if model_id else None,  # Store model_id if provided
             'required_miner_count': 3
         }
         
@@ -1237,6 +1413,13 @@ async def submit_document_translation_task(
     except HTTPException:
         raise
     except Exception as e:
+        error_msg = str(e)
+        # Check if it's a Firebase storage error
+        if "403" in error_msg or "storage.googleapis.com" in error_msg or "Firebase" in error_msg or "not configured" in error_msg:
+            raise HTTPException(
+                status_code=503,
+                detail="File storage is not configured. Please configure Firebase credentials to enable file uploads."
+            )
         raise HTTPException(status_code=500, detail=f"Failed to submit document translation task: {str(e)}")
 
 @app.get("/api/v1/miner/summarization/{task_id}")
@@ -1450,7 +1633,7 @@ async def upload_tts_audio(
     task_id: str = Form(...),
     miner_uid: int = Form(...),
     audio_file: UploadFile = File(...),
-    processing_time: float = Form(...),
+    processing_time: float = Form(0.0),  # Made optional with default
     accuracy_score: float = Form(0.0),
     speed_score: float = Form(0.0)
 ):
@@ -1537,8 +1720,17 @@ async def upload_tts_audio(
             
     except HTTPException:
         raise
+    except HTTPException:
+        raise
     except Exception as e:
+        error_msg = str(e)
         print(f"❌ Error uploading TTS audio: {e}")
+        # Check if it's a Firebase storage error
+        if "403" in error_msg or "storage.googleapis.com" in error_msg or "Firebase" in error_msg or "not configured" in error_msg:
+            raise HTTPException(
+                status_code=503,
+                detail="File storage is not configured. Please configure Firebase credentials to enable file uploads."
+            )
         raise HTTPException(status_code=500, detail=f"Failed to upload audio: {str(e)}")
 
 @app.get("/api/v1/tts/audio/{file_id}")
@@ -1578,18 +1770,32 @@ async def get_tts_audio(file_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to serve audio: {str(e)}")
 
 @app.post("/api/v1/miner/video-transcription/upload-result")
-async def upload_video_transcription_result(
-    task_id: str = Form(...),
-    miner_uid: int = Form(...),
-    transcript: str = Form(...),
-    processing_time: float = Form(...),
-    accuracy_score: float = Form(0.0),
-    speed_score: float = Form(0.0),
-    confidence: float = Form(0.0),
-    language: str = Form("en")
-):
-    """Upload video transcription result from miner"""
+async def upload_video_transcription_result(request: Request):
+    """Upload video transcription result from miner - accepts both JSON and Form data"""
     try:
+        # Try to parse as JSON first, fallback to Form
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+            task_id = body.get("task_id", "")
+            miner_uid = body.get("miner_uid", 0)
+            transcript = body.get("transcript", "")
+            processing_time = body.get("processing_time", 0.0)
+            accuracy_score = body.get("accuracy_score", 0.0)
+            speed_score = body.get("speed_score", 0.0)
+            confidence = body.get("confidence", 0.0)
+            language = body.get("language", "en")
+        else:
+            form_data = await request.form()
+            task_id = form_data.get("task_id", "")
+            miner_uid = int(form_data.get("miner_uid", 0))
+            transcript = form_data.get("transcript", "")
+            processing_time = float(form_data.get("processing_time", 0.0))
+            accuracy_score = float(form_data.get("accuracy_score", 0.0))
+            speed_score = float(form_data.get("speed_score", 0.0))
+            confidence = float(form_data.get("confidence", 0.0))
+            language = form_data.get("language", "en")
+        
         # Validate required parameters
         if not task_id or task_id == "None" or task_id == "null":
             raise HTTPException(status_code=400, detail="Invalid task_id provided")
@@ -1620,6 +1826,12 @@ async def upload_video_transcription_result(
         print(f"   Confidence: {confidence}")
         print(f"   Language: {language}")
         
+        # Check if task exists first
+        task_ref = miner_response_handler.tasks_collection.document(task_id)
+        task_doc = task_ref.get()
+        if not task_doc.exists:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+        
         # Handle the response with miner_response_handler
         success = await miner_response_handler.handle_miner_response(task_id, miner_uid, response_data)
         
@@ -1635,7 +1847,7 @@ async def upload_video_transcription_result(
                 "language": language
             }
         else:
-            raise HTTPException(status_code=500, detail="Failed to process video transcription response")
+            raise HTTPException(status_code=400, detail="Failed to process video transcription response (task may not exist or duplicate response)")
             
     except HTTPException:
         raise
@@ -1644,18 +1856,32 @@ async def upload_video_transcription_result(
         raise HTTPException(status_code=500, detail=f"Failed to upload result: {str(e)}")
 
 @app.post("/api/v1/miner/text-translation/upload-result")
-async def upload_text_translation_result(
-    task_id: str = Form(...),
-    miner_uid: int = Form(...),
-    translated_text: str = Form(...),
-    processing_time: float = Form(...),
-    accuracy_score: float = Form(0.0),
-    speed_score: float = Form(0.0),
-    source_language: str = Form(...),
-    target_language: str = Form(...)
-):
-    """Upload text translation result from miner"""
+async def upload_text_translation_result(request: Request):
+    """Upload text translation result from miner - accepts both JSON and Form data"""
     try:
+        # Try to parse as JSON first, fallback to Form
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+            task_id = body.get("task_id", "")
+            miner_uid = body.get("miner_uid", 0)
+            translated_text = body.get("translated_text", "")
+            processing_time = body.get("processing_time", 0.0)
+            accuracy_score = body.get("accuracy_score", 0.0)
+            speed_score = body.get("speed_score", 0.0)
+            source_language = body.get("source_language", "")
+            target_language = body.get("target_language", "")
+        else:
+            form_data = await request.form()
+            task_id = form_data.get("task_id", "")
+            miner_uid = int(form_data.get("miner_uid", 0))
+            translated_text = form_data.get("translated_text", "")
+            processing_time = float(form_data.get("processing_time", 0.0))
+            accuracy_score = float(form_data.get("accuracy_score", 0.0))
+            speed_score = float(form_data.get("speed_score", 0.0))
+            source_language = form_data.get("source_language", "")
+            target_language = form_data.get("target_language", "")
+        
         # Validate required parameters
         if not task_id or task_id == "None" or task_id == "null":
             raise HTTPException(status_code=400, detail="Invalid task_id provided")
@@ -1678,6 +1904,12 @@ async def upload_text_translation_result(
             'accuracy_score': accuracy_score,
             'speed_score': speed_score
         }
+        
+        # Check if task exists first
+        task_ref = miner_response_handler.tasks_collection.document(task_id)
+        task_doc = task_ref.get()
+        if not task_doc.exists:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
         
         # Log the response submission for debugging
         print(f"📥 Miner {miner_uid} submitting text translation result for task {task_id}")
@@ -1709,19 +1941,34 @@ async def upload_text_translation_result(
         raise HTTPException(status_code=500, detail=f"Failed to upload result: {str(e)}")
 
 @app.post("/api/v1/miner/document-translation/upload-result")
-async def upload_document_translation_result(
-    task_id: str = Form(...),
-    miner_uid: int = Form(...),
-    translated_text: str = Form(...),
-    processing_time: float = Form(...),
-    accuracy_score: float = Form(0.0),
-    speed_score: float = Form(0.0),
-    source_language: str = Form(...),
-    target_language: str = Form(...),
-    metadata: str = Form("{}")
-):
-    """Upload document translation result from miner"""
+async def upload_document_translation_result(request: Request):
+    """Upload document translation result from miner - accepts both JSON and Form data"""
     try:
+        # Try to parse as JSON first, fallback to Form
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+            task_id = body.get("task_id", "")
+            miner_uid = body.get("miner_uid", 0)
+            translated_text = body.get("translated_text", "")
+            processing_time = body.get("processing_time", 0.0)
+            accuracy_score = body.get("accuracy_score", 0.0)
+            speed_score = body.get("speed_score", 0.0)
+            source_language = body.get("source_language", "")
+            target_language = body.get("target_language", "")
+            metadata = body.get("metadata", "{}")
+        else:
+            form_data = await request.form()
+            task_id = form_data.get("task_id", "")
+            miner_uid = int(form_data.get("miner_uid", 0))
+            translated_text = form_data.get("translated_text", "")
+            processing_time = float(form_data.get("processing_time", 0.0))
+            accuracy_score = float(form_data.get("accuracy_score", 0.0))
+            speed_score = float(form_data.get("speed_score", 0.0))
+            source_language = form_data.get("source_language", "")
+            target_language = form_data.get("target_language", "")
+            metadata = form_data.get("metadata", "{}")
+        
         # Validate required parameters
         if not task_id or task_id == "None" or task_id == "null":
             raise HTTPException(status_code=400, detail="Invalid task_id provided")
@@ -1753,6 +2000,12 @@ async def upload_document_translation_result(
             'speed_score': speed_score
         }
         
+        # Check if task exists first
+        task_ref = miner_response_handler.tasks_collection.document(task_id)
+        task_doc = task_ref.get()
+        if not task_doc.exists:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+        
         # Log the response submission for debugging
         print(f"📥 Miner {miner_uid} submitting document translation result for task {task_id}")
         print(f"   Translated text length: {len(translated_text)} characters")
@@ -1783,23 +2036,120 @@ async def upload_document_translation_result(
         print(f"❌ Error uploading document translation result: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to upload result: {str(e)}")
 
+def get_auth_middleware():
+    """Dependency to get auth middleware instance"""
+    from middleware.auth_middleware import AuthMiddleware
+    return AuthMiddleware(db_manager.get_db())
+
+def require_miner_auth(
+    http_request: Request,
+    auth_middleware: AuthMiddleware = Depends(get_auth_middleware)
+):
+    """Dependency to require miner authentication (admin can also access)"""
+    api_key = http_request.headers.get("X-API-Key") or http_request.query_params.get("api_key")
+    user_info = auth_middleware.verify_api_key(api_key)
+    
+    # Role is already validated in verify_api_key, but double-check for security
+    role = user_info.get('role')
+    allowed_roles = {'miner', 'admin'}
+    if not role or role not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Miner or admin role required")
+    
+    return user_info
+
+def require_validator_auth(
+    http_request: Request,
+    auth_middleware: AuthMiddleware = Depends(get_auth_middleware)
+):
+    """Dependency to require validator authentication (admin can also access)"""
+    api_key = http_request.headers.get("X-API-Key") or http_request.query_params.get("api_key")
+    user_info = auth_middleware.verify_api_key(api_key)
+    
+    # Role is already validated in verify_api_key, but double-check for security
+    role = user_info.get('role')
+    allowed_roles = {'validator', 'admin'}
+    if not role or role not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Validator or admin role required")
+    
+    return user_info
+
+def require_client_auth(
+    http_request: Request,
+    auth_middleware: AuthMiddleware = Depends(get_auth_middleware)
+):
+    """Dependency to require client authentication (admin can also access)"""
+    api_key = http_request.headers.get("X-API-Key") or http_request.query_params.get("api_key")
+    user_info = auth_middleware.verify_api_key(api_key)
+    
+    # Role is already validated in verify_api_key, but double-check for security
+    role = user_info.get('role')
+    allowed_roles = {'client', 'admin'}
+    if not role or role not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Client or admin role required")
+    
+    return user_info
+
 @app.post("/api/v1/miner/response")
 async def submit_miner_response(
-    task_id: str = Form(...),
-    miner_uid: int = Form(...),
-    response_data: str = Form(...),
-    processing_time: float = Form(...),
-    accuracy_score: float = Form(0.0),
-    speed_score: float = Form(0.0)
+    request: Request,
+    user_info: dict = Depends(require_miner_auth)
 ):
-    """Submit miner response for a task"""
+    """Submit miner response for a task - accepts both JSON and Form data"""
     try:
+        # Try to parse as JSON first, fallback to Form
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+            task_id = body.get("task_id", "")
+            miner_uid = body.get("miner_uid", 0)
+            response_data = body.get("response_data", body.get("response", ""))
+            processing_time = body.get("processing_time", 0.0)
+            accuracy_score = body.get("accuracy_score", 0.0)
+            speed_score = body.get("speed_score", 0.0)
+        else:
+            form_data = await request.form()
+            task_id = form_data.get("task_id", "")
+            miner_uid = int(form_data.get("miner_uid", 0))
+            response_data = form_data.get("response_data", form_data.get("response", ""))
+            processing_time = float(form_data.get("processing_time", 0.0))
+            accuracy_score = float(form_data.get("accuracy_score", 0.0))
+            speed_score = float(form_data.get("speed_score", 0.0))
+        
         # Validate required parameters
         if not task_id or task_id == "None" or task_id == "null":
             raise HTTPException(status_code=400, detail="Invalid task_id provided")
         
         if not miner_uid or miner_uid <= 0:
             raise HTTPException(status_code=400, detail="Invalid miner_uid provided")
+        
+        # Extract miner credentials from request if provided (for validation)
+        miner_hotkey = None
+        miner_coldkey = None
+        miner_network = None
+        if "application/json" in content_type:
+            miner_hotkey = body.get("hotkey")
+            miner_coldkey = body.get("coldkey_address")
+            miner_network = body.get("network")
+        else:
+            miner_hotkey = form_data.get("hotkey")
+            miner_coldkey = form_data.get("coldkey_address")
+            miner_network = form_data.get("network")
+        
+        # If credentials provided, verify they match the API key
+        if miner_hotkey and miner_coldkey and miner_network:
+            from middleware.auth_middleware import AuthMiddleware
+            auth_middleware = AuthMiddleware(db_manager.get_db())
+            if not auth_middleware.verify_miner_credentials(
+                user_info,
+                miner_hotkey,
+                miner_coldkey,
+                miner_uid,
+                miner_network
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Miner credentials do not match the provided API key"
+                )
         
         # Parse response data (assuming it's JSON string)
         import json
@@ -1819,6 +2169,12 @@ async def submit_miner_response(
             'accuracy_score': accuracy_score,
             'speed_score': speed_score
         }
+        
+        # Check if task exists first
+        task_ref = miner_response_handler.tasks_collection.document(task_id)
+        task_doc = task_ref.get()
+        if not task_doc.exists:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
         
         # Log the response submission for debugging
         print(f"📥 Miner {miner_uid} submitting response for task {task_id}")
@@ -1855,7 +2211,7 @@ async def submit_miner_response(
             }
         else:
             print(f"❌ Failed to process miner response for task {task_id}")
-            raise HTTPException(status_code=500, detail="Failed to process miner response")
+            raise HTTPException(status_code=400, detail="Failed to process miner response (task may not exist or duplicate response)")
             
     except HTTPException:
         raise
@@ -1870,9 +2226,10 @@ async def upload_tts_audio(
     task_id: str = Form(...),
     miner_uid: int = Form(...),
     audio_file: UploadFile = File(...),
-    processing_time: float = Form(...),
+    processing_time: float = Form(0.0),  # Made optional with default
     accuracy_score: float = Form(0.0),
-    speed_score: float = Form(0.0)
+    speed_score: float = Form(0.0),
+    user_info: dict = Depends(require_miner_auth)
 ):
     """Upload TTS audio file from miner"""
     try:
@@ -1960,12 +2317,24 @@ async def upload_tts_audio(
             
     except HTTPException:
         raise
+    except HTTPException:
+        raise
     except Exception as e:
+        error_msg = str(e)
         print(f"❌ Unexpected error in upload_tts_audio: {e}")
+        # Check if it's a Firebase storage error
+        if "403" in error_msg or "storage.googleapis.com" in error_msg or "Firebase" in error_msg or "not configured" in error_msg:
+            raise HTTPException(
+                status_code=503,
+                detail="File storage is not configured. Please configure Firebase credentials to enable file uploads."
+            )
         raise HTTPException(status_code=500, detail=f"Failed to upload TTS audio: {str(e)}")
 
 @app.get("/api/v1/validator/tasks")
-async def get_tasks_for_validator(validator_uid: int = None):
+async def get_tasks_for_validator(
+    validator_uid: int = None,
+    user_info: dict = Depends(require_validator_auth)
+):
     """Get tasks ready for validator evaluation"""
     try:
         print(f"🔍 Validator requesting tasks (validator_uid: {validator_uid})")
@@ -2006,21 +2375,74 @@ async def get_tasks_for_validator(validator_uid: int = None):
 
 @app.post("/api/v1/validator/evaluation")
 async def submit_validator_evaluation(
-    task_id: str = Form(...),
-    validator_uid: int = Form(...),
-    evaluation_data: str = Form(...)
+    request: Request,
+    user_info: dict = Depends(require_validator_auth)
 ):
-    """Submit validator evaluation and rewards"""
+    """Submit validator evaluation and rewards - accepts both JSON and Form data"""
     try:
-        # Parse evaluation JSON
-        evaluation_dict = json.loads(evaluation_data)
+        # Try to parse as JSON first, fallback to Form
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+            task_id = body.get("task_id", "")
+            validator_uid = body.get("validator_uid", 0)
+            evaluation_dict = body.get("evaluation_data", body)
+        else:
+            form_data = await request.form()
+            task_id = form_data.get("task_id", "")
+            validator_uid = int(form_data.get("validator_uid", 0))
+            evaluation_data_str = form_data.get("evaluation_data", "{}")
+            # Parse evaluation JSON
+            evaluation_dict = json.loads(evaluation_data_str)
+        
+        # Extract validator credentials from request if provided (for validation)
+        validator_hotkey = None
+        validator_coldkey = None
+        validator_network = None
+        if "application/json" in content_type:
+            validator_hotkey = body.get("hotkey")
+            validator_coldkey = body.get("coldkey_address")
+            validator_network = body.get("network")
+        else:
+            form_data = await request.form()
+            validator_hotkey = form_data.get("hotkey")
+            validator_coldkey = form_data.get("coldkey_address")
+            validator_network = form_data.get("network")
+        
+        # If credentials provided, verify they match the API key
+        if validator_hotkey and validator_coldkey and validator_network:
+            from middleware.auth_middleware import AuthMiddleware
+            auth_middleware = AuthMiddleware(db_manager.get_db())
+            if not auth_middleware.verify_validator_credentials(
+                user_info,
+                validator_hotkey,
+                validator_coldkey,
+                validator_uid,
+                validator_network
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Validator credentials do not match the provided API key"
+                )
         
         # Submit evaluation
-        await validator_api.submit_validator_evaluation(task_id, validator_uid, evaluation_dict)
+        try:
+            await validator_api.submit_validator_evaluation(task_id, validator_uid, evaluation_dict)
+        except ValueError as e:
+            # ValueError from validator_integration means task not found
+            if "not found" in str(e).lower():
+                raise HTTPException(status_code=404, detail=f"Task not found")
+            raise
         
         return {"success": True, "message": "Evaluation submitted successfully"}
         
+    except HTTPException:
+        raise
     except Exception as e:
+        error_msg = str(e)
+        # Check if task not found
+        if "not found" in error_msg.lower():
+            raise HTTPException(status_code=404, detail=f"Task not found")
         raise HTTPException(status_code=500, detail=f"Failed to submit evaluation: {str(e)}")
 
 @app.get("/api/v1/task/{task_id}/status")
@@ -2271,6 +2693,18 @@ async def api_health_check():
             "error": str(e)
         }
 
+@app.get("/api/v1/files/stats")
+async def get_file_stats():
+    """Get file storage statistics"""
+    try:
+        stats = await file_manager.get_storage_statistics()
+        return {
+            "success": True,
+            "stats": stats
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
+
 @app.get("/api/v1/files/{file_id}")
 async def serve_file(file_id: str):
     """Serve files from Firebase Cloud Storage"""
@@ -2371,18 +2805,6 @@ async def download_file(file_id: str):
             detail=f"Internal server error while downloading file: {str(e)}"
         )
 
-@app.get("/api/v1/files/stats")
-async def get_file_stats():
-    """Get file storage statistics"""
-    try:
-        stats = await file_manager.get_storage_statistics()
-        return {
-            "success": True,
-            "stats": stats
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
-
 @app.get("/api/v1/files/list/{file_type}")
 async def list_files_by_type(file_type: str):
     """List files by type"""
@@ -2405,15 +2827,32 @@ async def get_transcription_result(task_id: str):
         task_status = await workflow_orchestrator.get_task_status(task_id)
         
         if 'error' in task_status:
-            raise HTTPException(status_code=404, detail=task_status['error'])
+            return {
+                "success": False,
+                "task_id": task_id,
+                "message": f"Task not found or unavailable: {task_status.get('error', 'Unknown error')}",
+                "status": "not_found",
+                "available": False
+            }
         
         # Check if task is completed
         task_info = task_status.get('task', {})
-        if task_info.get('status') not in ['done', 'approved']:
+        task_status_value = task_info.get('status', 'unknown')
+        
+        if task_status_value not in ['completed', 'done', 'approved']:
             return {
                 "success": False,
-                "message": f"Task is still {task_info.get('status')}",
-                "status": task_info.get('status')
+                "task_id": task_id,
+                "message": f"Task result is not yet available. Current status: {task_status_value}",
+                "status": task_status_value,
+                "available": False,
+                "task_type": task_info.get('task_type', 'unknown'),
+                "created_at": task_info.get('created_at'),
+                "progress": {
+                    "assigned_miners": len(task_info.get('assigned_miners', [])),
+                    "miner_responses": task_info.get('miner_responses', 0),
+                    "required_miner_count": task_info.get('required_miner_count', 0)
+                }
             }
         
         # Get the best response from completion status
@@ -2434,21 +2873,39 @@ async def get_transcription_result(task_id: str):
         if not best_miner_uid:
             return {
                 "success": False,
-                "message": "No completed responses found"
+                "task_id": task_id,
+                "message": "Task is completed but no miner responses are available yet. Please check back shortly.",
+                "status": task_status_value,
+                "available": False,
+                "task_type": task_info.get('task_type', 'unknown'),
+                "progress": {
+                    "assigned_miners": len(task_info.get('assigned_miners', [])),
+                    "miner_responses": task_info.get('miner_responses', 0),
+                    "required_miner_count": task_info.get('required_miner_count', 0)
+                }
             }
         
         # Get the best miner's response data
         best_status = miner_statuses[best_miner_uid]
         
+        # Get transcript from response data
+        response_data = best_status.get('response_data', {})
+        transcript = response_data.get('output_data', {}).get('transcript', '')
+        if not transcript:
+            transcript = response_data.get('output_data', {}).get('text', '')
+        
         return {
             "success": True,
             "task_id": task_id,
-            "status": task_info.get('status'),
-            "transcript": f"Transcription from miner {best_miner_uid}: This is a test transcription of the audio file from miner {best_miner_uid}.",
+            "status": task_status_value,
+            "available": True,
+            "transcript": transcript,
             "processing_time": best_status.get('processing_time', 0),
             "miner_uid": int(best_miner_uid),
             "accuracy_score": best_status.get('accuracy_score', 0),
-            "speed_score": best_status.get('speed_score', 0)
+            "speed_score": best_status.get('speed_score', 0),
+            "language": response_data.get('output_data', {}).get('language', task_info.get('source_language', 'en')),
+            "confidence": response_data.get('output_data', {}).get('confidence', 0.0)
         }
         
     except HTTPException:
@@ -2464,15 +2921,32 @@ async def get_tts_result(task_id: str):
         task_status = await workflow_orchestrator.get_task_status(task_id)
         
         if 'error' in task_status:
-            raise HTTPException(status_code=404, detail=task_status['error'])
+            return {
+                "success": False,
+                "task_id": task_id,
+                "message": f"Task not found or unavailable: {task_status.get('error', 'Unknown error')}",
+                "status": "not_found",
+                "available": False
+            }
         
         # Check if task is completed
         task_info = task_status.get('task', {})
-        if task_info.get('status') not in ['done', 'approved']:
+        task_status_value = task_info.get('status', 'unknown')
+        
+        if task_status_value not in ['completed', 'done', 'approved']:
             return {
                 "success": False,
-                "message": f"Task is still {task_info.get('status')}",
-                "status": task_info.get('status')
+                "task_id": task_id,
+                "message": f"Task result is not yet available. Current status: {task_status_value}",
+                "status": task_status_value,
+                "available": False,
+                "task_type": task_info.get('task_type', 'unknown'),
+                "created_at": task_info.get('created_at'),
+                "progress": {
+                    "assigned_miners": len(task_info.get('assigned_miners', [])),
+                    "miner_responses": task_info.get('miner_responses', 0),
+                    "required_miner_count": task_info.get('required_miner_count', 0)
+                }
             }
         
         # Get the best response from completion status
@@ -2493,7 +2967,16 @@ async def get_tts_result(task_id: str):
         if not best_miner_uid:
             return {
                 "success": False,
-                "message": "No completed responses found"
+                "task_id": task_id,
+                "message": "Task is completed but no miner responses are available yet. Please check back shortly.",
+                "status": task_status_value,
+                "available": False,
+                "task_type": task_info.get('task_type', 'unknown'),
+                "progress": {
+                    "assigned_miners": len(task_info.get('assigned_miners', [])),
+                    "miner_responses": task_info.get('miner_responses', 0),
+                    "required_miner_count": task_info.get('required_miner_count', 0)
+                }
             }
         
         # Get the best miner's response data
@@ -2505,7 +2988,8 @@ async def get_tts_result(task_id: str):
         return {
             "success": True,
             "task_id": task_id,
-            "status": task_info.get('status'),
+            "status": task_status_value,
+            "available": True,
             "audio_url": audio_url,
             "processing_time": best_status.get('processing_time', 0),
             "miner_uid": int(best_miner_uid),
@@ -2517,6 +3001,135 @@ async def get_tts_result(task_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get result: {str(e)}")
+
+@app.get("/api/v1/summarization/{task_id}/result")
+async def get_summarization_result(task_id: str):
+    """Get summarization result for a completed task"""
+    try:
+        # Get task status
+        task_status = await workflow_orchestrator.get_task_status(task_id)
+        
+        if 'error' in task_status:
+            return {
+                "success": False,
+                "task_id": task_id,
+                "message": f"Task not found or unavailable: {task_status.get('error', 'Unknown error')}",
+                "status": "not_found",
+                "available": False
+            }
+        
+        # Check if task is completed
+        task_info = task_status.get('task', {})
+        task_status_value = task_info.get('status', 'unknown')
+        
+        if task_status_value not in ['completed', 'done', 'approved']:
+            return {
+                "success": False,
+                "task_id": task_id,
+                "message": f"Task result is not yet available. Current status: {task_status_value}",
+                "status": task_status_value,
+                "available": False,
+                "task_type": "summarization",
+                "created_at": task_info.get('created_at'),
+                "progress": {
+                    "assigned_miners": len(task_info.get('assigned_miners', [])),
+                    "miner_responses": task_info.get('miner_responses', 0),
+                    "required_miner_count": task_info.get('required_miner_count', 0)
+                }
+            }
+        
+        # Get the best response from completion status
+        completion_status = task_status.get('completion_status', {})
+        miner_statuses = completion_status.get('miner_statuses', {})
+        best_response = task_status.get('best_response')
+        
+        # Find the best response (highest accuracy score)
+        best_miner_uid = None
+        best_accuracy = 0
+        
+        for miner_uid, status in miner_statuses.items():
+            if status.get('status') == 'completed':
+                accuracy = status.get('accuracy_score', 0)
+                if accuracy > best_accuracy:
+                    best_accuracy = accuracy
+                    best_miner_uid = miner_uid
+        
+        if not best_miner_uid and not best_response:
+            return {
+                "success": False,
+                "task_id": task_id,
+                "message": "Task is completed but no miner responses are available yet. Please check back shortly.",
+                "status": task_status_value,
+                "available": False,
+                "task_type": "summarization",
+                "progress": {
+                    "assigned_miners": len(task_info.get('assigned_miners', [])),
+                    "miner_responses": task_info.get('miner_responses', 0),
+                    "required_miner_count": task_info.get('required_miner_count', 0)
+                }
+            }
+        
+        # Get the best miner's response data
+        if best_response:
+            summary_text = best_response.get('output_data', {}).get('summary', '')
+            if not summary_text and isinstance(best_response.get('output_data'), dict):
+                summary_text = best_response.get('output_data', {}).get('text', '')
+        elif best_miner_uid:
+            best_status = miner_statuses[best_miner_uid]
+            response_data = best_status.get('response_data', {})
+            summary_text = response_data.get('output_data', {}).get('summary', '')
+            if not summary_text:
+                summary_text = response_data.get('output_data', {}).get('text', '')
+        else:
+            summary_text = ""
+        
+        if not summary_text:
+            return {
+                "success": False,
+                "task_id": task_id,
+                "message": "Task is completed but summary text is not available. Please check back shortly.",
+                "status": task_status_value,
+                "available": False,
+                "task_type": "summarization"
+            }
+        
+        # Get processing metrics
+        processing_time = 0
+        accuracy_score = 0
+        speed_score = 0
+        miner_uid = None
+        
+        if best_miner_uid:
+            best_status = miner_statuses[best_miner_uid]
+            processing_time = best_status.get('processing_time', 0)
+            accuracy_score = best_status.get('accuracy_score', 0)
+            speed_score = best_status.get('speed_score', 0)
+            miner_uid = int(best_miner_uid)
+        elif best_response:
+            processing_time = best_response.get('processing_time', 0)
+            accuracy_score = best_response.get('accuracy_score', 0)
+            speed_score = best_response.get('speed_score', 0)
+            miner_uid = best_response.get('miner_uid')
+        
+        return {
+            "success": True,
+            "task_id": task_id,
+            "status": task_status_value,
+            "available": True,
+            "summary": summary_text,
+            "processing_time": processing_time,
+            "miner_uid": miner_uid,
+            "accuracy_score": accuracy_score,
+            "speed_score": speed_score,
+            "original_text_length": task_info.get('input_text', {}).get('text_length', 0) if task_info.get('input_text') else 0,
+            "summary_length": len(summary_text),
+            "compression_ratio": round(len(summary_text) / max(task_info.get('input_text', {}).get('text_length', 1), 1), 2) if task_info.get('input_text') else 0
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get summarization result: {str(e)}")
 
 @app.get("/api/v1/miners/performance")
 async def get_miner_performance():
@@ -2632,7 +3245,11 @@ async def get_miner_performance():
         raise HTTPException(status_code=500, detail=f"Failed to get miner performance: {str(e)}")
 
 @app.get("/api/v1/miners/{miner_uid}/tasks")
-async def get_miner_tasks(miner_uid: int, status: str = "assigned"):
+async def get_miner_tasks(
+    miner_uid: int,
+    status: str = "assigned",
+    user_info: dict = Depends(require_miner_auth)
+):
     """Get tasks assigned to a specific miner with proper status filtering"""
     try:
         print(f"🔍 Miner {miner_uid} requesting tasks with status: {status}")
@@ -2652,14 +3269,23 @@ async def get_miner_tasks(miner_uid: int, status: str = "assigned"):
         # Additional validation: ensure we're not returning completed tasks to miners
         filtered_tasks = []
         for task in tasks:
+            # Ensure task_id is present (should be added by get_miner_tasks, but double-check)
+            if 'task_id' not in task:
+                task['task_id'] = task.get('id', 'unknown')
+            
             task_status = task.get('status', 'unknown')
-            if task_status in ['completed', 'failed', 'cancelled']:
+            if task_status in ['completed', 'failed', 'cancelled', 'approved']:
                 print(f"⚠️ Filtering out {task_status} task {task.get('task_id')} for miner {miner_uid}")
                 continue
             filtered_tasks.append(task)
         
         if len(filtered_tasks) != len(tasks):
             print(f"🔍 Filtered {len(tasks) - len(filtered_tasks)} completed/failed tasks from miner {miner_uid} results")
+        
+        # Log task IDs for debugging
+        if filtered_tasks:
+            task_ids = [t.get('task_id', 'no_id') for t in filtered_tasks]
+            print(f"📋 Returning {len(filtered_tasks)} tasks to miner {miner_uid}: {task_ids}")
         
         return filtered_tasks
         
@@ -2806,28 +3432,167 @@ async def register_miner(
         raise HTTPException(status_code=500, detail=f"Failed to register miner: {str(e)}")
 
 @app.get("/api/v1/miners")
-async def get_miners():
-    """Get all registered miners"""
+async def get_miners(
+    user_info: dict = Depends(require_client_auth)
+):
+    """Get all active miners from validator reports (miner_status collection)"""
     try:
-        miners = DatabaseOperations.get_all_miners(db_manager.get_db())
-        return {"miners": miners}
+        from datetime import datetime
+        from dateutil import parser
+        
+        print(f"🔍 GET /api/v1/miners - Fetching active miners from miner_status collection")
+        
+        # Query miner_status collection (where validators send active miners)
+        db = db_manager.get_db()
+        miner_status_collection = db.collection('miner_status')
+        docs = miner_status_collection.stream()
+        
+        current_time = datetime.utcnow()
+        miner_timeout = 900  # 15 minutes - same as network-status endpoint
+        
+        miners = []
+        stale_count = 0
+        
+        for doc in docs:
+            try:
+                miner_data = doc.to_dict()
+                
+                # CRITICAL: Add miner_id from document ID
+                miner_data['miner_id'] = doc.id
+                
+                # Ensure uid is present
+                if 'uid' not in miner_data:
+                    miner_data['uid'] = miner_data.get('miner_id')
+                
+                # Filter out stale miners (not seen in last 15 minutes)
+                last_seen = miner_data.get('last_seen')
+                timestamp_to_check = last_seen or miner_data.get('last_updated')
+                
+                if timestamp_to_check:
+                    try:
+                        # Normalize current_time to timezone-naive for comparison
+                        current_time_naive = current_time.replace(tzinfo=None) if current_time.tzinfo else current_time
+                        
+                        # Handle different timestamp formats and normalize to timezone-naive
+                        if isinstance(timestamp_to_check, datetime):
+                            # Normalize to timezone-naive
+                            ts_naive = timestamp_to_check.replace(tzinfo=None) if timestamp_to_check.tzinfo else timestamp_to_check
+                            time_diff = (current_time_naive - ts_naive).total_seconds()
+                        elif hasattr(timestamp_to_check, 'replace'):
+                            # Firestore DatetimeWithNanoseconds or similar
+                            try:
+                                ts_naive = timestamp_to_check.replace(tzinfo=None)
+                                time_diff = (current_time_naive - ts_naive).total_seconds()
+                            except:
+                                # Fallback: try timestamp method
+                                if hasattr(timestamp_to_check, 'timestamp'):
+                                    time_diff = (current_time_naive.timestamp() - timestamp_to_check.timestamp())
+                                else:
+                                    # Unknown format, skip timestamp check but include miner
+                                    time_diff = 0
+                        elif hasattr(timestamp_to_check, 'timestamp'):
+                            # Firestore Timestamp object
+                            ts_naive = datetime.fromtimestamp(timestamp_to_check.timestamp())
+                            time_diff = (current_time_naive - ts_naive).total_seconds()
+                        elif isinstance(timestamp_to_check, str):
+                            # ISO format string
+                            last_seen_dt = parser.parse(timestamp_to_check)
+                            # Normalize to timezone-naive
+                            ts_naive = last_seen_dt.replace(tzinfo=None) if last_seen_dt.tzinfo else last_seen_dt
+                            time_diff = (current_time_naive - ts_naive).total_seconds()
+                        else:
+                            # Unknown format, skip timestamp check but include miner
+                            time_diff = 0
+                        
+                        # Only include miners seen within the timeout period
+                        if time_diff > miner_timeout:
+                            minutes_ago = time_diff / 60
+                            print(f"⏰ Filtering stale miner {miner_data.get('uid')} - last seen {minutes_ago:.1f} minutes ago")
+                            stale_count += 1
+                            continue
+                    except Exception as e:
+                        print(f"⚠️ Error checking timestamp for miner {miner_data.get('uid')}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # Include miner anyway if timestamp parsing fails (better to show than hide)
+                        pass
+                
+                miners.append(miner_data)
+                
+            except Exception as e:
+                print(f"⚠️ Error processing miner document {doc.id}: {e}")
+                continue
+        
+        print(f"📋 Found {len(miners)} active miners (filtered {stale_count} stale miners)")
+        
+        return {
+            "success": True,
+            "miners": miners,
+            "count": len(miners),
+            "stale_filtered": stale_count
+        }
+        
     except Exception as e:
+        print(f"❌ Error getting miners: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to get miners: {str(e)}")
 
 @app.get("/api/v1/tasks")
-async def get_all_tasks():
-    """Get all tasks"""
+async def get_all_tasks(
+    user_info: dict = Depends(require_client_auth)
+):
+    """Get all tasks - queries all tasks regardless of status"""
     try:
-        # Get tasks by status - get all statuses
+        from database.enhanced_schema import COLLECTIONS
+        
+        print(f"🔍 GET /api/v1/tasks - Fetching all tasks from database")
+        
+        # Query ALL tasks directly instead of filtering by status
+        # This is more reliable and catches tasks with any status value
+        db = db_manager.get_db()
+        tasks_collection = db.collection(COLLECTIONS.get('tasks', 'tasks'))
+        
+        # Get all tasks (limit to 1000 to avoid timeout)
+        docs = tasks_collection.limit(1000).stream()
+        
         all_tasks = []
-        for status in ['pending', 'assigned', 'in_progress', 'completed', 'failed']:
+        status_counts = {}
+        error_count = 0
+        
+        for doc in docs:
             try:
-                tasks = DatabaseOperations.get_tasks_by_status(db_manager.get_db(), status, limit=100)
-                all_tasks.extend(tasks)
-            except:
+                task_data = doc.to_dict()
+                if task_data:
+                    # CRITICAL: Add task_id from document ID (Firestore doesn't include it in to_dict())
+                    task_data['task_id'] = doc.id
+                    all_tasks.append(task_data)
+                    
+                    # Track status distribution for debugging
+                    task_status = task_data.get('status', 'unknown')
+                    # Handle enum status values
+                    if hasattr(task_status, 'value'):
+                        task_status = task_status.value
+                    status_counts[task_status] = status_counts.get(task_status, 0) + 1
+            except Exception as e:
+                error_count += 1
+                print(f"⚠️ Error processing task document {doc.id}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
+        
+        print(f"📋 Found {len(all_tasks)} total tasks in database")
+        if status_counts:
+            print(f"   Status distribution: {status_counts}")
+        if error_count > 0:
+            print(f"   ⚠️ {error_count} documents had errors during processing")
+        
         return all_tasks
+        
     except Exception as e:
+        print(f"❌ Error getting all tasks: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to get tasks: {str(e)}")
 
 @app.get("/api/v1/tasks/{task_id}")
@@ -3050,7 +3815,8 @@ async def get_duplicate_protection_stats():
 async def receive_miner_status_from_validator(
     validator_uid: int = Form(...),
     miner_statuses: str = Form(...),  # JSON string
-    epoch: int = Form(...)
+    epoch: int = Form(...),
+    user_info: dict = Depends(require_validator_auth)
 ):
     """Receive miner status reports from validators with multi-validator consensus"""
     try:
@@ -3101,8 +3867,17 @@ async def _legacy_miner_status_processing(validator_uid: int, miner_data: List[D
                     miner_ref = db_manager.get_db().collection('miner_status').document(str(miner_uid))
                     
                     # Add timestamp and validator info
+                    # Convert ISO string timestamps to datetime objects if needed
+                    if 'last_seen' in miner_status and isinstance(miner_status['last_seen'], str):
+                        try:
+                            from dateutil import parser
+                            miner_status['last_seen'] = parser.parse(miner_status['last_seen'])
+                        except:
+                            miner_status['last_seen'] = datetime.now()
+                    else:
+                        miner_status['last_seen'] = datetime.now()  # Ensure last_seen is set
+                    
                     miner_status['last_updated'] = datetime.now()
-                    miner_status['last_seen'] = datetime.now()  # Ensure last_seen is set for cleanup
                     miner_status['reported_by_validator'] = validator_uid
                     miner_status['epoch'] = epoch
                     
@@ -3112,6 +3887,8 @@ async def _legacy_miner_status_processing(validator_uid: int, miner_data: List[D
                     
                     # Store in database (use set instead of merge to ensure all fields are present)
                     miner_ref.set(miner_status, merge=True)
+                    
+                    print(f"      ✅ Updated miner {miner_uid} in miner_status collection")
                     updated_count += 1
                     
                     print(f"      ✅ Updated miner {miner_uid}: {miner_status.get('hotkey', 'unknown')}")
@@ -3144,7 +3921,9 @@ async def _legacy_miner_status_processing(validator_uid: int, miner_data: List[D
 
 # Add endpoint to get current miner status
 @app.get("/api/v1/miners/network-status")
-async def get_network_miner_status():
+async def get_network_miner_status(
+    user_info: dict = Depends(require_client_auth)
+):
     """Get current miner status from Bittensor network (via validator reports) - only shows active miners"""
     try:
         from datetime import datetime, timedelta
@@ -3170,34 +3949,39 @@ async def get_network_miner_status():
             
             if timestamp_to_check:
                 try:
-                    # Handle different timestamp formats
+                    # Normalize current_time to timezone-naive for comparison
+                    current_time_naive = current_time.replace(tzinfo=None) if current_time.tzinfo else current_time
+                    
+                    # Handle different timestamp formats and normalize to timezone-naive
                     if isinstance(timestamp_to_check, datetime):
-                        time_diff = (current_time - timestamp_to_check).total_seconds()
+                        # Normalize to timezone-naive
+                        ts_naive = timestamp_to_check.replace(tzinfo=None) if timestamp_to_check.tzinfo else timestamp_to_check
+                        time_diff = (current_time_naive - ts_naive).total_seconds()
                     elif hasattr(timestamp_to_check, 'replace'):  # DatetimeWithNanoseconds or similar datetime-like
                         # It's a datetime-like object (Firestore DatetimeWithNanoseconds)
                         try:
-                            ts_dt = timestamp_to_check.replace(tzinfo=None)
-                            time_diff = (current_time - ts_dt).total_seconds()
+                            ts_naive = timestamp_to_check.replace(tzinfo=None)
+                            time_diff = (current_time_naive - ts_naive).total_seconds()
                         except Exception as replace_error:
                             # If replace fails, try converting via timestamp
                             try:
                                 if hasattr(timestamp_to_check, 'timestamp'):
-                                    ts_dt = datetime.fromtimestamp(timestamp_to_check.timestamp())
-                                    time_diff = (current_time - ts_dt).total_seconds()
+                                    ts_naive = datetime.fromtimestamp(timestamp_to_check.timestamp())
+                                    time_diff = (current_time_naive - ts_naive).total_seconds()
                                 else:
                                     raise replace_error
                             except:
                                 raise replace_error
                     elif hasattr(timestamp_to_check, 'timestamp'):  # Firestore Timestamp
                         # It's a timestamp object
-                        time_diff = (current_time.timestamp() - timestamp_to_check.timestamp())
+                        ts_naive = datetime.fromtimestamp(timestamp_to_check.timestamp())
+                        time_diff = (current_time_naive - ts_naive).total_seconds()
                     elif isinstance(timestamp_to_check, str):
                         try:
                             last_seen_dt = parser.parse(timestamp_to_check)
-                            # Handle timezone-aware datetime
-                            if last_seen_dt.tzinfo:
-                                last_seen_dt = last_seen_dt.replace(tzinfo=None)
-                            time_diff = (current_time - last_seen_dt).total_seconds()
+                            # Normalize to timezone-naive
+                            ts_naive = last_seen_dt.replace(tzinfo=None) if last_seen_dt.tzinfo else last_seen_dt
+                            time_diff = (current_time_naive - ts_naive).total_seconds()
                         except Exception as parse_error:
                             print(f"⚠️  Error parsing timestamp string '{timestamp_to_check}': {parse_error}")
                             stale_count += 1
@@ -3207,8 +3991,8 @@ async def get_network_miner_status():
                         try:
                             if hasattr(timestamp_to_check, 'replace'):
                                 # DatetimeWithNanoseconds or similar
-                                ts_dt = timestamp_to_check.replace(tzinfo=None)
-                                time_diff = (current_time - ts_dt).total_seconds()
+                                ts_naive = timestamp_to_check.replace(tzinfo=None)
+                                time_diff = (current_time_naive - ts_naive).total_seconds()
                             else:
                                 print(f"⚠️  Unknown timestamp format for miner {miner_data.get('uid')}: {type(timestamp_to_check)}")
                                 stale_count += 1
@@ -3226,6 +4010,8 @@ async def get_network_miner_status():
                         continue  # Skip stale miners
                 except Exception as e:
                     print(f"⚠️  Error checking timestamp for miner {miner_data.get('uid')}: {e}")
+                    import traceback
+                    traceback.print_exc()
                     stale_count += 1
                     continue  # Skip miners with timestamp parsing errors
             else:
@@ -3306,6 +4092,341 @@ async def get_miner_consensus_status(miner_uid: int):
         print(f"❌ Error getting miner consensus status: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get miner consensus status: {str(e)}")
 
+# ============================================================================
+# USER AUTHENTICATION ENDPOINTS
+# ============================================================================
+
+class RegisterRequest(BaseModel):
+    email: str = Field(..., description="User email address")
+    role: str = Field(..., description="User role: 'client' or 'admin' (miner/validator roles require API key generation with credentials)")
+    
+    @validator('role')
+    def validate_role(cls, v):
+        if v not in ['client', 'admin']:
+            raise ValueError("Role must be 'client' or 'admin'. To become a miner/validator, register as client first, then generate API key with credentials.")
+        return v
+
+class LoginRequest(BaseModel):
+    email: str = Field(..., description="User email address")
+
+class GenerateAPIKeyRequest(BaseModel):
+    email: str = Field(..., description="User email address")
+    hotkey: Optional[str] = Field(None, description="Bittensor hotkey address (required for miner/validator role upgrade)")
+    coldkey_address: Optional[str] = Field(None, description="Bittensor coldkey address (required for miner/validator role upgrade)")
+    uid: Optional[int] = Field(None, description="Bittensor UID (required for miner/validator role upgrade)")
+    network: Optional[str] = Field(None, description="Network: 'test' or 'finney' (required for miner/validator role upgrade)")
+    target_role: Optional[str] = Field(None, description="Target role: 'miner' or 'validator' (optional, for role upgrade)")
+
+class APIKeyResponse(BaseModel):
+    success: bool
+    api_key: Optional[str] = None
+    role: Optional[str] = None
+    message: str
+
+@app.post("/api/v1/auth/register", response_model=Dict[str, Any])
+async def register_user(request: RegisterRequest):
+    """Register a new user with role-based authentication. Only 'client' and 'admin' roles allowed. To become miner/validator, use generate-api-key endpoint."""
+    try:
+        from database.user_schema import UserOperations
+        
+        # Validate role - only client or admin allowed during registration
+        if request.role not in ['client', 'admin']:
+            raise HTTPException(
+                status_code=400,
+                detail="Registration only allows 'client' or 'admin' roles. To become a miner/validator, register as client first, then generate API key with credentials."
+            )
+        
+        # Check if user already exists
+        if UserOperations.verify_user_exists(db_manager.get_db(), request.email):
+            raise HTTPException(status_code=400, detail="User with this email already exists")
+        
+        # Client and admin don't need Bittensor credentials
+        user_data = {
+            'email': request.email,
+            'role': request.role
+        }
+        
+        # Create user
+        user_id = UserOperations.create_user(db_manager.get_db(), user_data)
+        user = UserOperations.get_user_by_email(db_manager.get_db(), request.email)
+        
+        return {
+            "success": True,
+            "user_id": user_id,
+            "email": user['email'],
+            "role": user['role'],
+            "api_key": user['api_key'],
+            "message": f"User registered successfully as {request.role}. To become a miner/validator, use generate-api-key endpoint with credentials."
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Registration error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+
+@app.post("/api/v1/auth/login", response_model=Dict[str, Any])
+async def login_user(request: LoginRequest):
+    """Login user and return API key"""
+    try:
+        from database.user_schema import UserOperations
+        
+        user = UserOperations.get_user_by_email(db_manager.get_db(), request.email)
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        if not user.get('is_active', True):
+            raise HTTPException(status_code=403, detail="User account is inactive")
+        
+        # Update last login
+        UserOperations.update_last_login(db_manager.get_db(), user['user_id'])
+        
+        return {
+            "success": True,
+            "user_id": user['user_id'],
+            "email": user['email'],
+            "role": user.get('role', 'client'),
+            "api_key": user.get('api_key'),
+            "uid": user.get('uid'),
+            "network": user.get('network'),
+            "hotkey": user.get('hotkey'),
+            "coldkey_address": user.get('coldkey_address'),
+            "message": "Login successful"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Login error: {e}")
+        raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
+
+@app.post("/api/v1/auth/generate-api-key", response_model=APIKeyResponse)
+async def generate_api_key(request: GenerateAPIKeyRequest):
+    """Generate a new API key for user. Can upgrade client to miner/validator by providing credentials."""
+    try:
+        from database.user_schema import UserOperations
+        from utils.bittensor_verifier import BittensorVerifier
+        from datetime import datetime
+        
+        user = UserOperations.get_user_by_email(db_manager.get_db(), request.email)
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        if not user.get('is_active', True):
+            raise HTTPException(status_code=403, detail="User account is inactive")
+        
+        current_role = user.get('role', 'client')
+        target_role = request.target_role
+        
+        # If upgrading to miner/validator, verify credentials
+        if target_role in ['miner', 'validator']:
+            if not all([request.hotkey, request.coldkey_address, request.uid, request.network]):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"hotkey, coldkey_address, uid, and network are required to upgrade to {target_role} role"
+                )
+            
+            # Determine netuid based on network
+            netuid = 292 if request.network == 'test' else 49
+            
+            # Verify credentials against Bittensor metagraph
+            verifier = BittensorVerifier()
+            is_valid, error_msg = verifier.verify_credentials(
+                hotkey=request.hotkey,
+                coldkey_address=request.coldkey_address,
+                uid=request.uid,
+                network=request.network,
+                netuid=netuid
+            )
+            
+            if not is_valid:
+                raise HTTPException(status_code=400, detail=error_msg or "Credential verification failed")
+            
+            # Update user role and credentials
+            db = db_manager.get_db()
+            user_ref = db.collection('users').document(user['user_id'])
+            user_ref.update({
+                'role': target_role,
+                'hotkey': request.hotkey,
+                'coldkey_address': request.coldkey_address,
+                'uid': request.uid,
+                'network': request.network,
+                'netuid': netuid,
+                'updated_at': datetime.now()
+            })
+            
+            # Update API key index with new role (will be done in generate_new_api_key)
+        
+        # Generate new API key (this will update the API key index with current role)
+        api_key = UserOperations.generate_new_api_key(db_manager.get_db(), user['user_id'])
+        
+        # Get updated user info
+        updated_user = UserOperations.get_user_by_email(db_manager.get_db(), request.email)
+        final_role = updated_user.get('role', current_role)
+        
+        message = f"API key generated successfully"
+        if target_role and target_role != current_role:
+            message = f"API key generated successfully. User upgraded from {current_role} to {final_role} role."
+        
+        return {
+            "success": True,
+            "api_key": api_key,
+            "role": final_role,
+            "message": message
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ API key generation error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"API key generation failed: {str(e)}")
+
+@app.get("/api/v1/auth/verify-api-key")
+async def verify_api_key(api_key: str = None):
+    """Verify if an API key is valid"""
+    try:
+        from middleware.auth_middleware import AuthMiddleware
+        
+        if not api_key:
+            raise HTTPException(status_code=400, detail="API key is required")
+        
+        auth_middleware = AuthMiddleware(db_manager.get_db())
+        user_info = auth_middleware.verify_api_key(api_key)
+        
+        return {
+            "valid": True,
+            "role": user_info.get('role'),
+            "user_id": user_info.get('user_id'),
+            "email": user_info.get('email'),
+            "uid": user_info.get('uid'),
+            "network": user_info.get('network'),
+            "message": "API key is valid"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ API key verification error: {e}")
+        raise HTTPException(status_code=500, detail=f"API key verification failed: {str(e)}")
+
+# ============================================================================
+# MINER ENDPOINTS (Protected with miner API key)
+# ============================================================================
+
+class MinerAuthRequest(BaseModel):
+    """Miner authentication request with credentials"""
+    hotkey: str = Field(..., description="Miner hotkey address")
+    coldkey_address: str = Field(..., description="Miner coldkey address")
+    uid: int = Field(..., description="Miner UID")
+    network: str = Field(..., description="Network: 'test' or 'finney'")
+
+@app.post("/api/v1/miner/authenticate")
+async def authenticate_miner(
+    request: MinerAuthRequest,
+    http_request: Request
+):
+    """Authenticate miner and verify credentials match API key"""
+    try:
+        from middleware.auth_middleware import AuthMiddleware
+        
+        # Get API key from header or query
+        api_key = http_request.headers.get("X-API-Key") or http_request.query_params.get("api_key")
+        
+        if not api_key:
+            raise HTTPException(status_code=401, detail="API key is required")
+        
+        auth_middleware = AuthMiddleware(db_manager.get_db())
+        user_info = auth_middleware.verify_api_key(api_key)
+        
+        # Verify miner credentials match
+        if not auth_middleware.verify_miner_credentials(
+            user_info,
+            request.hotkey,
+            request.coldkey_address,
+            request.uid,
+            request.network
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Miner credentials do not match the provided API key"
+            )
+        
+        return {
+            "success": True,
+            "authenticated": True,
+            "uid": request.uid,
+            "network": request.network,
+            "message": "Miner authenticated successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Miner authentication error: {e}")
+        raise HTTPException(status_code=500, detail=f"Miner authentication failed: {str(e)}")
+
+# ============================================================================
+# VALIDATOR ENDPOINTS (Protected with validator API key)
+# ============================================================================
+
+class ValidatorAuthRequest(BaseModel):
+    """Validator authentication request with credentials"""
+    hotkey: str = Field(..., description="Validator hotkey address")
+    coldkey_address: str = Field(..., description="Validator coldkey address")
+    uid: int = Field(..., description="Validator UID")
+    network: str = Field(..., description="Network: 'test' or 'finney'")
+
+@app.post("/api/v1/validator/authenticate")
+async def authenticate_validator(
+    request: ValidatorAuthRequest,
+    http_request: Request
+):
+    """Authenticate validator and verify credentials match API key"""
+    try:
+        from middleware.auth_middleware import AuthMiddleware
+        
+        # Get API key from header or query
+        api_key = http_request.headers.get("X-API-Key") or http_request.query_params.get("api_key")
+        
+        if not api_key:
+            raise HTTPException(status_code=401, detail="API key is required")
+        
+        auth_middleware = AuthMiddleware(db_manager.get_db())
+        user_info = auth_middleware.verify_api_key(api_key)
+        
+        # Verify validator credentials match
+        if not auth_middleware.verify_validator_credentials(
+            user_info,
+            request.hotkey,
+            request.coldkey_address,
+            request.uid,
+            request.network
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Validator credentials do not match the provided API key"
+            )
+        
+        return {
+            "success": True,
+            "authenticated": True,
+            "uid": request.uid,
+            "network": request.network,
+            "message": "Validator authenticated successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Validator authentication error: {e}")
+        raise HTTPException(status_code=500, detail=f"Validator authentication failed: {str(e)}")
+
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
@@ -3314,3 +4435,4 @@ if __name__ == "__main__":
         reload=True,
         log_level="info"
     )
+

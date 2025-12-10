@@ -13,6 +13,7 @@ from typing import Optional, Tuple, List, Dict, Union
 import gc
 import logging
 from dataclasses import dataclass
+from template.utils.hf_token import get_hf_token_dict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -56,10 +57,11 @@ class TranscriptionPipeline:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.chunk_duration = chunk_duration
         
-        # Load model and processor
+        # Load model and processor with HF token if available
+        hf_token_kwargs = get_hf_token_dict()
         logger.info(f"🔄 Loading Whisper model: {model_name}")
-        self.processor = WhisperProcessor.from_pretrained(model_name)
-        self.model = WhisperForConditionalGeneration.from_pretrained(model_name)
+        self.processor = WhisperProcessor.from_pretrained(model_name, **hf_token_kwargs)
+        self.model = WhisperForConditionalGeneration.from_pretrained(model_name, **hf_token_kwargs)
         self.model.to(self.device)
         logger.info(f"✅ Whisper model loaded successfully on {self.device}")
         
@@ -155,8 +157,23 @@ class TranscriptionPipeline:
                 return_tensors="pt"
             ).input_features.to(self.device)
             
-            # Generate transcription
-            predicted_ids = self.model.generate(inputs)
+            # Get language ID for forced language decoding (if supported)
+            language_id = self.language_codes.get(language.lower(), None)
+            if language_id:
+                logger.info(f"🌐 Forcing transcription language: {language} ({language_id})")
+            
+            # Generate transcription with language forcing if specified
+            # Whisper can auto-detect, but we can force language by setting forced_decoder_ids
+            generate_kwargs = {}
+            if language_id and hasattr(self.processor, 'get_decoder_prompt_ids'):
+                try:
+                    forced_decoder_ids = self.processor.get_decoder_prompt_ids(language=language, task="transcribe")
+                    generate_kwargs['forced_decoder_ids'] = forced_decoder_ids
+                except:
+                    # If language forcing not supported, continue with auto-detection
+                    logger.debug(f"Language forcing not available for {language}, using auto-detection")
+            
+            predicted_ids = self.model.generate(inputs, **generate_kwargs)
             transcription = self.processor.batch_decode(
                 predicted_ids, 
                 skip_special_tokens=True
@@ -211,8 +228,19 @@ class TranscriptionPipeline:
                         return_tensors="pt"
                     ).input_features.to(self.device)
                     
-                    # Generate transcription
-                    predicted_ids = self.model.generate(inputs)
+                    # Get language ID for forced language decoding (if supported)
+                    language_id = self.language_codes.get(language.lower(), None)
+                    generate_kwargs = {}
+                    if language_id and hasattr(self.processor, 'get_decoder_prompt_ids'):
+                        try:
+                            forced_decoder_ids = self.processor.get_decoder_prompt_ids(language=language, task="transcribe")
+                            generate_kwargs['forced_decoder_ids'] = forced_decoder_ids
+                        except:
+                            # If language forcing not supported, continue with auto-detection
+                            pass
+                    
+                    # Generate transcription with language forcing if specified
+                    predicted_ids = self.model.generate(inputs, **generate_kwargs)
                     transcription = self.processor.batch_decode(
                         predicted_ids, 
                         skip_special_tokens=True
@@ -411,5 +439,16 @@ class TranscriptionPipeline:
         except Exception as e:
             logger.warning(f"⚠️ Memory cleanup failed: {e}")
 
-# Global instance for backward compatibility
-transcription_pipeline = TranscriptionPipeline()
+# Global instance for backward compatibility (lazy initialization)
+# Removed immediate instantiation to prevent model loading during import
+_transcription_pipeline_instance = None
+
+def get_transcription_pipeline_instance():
+    """Get or create the global transcription pipeline instance (lazy)"""
+    global _transcription_pipeline_instance
+    if _transcription_pipeline_instance is None:
+        _transcription_pipeline_instance = TranscriptionPipeline()
+    return _transcription_pipeline_instance
+
+# For backward compatibility - but prefer creating new instances
+transcription_pipeline = None

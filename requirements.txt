@@ -6,6 +6,7 @@ pydantic>=2.5.0
 python-multipart>=0.0.6
 starlette>=0.30.0
 rich>=13
+bittensor
 
 # Firebase and Google Cloud
 firebase-admin>=6.2.0

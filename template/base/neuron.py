@@ -80,7 +80,68 @@ class BaseNeuron(ABC):
         # The wallet holds the cryptographic key pairs for the miner.
         self.wallet = bt.wallet(config=self.config)
         self.subtensor = bt.subtensor(config=self.config)
-        self.metagraph = self.subtensor.metagraph(self.config.netuid)
+        
+        # Retry metagraph sync with error handling for SCALE codec issues
+        max_retries = 3
+        retry_delay = 2  # seconds
+        use_lite = False  # Try full sync first, fallback to lite if needed
+        
+        for attempt in range(max_retries):
+            try:
+                if attempt == 0:
+                    bt.logging.info(f"Syncing metagraph (attempt {attempt + 1}/{max_retries})...")
+                else:
+                    bt.logging.info(f"Syncing metagraph (attempt {attempt + 1}/{max_retries}, lite={use_lite})...")
+                
+                # Try with lite mode if previous attempts failed
+                if use_lite:
+                    self.metagraph = self.subtensor.metagraph(self.config.netuid, lite=True)
+                else:
+                    self.metagraph = self.subtensor.metagraph(self.config.netuid)
+                
+                bt.logging.info("✅ Metagraph synced successfully")
+                break
+            except Exception as e:
+                error_msg = str(e)
+                error_type = type(e).__name__
+                
+                # Check if it's a SCALE codec error
+                is_scale_error = (
+                    "RemainingScaleBytesNotEmptyException" in error_msg or 
+                    "RemainingScaleBytesNotEmptyException" in error_type or
+                    "decode" in error_msg.lower() or
+                    "Decoding" in error_msg
+                )
+                
+                if is_scale_error:
+                    if attempt < max_retries - 1:
+                        bt.logging.warning(
+                            f"⚠️ Metagraph sync failed (attempt {attempt + 1}/{max_retries}): {error_type}"
+                        )
+                        bt.logging.debug(f"   Error details: {error_msg[:200]}")
+                        
+                        # Try lite mode on second attempt
+                        if attempt == 1:
+                            use_lite = True
+                            bt.logging.info("   Switching to lite mode for faster sync...")
+                        else:
+                            bt.logging.info(f"   Retrying in {retry_delay} seconds...")
+                            import time
+                            time.sleep(retry_delay)
+                            retry_delay *= 2  # Exponential backoff
+                    else:
+                        bt.logging.error(f"❌ Failed to sync metagraph after {max_retries} attempts")
+                        bt.logging.error(f"   Error type: {error_type}")
+                        bt.logging.error(f"   Error: {error_msg[:300]}")
+                        bt.logging.error("   This is often caused by:")
+                        bt.logging.error("   - Network connectivity issues")
+                        bt.logging.error("   - Bittensor version mismatch")
+                        bt.logging.error("   - Blockchain data corruption")
+                        bt.logging.error("   Please try again in a few moments or check your Bittensor version")
+                        raise
+                else:
+                    # For other errors, raise immediately
+                    raise
 
         bt.logging.info(f"Wallet: {self.wallet}")
         bt.logging.info(f"Subtensor: {self.subtensor}")

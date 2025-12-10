@@ -33,7 +33,6 @@ from template.base.utils.weight_utils import (
     process_weights_for_netuid,
     convert_weights_and_uids_for_emit,
 )  # TODO: Replace when bittensor switches to numpy
-from template.mock import MockDendrite
 from template.utils.config import add_validator_args
 
 
@@ -56,10 +55,7 @@ class BaseValidatorNeuron(BaseNeuron):
         self.hotkeys = copy.deepcopy(self.metagraph.hotkeys)
 
         # Dendrite lets us send messages to other nodes (axons) in the network.
-        if self.config.mock:
-            self.dendrite = MockDendrite(wallet=self.wallet)
-        else:
-            self.dendrite = bt.dendrite(wallet=self.wallet)
+        self.dendrite = bt.dendrite(wallet=self.wallet)
         bt.logging.info(f"Dendrite: {self.dendrite}")
 
         # Set up initial scoring weights for validation

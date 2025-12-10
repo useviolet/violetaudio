@@ -350,9 +350,6 @@ class Validator(BaseValidatorNeuron):
                 ip = external_ip_str if external_ip_str else regular_ip_str
                 port = external_port if external_port and external_port != 0 else regular_port
                 
-                # Log what metagraph contains (for debugging)
-                bt.logging.debug(f"   UID {uid:3d} | metagraph data: ip={regular_ip_str}, port={regular_port}, external_ip={external_ip_str}, external_port={external_port} | using: {ip}:{port}")
-                
                 # IMPORTANT: We pass the axon object directly to dendrite
                 # Bittensor's dendrite automatically uses the correct IP/port from the axon
                 # The axon object from metagraph contains all on-chain registered information
@@ -376,14 +373,23 @@ class Validator(BaseValidatorNeuron):
                     # IMPORTANT: We pass the axon object directly from CURRENT metagraph
                     # Bittensor's dendrite will automatically use the correct IP/port from the axon
                     # The axon object contains all on-chain registered information (including external_ip/external_port)
-                    bt.logging.debug(f"🔗 Handshaking with UID {uid:3d} | {ip}:{port} (from current metagraph)...")
+                    # NOTE: Only log successful handshakes to reduce log noise
                     
-                    responses = await self.dendrite(
-                        axons=[axon],  # Use CURRENT metagraph axon - Bittensor handles IP/port automatically
-                        synapse=handshake_task,
-                        deserialize=False,  # Don't deserialize for handshake
-                        timeout=10  # Increased to 10 seconds for handshake (was 5)
-                    )
+                    # Use asyncio.wait_for to ensure we don't hang indefinitely
+                    # This matches the pattern used in working Bittensor subnets
+                    try:
+                        responses = await asyncio.wait_for(
+                            self.dendrite(
+                                axons=[axon],  # Use CURRENT metagraph axon - Bittensor handles IP/port automatically
+                                synapse=handshake_task,
+                                deserialize=False,  # Don't deserialize for handshake
+                                timeout=15  # Increased to 15 seconds for handshake (was 10)
+                            ),
+                            timeout=20  # Outer timeout to prevent hanging
+                        )
+                    except asyncio.TimeoutError:
+                        # Timeout occurred - miner not responding (silently skip, no logging)
+                        continue  # Skip to next miner
                     
                     # Check if miner responded successfully
                     if responses and len(responses) > 0:
@@ -400,28 +406,26 @@ class Validator(BaseValidatorNeuron):
                         # 200 = success, 400/500 = error but miner is online and responding
                         if status_code in [200, 400, 500]:
                             active_miners.append(uid)
+                            # ONLY log successful handshakes - this reduces log noise
                             bt.logging.info(
                                 f"✅ UID {uid:3d} | {ip}:{port} | "
                                 f"Stake: {stake:,.0f} TAO | "
                                 f"On-chain handshake: SUCCESS (Status: {status_code})"
                             )
-                        else:
-                            bt.logging.debug(
-                                f"❌ UID {uid:3d} | {ip}:{port} | "
-                                f"On-chain handshake: FAILED (Status: {status_code})"
-                            )
-                    else:
-                        bt.logging.debug(
-                            f"❌ UID {uid:3d} | {ip}:{port} | "
-                            f"On-chain handshake: NO RESPONSE"
-                        )
+                        # Failed handshakes are silently skipped (no logging to reduce noise)
+                    # No response is silently skipped (no logging to reduce noise)
                         
+                except asyncio.TimeoutError:
+                    # Already handled above, but catch here too for safety (silently skip)
+                    continue  # Skip to next miner
                 except Exception as e:
-                    # Miner did not respond to on-chain query - not active
-                    bt.logging.debug(
-                        f"❌ UID {uid:3d} | {ip}:{port} | "
-                        f"On-chain handshake: EXCEPTION ({str(e)[:50]}...)"
-                    )
+                    # Miner did not respond to on-chain query - not active (silently skip)
+                    # Only log unexpected errors (not timeouts or connection errors)
+                    error_msg = str(e)
+                    if "Timeout" not in error_msg and "408" not in error_msg and "Connect" not in error_msg:
+                        # Only log unexpected errors, not common connection failures
+                        bt.logging.debug(f"⚠️ Unexpected error handshaking with UID {uid:3d}: {error_msg[:50]}...")
+                    continue  # Skip to next miner
             
             # Summary of on-chain handshake results
             bt.logging.info("─" * 60)
@@ -1031,18 +1035,25 @@ class Validator(BaseValidatorNeuron):
                     hotkey = self.metagraph.hotkeys[uid]
                     stake = self.metagraph.S[uid]
                     
-                    # Get IP information
+                    # Get IP information - use getattr() to safely access attributes that may not exist
                     ip = axon.ip
                     port = axon.port
-                    external_ip = axon.external_ip
-                    external_port = axon.external_port
+                    external_ip = getattr(axon, 'external_ip', None)
+                    external_port = getattr(axon, 'external_port', None)
                     
                     # Convert IP from int to string if needed
                     if isinstance(ip, int):
                         ip = f"{ip >> 24}.{(ip >> 16) & 255}.{(ip >> 8) & 255}.{ip & 255}"
                     
-                    if isinstance(external_ip, int):
+                    # Convert external_ip if it exists and is an int
+                    if external_ip and isinstance(external_ip, int):
                         external_ip = f"{external_ip >> 24}.{(external_ip >> 16) & 255}.{(external_ip >> 8) & 255}.{external_ip & 255}"
+                    elif external_ip and isinstance(external_ip, str):
+                        # Already a string, use as is
+                        pass
+                    else:
+                        # external_ip is None or invalid, set to None
+                        external_ip = None
                     
                     # Calculate performance score based on recent interactions
                     performance_score = self.calculate_miner_performance_score(uid)
@@ -1072,7 +1083,10 @@ class Validator(BaseValidatorNeuron):
                     miner_statuses.append(miner_status)
                     
                 except Exception as e:
-                    bt.logging.debug(f"⚠️ Error getting status for miner {uid}: {str(e)[:50]}...")
+                    error_msg = str(e)
+                    bt.logging.warning(f"⚠️ Error getting status for miner {uid}: {error_msg}")
+                    import traceback
+                    bt.logging.debug(f"   Traceback: {traceback.format_exc()}")
                     continue
             
             if miner_statuses:

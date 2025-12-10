@@ -130,15 +130,92 @@ class BaseNeuron(ABC):
                             time.sleep(retry_delay)
                             retry_delay *= 2  # Exponential backoff
                     else:
+                        # Last attempt failed - try fallback method
                         bt.logging.error(f"❌ Failed to sync metagraph after {max_retries} attempts")
                         bt.logging.error(f"   Error type: {error_type}")
                         bt.logging.error(f"   Error: {error_msg[:300]}")
-                        bt.logging.error("   This is often caused by:")
-                        bt.logging.error("   - Network connectivity issues")
-                        bt.logging.error("   - Bittensor version mismatch")
-                        bt.logging.error("   - Blockchain data corruption")
-                        bt.logging.error("   Please try again in a few moments or check your Bittensor version")
-                        raise
+                        bt.logging.warning("⚠️ Attempting fallback: Getting UID directly from subtensor...")
+                        
+                        # Fallback: Try to get UID directly without full metagraph
+                        try:
+                            # Check registration first
+                            is_registered = self.subtensor.is_hotkey_registered(
+                                netuid=self.config.netuid,
+                                hotkey_ss58=self.wallet.hotkey.ss58_address
+                            )
+                            
+                            if not is_registered:
+                                bt.logging.error(
+                                    f"Wallet: {self.wallet} is not registered on netuid {self.config.netuid}."
+                                    f" Please register the hotkey using `btcli subnets register` before trying again"
+                                )
+                                exit()
+                            
+                            # Try to get UID from subtensor directly (may also fail with same error)
+                            try:
+                                bt.logging.info("   Attempting to get UID from subtensor.neurons()...")
+                                neurons = self.subtensor.neurons(netuid=self.config.netuid)
+                                uid = None
+                                for i, neuron in enumerate(neurons):
+                                    if neuron.hotkey == self.wallet.hotkey.ss58_address:
+                                        uid = i
+                                        break
+                                
+                                if uid is not None:
+                                    bt.logging.warning(f"⚠️ Using fallback method - UID: {uid}")
+                                    bt.logging.warning("⚠️ Metagraph sync failed, but miner can continue with limited functionality")
+                                    # Create a minimal metagraph-like object
+                                    self.metagraph = None
+                                    self.uid = uid
+                                    bt.logging.info(
+                                        f"Running neuron on subnet: {self.config.netuid} with uid {self.uid} using network: {self.subtensor.chain_endpoint}"
+                                    )
+                                    bt.logging.warning("⚠️ Some features may be limited without full metagraph sync")
+                                    return  # Skip the rest of initialization that requires metagraph
+                                else:
+                                    raise ValueError("Could not find UID in neurons list")
+                            except Exception as fallback_error:
+                                # If neurons() also fails, try one more approach: query UID directly
+                                bt.logging.warning(f"   subtensor.neurons() also failed: {type(fallback_error).__name__}")
+                                bt.logging.warning("   Attempting final fallback: Query UID directly...")
+                                
+                                try:
+                                    # Try to query the UID using get_uid_for_hotkey
+                                    uid = self.subtensor.get_uid_for_hotkey_on_subnet(
+                                        hotkey_ss58=self.wallet.hotkey.ss58_address,
+                                        netuid=self.config.netuid
+                                    )
+                                    
+                                    if uid is not None:
+                                        bt.logging.warning(f"⚠️ Using direct UID query - UID: {uid}")
+                                        bt.logging.warning("⚠️ Metagraph sync failed, but miner can continue")
+                                        self.metagraph = None
+                                        self.uid = uid
+                                        bt.logging.info(
+                                            f"Running neuron on subnet: {self.config.netuid} with uid {self.uid} using network: {self.subtensor.chain_endpoint}"
+                                        )
+                                        bt.logging.warning("⚠️ Some features may be limited without full metagraph sync")
+                                        return
+                                    else:
+                                        raise ValueError("UID query returned None")
+                                except Exception as final_error:
+                                    bt.logging.error(f"❌ All fallback methods failed")
+                                    bt.logging.error(f"   Last error: {type(final_error).__name__}: {final_error}")
+                                    bt.logging.error("   This is often caused by:")
+                                    bt.logging.error("   - Network connectivity issues")
+                                    bt.logging.error("   - Bittensor version mismatch (check: pip show bittensor)")
+                                    bt.logging.error("   - Blockchain data corruption")
+                                    bt.logging.error("   - Firewall/proxy interfering with WebSocket connections")
+                                    bt.logging.error("")
+                                    bt.logging.error("   Solutions:")
+                                    bt.logging.error("   1. Update Bittensor: pip install --upgrade bittensor")
+                                    bt.logging.error("   2. Check network connectivity to test.finney.opentensor.ai")
+                                    bt.logging.error("   3. Try again in a few moments (may be transient)")
+                                    bt.logging.error("   4. Check if local machine works (suggests remote network issue)")
+                                    raise
+                        except Exception as fallback_error:
+                            bt.logging.error(f"❌ Fallback method failed: {fallback_error}")
+                            raise
                 else:
                     # For other errors, raise immediately
                     raise

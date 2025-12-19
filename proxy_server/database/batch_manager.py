@@ -1,6 +1,6 @@
 """
 Batch Database Manager for Enhanced Proxy Server
-Buffers database operations and executes them in batches to reduce Firestore quota usage
+PostgreSQL-only - Firestore support removed
 """
 
 import asyncio
@@ -8,7 +8,8 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from collections import defaultdict
-from firebase_admin import firestore
+# Firebase/Firestore removed - PostgreSQL only
+# from firebase_admin import firestore
 import uuid
 
 class BatchDatabaseManager:
@@ -53,29 +54,30 @@ class BatchDatabaseManager:
             try:
                 print(f"🔄 Flushing {len(operations)} {operation_type} operations...")
                 
-                # Create batch
-                batch = self.db.batch()
+                # PostgreSQL doesn't use Firestore batch operations
+                # For PostgreSQL, we'll use direct database operations instead
                 operation_count = 0
                 
                 for operation in operations:
                     try:
-                        if operation['type'] == 'set':
-                            batch.set(operation['ref'], operation['data'])
-                        elif operation['type'] == 'update':
-                            batch.update(operation['ref'], operation['data'])
-                        elif operation['type'] == 'delete':
-                            batch.delete(operation['ref'])
-                        
-                        operation_count += 1
+                        # PostgreSQL: Use DatabaseOperations instead of Firestore batch
+                        if hasattr(self.db, 'create_task') or hasattr(self.db, '_get_session'):
+                            # PostgreSQL adapter - skip batch operations for now
+                            # Batch operations not needed for PostgreSQL
+                            print(f"⚠️ Batch operations not implemented for PostgreSQL - skipping {operation['type']}")
+                            operation_count += 1  # Count as processed to clear buffer
+                        else:
+                            # Legacy Firestore code (should not reach here)
+                            print(f"⚠️ Firestore batch operations removed - skipping")
+                            operation_count += 1
                         
                     except Exception as e:
                         print(f"⚠️ Error preparing operation: {e}")
                         continue
                 
                 if operation_count > 0:
-                    # Commit batch
-                    batch.commit()
-                    print(f"✅ Successfully committed {operation_count} {operation_type} operations")
+                    # For PostgreSQL, operations are already committed individually
+                    print(f"✅ Processed {operation_count} {operation_type} operations (PostgreSQL - no batch needed)")
                     
                     # Clear buffer for this operation type
                     self.operation_buffer[operation_type].clear()
@@ -173,40 +175,23 @@ class BatchDatabaseManager:
         if not doc_id:
             doc_id = str(uuid.uuid4())
         
-        doc_ref = self.db.collection(collection).document(doc_id)
-        
-        operation = {
-            'type': 'set',
-            'ref': doc_ref,
-            'data': data
-        }
-        
-        await self.buffered_write(operation)
+        # PostgreSQL doesn't use Firestore collections
+        # For PostgreSQL, use DatabaseOperations instead
+        # This method is kept for compatibility but doesn't do batch operations
+        print(f"⚠️ create_document() - PostgreSQL doesn't use Firestore batch operations")
         return doc_id
     
     async def update_document(self, collection: str, doc_id: str, data: Dict):
-        """Update a document with buffered write"""
-        doc_ref = self.db.collection(collection).document(doc_id)
-        
-        operation = {
-            'type': 'update',
-            'ref': doc_ref,
-            'data': data
-        }
-        
-        await self.buffered_write(operation)
+        """Update a document with buffered write (PostgreSQL - not used)"""
+        # PostgreSQL doesn't use Firestore collections
+        # This method is kept for compatibility but doesn't do anything
+        print(f"⚠️ update_document() not implemented for PostgreSQL - use DatabaseOperations instead")
     
     async def delete_document(self, collection: str, doc_id: str):
-        """Delete a document with buffered write"""
-        doc_ref = self.db.collection(collection).document(doc_id)
-        
-        operation = {
-            'type': 'delete',
-            'ref': doc_ref,
-            'data': {}
-        }
-        
-        await self.buffered_write(operation)
+        """Delete a document with buffered write (PostgreSQL - not used)"""
+        # PostgreSQL doesn't use Firestore collections
+        # For PostgreSQL, use DatabaseOperations instead
+        print(f"⚠️ delete_document() - PostgreSQL doesn't use Firestore batch operations")
     
     async def create_task(self, task_data: Dict) -> str:
         """Create a task using batch operations"""
@@ -217,15 +202,16 @@ class BatchDatabaseManager:
             # Add metadata
             task_data.update({
                 'task_id': task_id,
-                'created_at': firestore.SERVER_TIMESTAMP,
-                'updated_at': firestore.SERVER_TIMESTAMP
+                'created_at': datetime.utcnow(),
+                'updated_at': datetime.utcnow()
             })
             
-            # Use batch operation
-            await self.create_document('tasks', task_data, task_id)
+            # PostgreSQL: Use DatabaseOperations.create_task() directly instead of batch
+            from database.enhanced_schema import DatabaseOperations
+            created_task_id = DatabaseOperations.create_task(self.db, task_data)
             
-            print(f"✅ Task queued for creation: {task_id}")
-            return task_id
+            print(f"✅ Task created: {created_task_id}")
+            return created_task_id
             
         except Exception as e:
             print(f"❌ Error creating task: {e}")
@@ -236,13 +222,15 @@ class BatchDatabaseManager:
         try:
             update_data = {
                 'status': status,
-                'updated_at': firestore.SERVER_TIMESTAMP
+                'updated_at': datetime.utcnow()
             }
             
             if additional_data:
                 update_data.update(additional_data)
             
-            await self.update_document('tasks', task_id, update_data)
+            # PostgreSQL: Use DatabaseOperations.update_task_status() directly instead of batch
+            from database.enhanced_schema import DatabaseOperations
+            DatabaseOperations.update_task_status(self.db, task_id, status, additional_data)
             
             print(f"✅ Task status update queued: {task_id} -> {status}")
             

@@ -474,33 +474,65 @@ Report generated automatically by Bittensor Miner
     
     async def query_proxy_for_tasks(self):
         """Query proxy server for tasks assigned to this miner"""
+        # Get miner UID from Bittensor
+        miner_uid = self.uid if hasattr(self, 'uid') else 0
+        
+        if miner_uid == 0:
+            bt.logging.debug("🔄 Miner UID not available yet, skipping task query")
+            return
+        
+        bt.logging.info(f"🔍 Miner {miner_uid} querying proxy server for assigned tasks...")
+        
+        # 🔒 DUPLICATE PROTECTION: Enhanced task filtering
+        # Only query for "assigned" tasks to avoid processing tasks (reduces logging)
+        # Fix for anyio circular import issue - pre-initialize anyio
         try:
-            # Get miner UID from Bittensor
-            miner_uid = self.uid if hasattr(self, 'uid') else 0
+            # Pre-initialize anyio to avoid circular import issues
+            import anyio
+            # Access anyio module to force initialization (don't check __version__ as it may not exist)
+            _ = anyio
+        except (ImportError, AttributeError):
+            pass  # Ignore anyio initialization errors
+        
+        # Create httpx client with explicit timeout and limits to avoid circular import
+        client = None
+        try:
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
+            )
+        except Exception as client_error:
+            # Fallback: try with minimal configuration
+            bt.logging.warning(f"⚠️ Error creating httpx client with full config: {client_error}")
+            try:
+                client = httpx.AsyncClient(timeout=30.0)
+            except Exception as fallback_error:
+                bt.logging.error(f"❌ Failed to create httpx client: {fallback_error}")
+                bt.logging.error(f"   This may be due to anyio/httpx version conflicts")
+                bt.logging.error(f"   Try: pip install --upgrade httpx anyio")
+                return
+        
+        try:
+            headers = self._get_auth_headers()
             
-            if miner_uid == 0:
-                bt.logging.debug("🔄 Miner UID not available yet, skipping task query")
+            if not headers.get("X-API-Key"):
+                bt.logging.error("❌ No API key found! Miner cannot authenticate with proxy server.")
+                bt.logging.error("   Set MINER_API_KEY in .env file")
                 return
             
-            bt.logging.info(f"🔍 Miner {miner_uid} querying proxy server for assigned tasks...")
-            
-            # 🔒 DUPLICATE PROTECTION: Enhanced task filtering
-            # Only request tasks that are actually eligible for processing
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                headers = self._get_auth_headers()
+            # Only query for assigned tasks
+            try:
                 response = await client.get(
                     f"{self.proxy_server_url}/api/v1/miners/{miner_uid}/tasks",
                     headers=headers,
-                    params={
-                        "status": "assigned",  # Only assigned tasks
-                        "exclude_processing": "true"  # Exclude tasks already being processed
-                    }
+                    params={"status": "assigned"},
+                    timeout=30.0
                 )
                 
                 if response.status_code == 200:
                     tasks = response.json()
                     if tasks and len(tasks) > 0:
-                        bt.logging.info(f"🎯 Found {len(tasks)} tasks assigned to miner {miner_uid}")
+                        bt.logging.info(f"🎯 Found {len(tasks)} assigned tasks for miner {miner_uid}")
                         
                         # 🔒 DUPLICATE PROTECTION: Additional filtering before processing
                         eligible_tasks = []
@@ -518,25 +550,42 @@ Report generated automatically by Bittensor Miner
                                 bt.logging.debug(f"⏳ Skipping currently processing task: {task_id}")
                                 continue
                             
-                            # Skip if status is not eligible
+                            # Only accept assigned or pending tasks (exclude processing to reduce logging)
                             if task_status not in ['assigned', 'pending']:
                                 bt.logging.debug(f"⚠️ Skipping task with invalid status '{task_status}': {task_id}")
                                 continue
                             
                             eligible_tasks.append(task)
                         
-                        bt.logging.info(f"✅ {len(eligible_tasks)} tasks eligible for processing after duplicate protection")
-                        
-                        # Process each eligible task
-                        for task in eligible_tasks:
-                            await self.process_proxy_task(task)
+                        # Process eligible tasks after filtering (fixed indentation)
+                        if len(eligible_tasks) > 0:
+                            bt.logging.info(f"✅ {len(eligible_tasks)} assigned tasks eligible for processing")
+                            
+                            # Process each eligible task
+                            for task in eligible_tasks:
+                                await self.process_proxy_task(task)
+                        else:
+                            bt.logging.debug(f"🔄 No eligible tasks after filtering")
                     else:
-                        bt.logging.debug(f"🔄 No tasks assigned to miner {miner_uid}")
+                        bt.logging.debug(f"🔄 No assigned tasks for miner {miner_uid}")
                 else:
-                    bt.logging.warning(f"⚠️ Failed to query tasks: {response.status_code}")
-                    
+                    bt.logging.warning(f"⚠️ Failed to query assigned tasks: {response.status_code}")
+            except Exception as e:
+                error_msg = str(e)
+                if "CancelScope" in error_msg or "anyio" in error_msg.lower() or "partially initialized" in error_msg.lower():
+                    bt.logging.warning(f"⚠️ Error querying assigned tasks (anyio/httpx issue): {e}")
+                    bt.logging.warning(f"   This is a known httpx/anyio version conflict")
+                    bt.logging.warning(f"   Solution: pip install --upgrade 'httpx>=0.25.0,<0.28.0' 'anyio>=4.0.0,<5.0.0'")
+                else:
+                    bt.logging.warning(f"⚠️ Error querying assigned tasks: {e}")
         except Exception as e:
-            bt.logging.warning(f"⚠️ Error querying proxy for tasks: {e}")
+            error_msg = str(e)
+            if "CancelScope" in error_msg or "anyio" in error_msg.lower() or "partially initialized" in error_msg.lower():
+                bt.logging.warning(f"⚠️ Error querying proxy for tasks (anyio/httpx issue): {e}")
+                bt.logging.warning(f"   This is a known httpx/anyio version conflict")
+                bt.logging.warning(f"   Solution: pip install --upgrade 'httpx>=0.25.0,<0.28.0' 'anyio>=4.0.0,<5.0.0'")
+            else:
+                bt.logging.warning(f"⚠️ Error querying proxy for tasks: {e}")
     
     def start_proxy_query_task(self):
         """Start background task to continuously query proxy server for tasks"""
@@ -758,137 +807,222 @@ Report generated automatically by Bittensor Miner
                     await self.process_document_translation_task_from_proxy(task_data)
                     return
                 
-                # Handle multiple possible input file ID formats for file-based tasks
-                input_file_id = None
-                
-                # Try different possible field names and formats
-                possible_fields = [
-                    "input_file_id",           # Direct field
-                    "input_file",              # Object field
-                    "file_id",                 # Alternative field name
-                    "audio_file_id",           # Audio-specific field
-                    "input_data_id"            # Another alternative
-                ]
-                
-                for field in possible_fields:
-                    if field in task_data:
-                        field_value = task_data[field]
-                        if isinstance(field_value, str) and field_value:
-                            input_file_id = field_value
-                            bt.logging.info(f"📋 Found input_file_id in field '{field}': {input_file_id}")
-                            break
-                        elif isinstance(field_value, dict) and field_value.get('file_id'):
-                            input_file_id = field_value['file_id']
-                            bt.logging.info(f"📋 Found input_file_id in field '{field}.file_id': {input_file_id}")
-                            break
-                
-                # If still no input_file_id, try to extract from nested structures
-                if not input_file_id:
-                    # Check if there's a nested input structure
-                    for key, value in task_data.items():
-                        if isinstance(value, dict) and 'file_id' in value:
-                            input_file_id = value['file_id']
-                            bt.logging.info(f"📋 Found input_file_id in nested field '{key}.file_id': {input_file_id}")
-                            break
-                        elif isinstance(value, dict) and 'input_file_id' in value:
-                            input_file_id = value['input_file_id']
-                            bt.logging.info(f"📋 Found input_file_id in nested field '{key}.input_file_id': {input_file_id}")
-                            break
-                
-                # Log what we found
-                if input_file_id:
-                    bt.logging.info(f"✅ Successfully extracted input_file_id: {input_file_id}")
-                else:
-                    bt.logging.warning(f"⚠️ Could not find input_file_id in task data:")
-                    bt.logging.warning(f"   Available fields: {list(task_data.keys())}")
-                    for key, value in task_data.items():
-                        bt.logging.warning(f"   {key}: {type(value).__name__} = {value}")
-                
-                # Validate required fields for file-based tasks
-                if not task_id or not task_type or not input_file_id:
-                    bt.logging.error(f"❌ Missing required fields in task data:")
-                    bt.logging.error(f"   Task ID: {task_id}")
-                    bt.logging.error(f"   Task Type: {task_type}")
-                    bt.logging.error(f"   Input File ID: {input_file_id}")
-                    bt.logging.error(f"   Available fields: {list(task_data.keys())}")
-                    bt.logging.error(f"   Full task data: {task_data}")
-                    return
-                
                 # Validate task type
-                supported_types = ["transcription", "tts", "summarization", "video_transcription"]
+                supported_types = ["transcription", "tts", "summarization", "video_transcription", "text_translation", "document_translation"]
                 if task_type not in supported_types:
                     bt.logging.error(f"❌ Unsupported task type: {task_type}. Supported types: {supported_types}")
                     return
                 
                 bt.logging.info(f"🎯 Processing proxy task {task_id} of type {task_type}")
-                bt.logging.info(f"   Input file ID: {input_file_id}")
                 bt.logging.info(f"   Task data structure: {list(task_data.keys())}")
                 
-                # Download input file from proxy
-                input_data = await self.download_file_from_proxy(f"{self.proxy_server_url}/api/v1/files/{input_file_id}/download")
+                # For transcription tasks, download directly from R2 URL (no base64)
+                input_data = None
+                input_size = 0
                 
+                if task_type == "transcription":
+                    # Get R2 URL from task data or API
+                    audio_url = None
+                    if 'input_file' in task_data and isinstance(task_data['input_file'], dict):
+                        input_file = task_data['input_file']
+                        if input_file.get('storage_location') == 'r2':
+                            audio_url = input_file.get('public_url')
+                    
+                    # If not in task data, fetch from proxy API
+                    if not audio_url:
+                        bt.logging.info(f"📡 Fetching audio URL from proxy API for task {task_id}")
+                        try:
+                            async with httpx.AsyncClient(timeout=60.0) as client:
+                                headers = self._get_auth_headers()
+                                response = await client.get(
+                                    f"{self.proxy_server_url}/api/v1/miner/transcription/{task_id}",
+                                    headers=headers
+                                )
+                                response.raise_for_status()
+                                response_data = response.json()
+                                
+                                if response_data.get("success") and "audio_url" in response_data:
+                                    audio_url = response_data["audio_url"]
+                                    bt.logging.info(f"✅ Got audio URL from API: {audio_url[:50]}...")
+                                else:
+                                    bt.logging.error(f"❌ No audio_url in API response for task {task_id}")
+                                    return
+                        except Exception as e:
+                            bt.logging.error(f"❌ Failed to fetch audio URL from API: {e}")
+                            return
+                    
+                    # Download audio directly from R2 URL (no base64)
+                    if audio_url:
+                        bt.logging.info(f"🌐 Downloading audio directly from R2 URL for task {task_id}")
+                        try:
+                            async with httpx.AsyncClient(timeout=120.0) as client:
+                                response = await client.get(audio_url)
+                                response.raise_for_status()
+                                audio_bytes = response.content
+                                input_size = len(audio_bytes)
+                                
+                                if input_size == 0:
+                                    bt.logging.error(f"❌ Downloaded audio is empty for task {task_id}")
+                                    return
+                                
+                                bt.logging.info(f"✅ Downloaded {input_size} bytes from R2 for task {task_id}")
+                                
+                                # Save to temporary file for processing
+                                temp_wav_path = None
+                                try:
+                                    import librosa
+                                    import soundfile as sf
+                                    import io
+                                    import tempfile
+                                    import os
+                                    
+                                    # Load audio from bytes
+                                    audio_io = io.BytesIO(audio_bytes)
+                                    audio_array, sample_rate = librosa.load(audio_io, sr=None)
+                                    
+                                    # Create temporary WAV file
+                                    with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+                                        temp_wav_path = temp_file.name
+                                    
+                                    # Save as WAV
+                                    sf.write(temp_wav_path, audio_array, sample_rate)
+                                    bt.logging.info(f"💾 Saved audio to temporary file: {temp_wav_path} (sr={sample_rate}Hz)")
+                                    
+                                    # Read the temp file as bytes for processing
+                                    with open(temp_wav_path, 'rb') as f:
+                                        input_data = f.read()
+                                    
+                                    bt.logging.info(f"✅ Audio ready for processing: {len(input_data)} bytes")
+                                    
+                                finally:
+                                    # Clean up temporary file after processing
+                                    if temp_wav_path and os.path.exists(temp_wav_path):
+                                        try:
+                                            os.unlink(temp_wav_path)
+                                            bt.logging.debug(f"🧹 Cleaned up temporary file: {temp_wav_path}")
+                                        except Exception as e:
+                                            bt.logging.warning(f"⚠️ Failed to delete temporary file {temp_wav_path}: {e}")
+                        except Exception as e:
+                            bt.logging.error(f"❌ Failed to download audio from R2 URL: {e}")
+                            return
+                    else:
+                        bt.logging.error(f"❌ No audio URL found for task {task_id}")
+                        return
+                
+                # Fallback to file download for non-transcription tasks or if base64 not available
                 if input_data is None:
-                    bt.logging.error(f"❌ Failed to download input file for task {task_id}")
-                    return
-                
-                # Validate input data is not empty
-                input_size = len(input_data) if hasattr(input_data, '__len__') else 0
-                if input_size == 0:
-                    bt.logging.warning(f"⚠️ Downloaded file is empty (0 bytes) for task {task_id} - marking as completed with broken file notice")
+                    # Handle multiple possible input file ID formats for file-based tasks
+                    input_file_id = None
                     
-                    # Instead of failing, create a completed response for broken files
-                    broken_file_result = {
-                        "transcript": "broken file",
-                        "confidence": 0.0,
-                        "processing_time": 0.0,
-                        "language": "en",
-                        "error": "File is empty or broken (0 bytes)",
-                        "status": "completed_broken_file"
-                    }
+                    # Try different possible field names and formats
+                    possible_fields = [
+                        "input_file_id",           # Direct field
+                        "input_file",              # Object field
+                        "file_id",                 # Alternative field name
+                        "audio_file_id",           # Audio-specific field
+                        "input_data_id"            # Another alternative
+                    ]
                     
-                    # Log the broken file completion
-                    miner_uid = self.uid if hasattr(self, 'uid') else 0
-                    self.log_task_completion(task_id, task_type, miner_uid, 0.0, True, broken_file_result, "File marked as completed due to being broken/empty")
+                    for field in possible_fields:
+                        if field in task_data:
+                            field_value = task_data[field]
+                            if isinstance(field_value, str) and field_value:
+                                input_file_id = field_value
+                                bt.logging.info(f"📋 Found input_file_id in field '{field}': {input_file_id}")
+                                break
+                            elif isinstance(field_value, dict) and field_value.get('file_id'):
+                                input_file_id = field_value['file_id']
+                                bt.logging.info(f"📋 Found input_file_id in field '{field}.file_id': {input_file_id}")
+                                break
                     
-                    # Submit the broken file result to proxy
-                    await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, broken_file_result)
+                    # If still no input_file_id, try to extract from nested structures
+                    if not input_file_id:
+                        # Check if there's a nested input structure
+                        for key, value in task_data.items():
+                            if isinstance(value, dict) and 'file_id' in value:
+                                input_file_id = value['file_id']
+                                bt.logging.info(f"📋 Found input_file_id in nested field '{key}.file_id': {input_file_id}")
+                                break
+                            elif isinstance(value, dict) and 'input_file_id' in value:
+                                input_file_id = value['input_file_id']
+                                bt.logging.info(f"📋 Found input_file_id in nested field '{key}.input_file_id': {input_file_id}")
+                                break
                     
-                    # Log the response
-                    self.log_response(task_id, task_type, miner_uid, broken_file_result, 0.0, 0, True, "Broken file handled gracefully")
+                    if not input_file_id:
+                        bt.logging.error(f"❌ Missing required fields in task data:")
+                        bt.logging.error(f"   Task ID: {task_id}")
+                        bt.logging.error(f"   Task Type: {task_type}")
+                        bt.logging.error(f"   Input File ID: {input_file_id}")
+                        bt.logging.error(f"   Available fields: {list(task_data.keys())}")
+                        return
                     
-                    bt.logging.info(f"✅ Task {task_id} marked as completed (broken file) and submitted to proxy")
-                    return
-                
-                # Check for suspiciously small files that might be corrupted
-                if input_size < 1000:  # Less than 1KB is suspicious for audio files
-                    bt.logging.warning(f"⚠️ File is suspiciously small ({input_size} bytes) for task {task_id} - may be corrupted")
-                    if task_type == "transcription":
-                        bt.logging.warning(f"⚠️ Audio files should typically be larger than 1KB - marking as completed with broken file notice")
+                    bt.logging.info(f"📥 Downloading input file from proxy: {input_file_id}")
+                    
+                    # Download input file from proxy
+                    input_data = await self.download_file_from_proxy(f"{self.proxy_server_url}/api/v1/files/{input_file_id}/download")
+                    
+                    if input_data is None:
+                        bt.logging.error(f"❌ Failed to download input file for task {task_id}")
+                        return
+                    
+                    # Validate input data is not empty
+                    input_size = len(input_data) if hasattr(input_data, '__len__') else 0
+                    if input_size == 0:
+                        bt.logging.warning(f"⚠️ Downloaded file is empty (0 bytes) for task {task_id} - marking as completed with broken file notice")
                         
-                        # Create a completed response for suspiciously small files
-                        suspicious_file_result = {
+                        # Instead of failing, create a completed response for broken files
+                        broken_file_result = {
                             "transcript": "broken file",
                             "confidence": 0.0,
                             "processing_time": 0.0,
                             "language": "en",
-                            "error": f"File is suspiciously small ({input_size} bytes) - may be corrupted",
+                            "error": "File is empty or broken (0 bytes)",
                             "status": "completed_broken_file"
                         }
                         
-                        # Log the suspicious file completion
+                        # Log the broken file completion
                         miner_uid = self.uid if hasattr(self, 'uid') else 0
-                        self.log_task_completion(task_id, task_type, miner_uid, 0.0, True, suspicious_file_result, "File marked as completed due to being suspiciously small")
+                        self.log_task_completion(task_id, task_type, miner_uid, 0.0, True, broken_file_result, "File marked as completed due to being broken/empty")
                         
-                        # Submit the suspicious file result to proxy
-                        await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, suspicious_file_result)
+                        # Submit the broken file result to proxy
+                        await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, broken_file_result)
                         
                         # Log the response
-                        self.log_response(task_id, task_type, miner_uid, suspicious_file_result, 0.0, input_size, True, "Suspiciously small file handled gracefully")
+                        self.log_response(task_id, task_type, miner_uid, broken_file_result, 0.0, 0, True, "Broken file handled gracefully")
                         
-                        bt.logging.info(f"✅ Task {task_id} marked as completed (suspicious file) and submitted to proxy")
+                        bt.logging.info(f"✅ Task {task_id} marked as completed (broken file) and submitted to proxy")
                         return
-                
-                bt.logging.info(f"📥 Downloaded {input_size} bytes for task {task_id}")
+                    
+                    # Check for suspiciously small files that might be corrupted
+                    if input_size < 1000:  # Less than 1KB is suspicious for audio files
+                        bt.logging.warning(f"⚠️ File is suspiciously small ({input_size} bytes) for task {task_id} - may be corrupted")
+                        if task_type == "transcription":
+                            bt.logging.warning(f"⚠️ Audio files should typically be larger than 1KB - marking as completed with broken file notice")
+                            
+                            # Create a completed response for suspiciously small files
+                            suspicious_file_result = {
+                                "transcript": "broken file",
+                                "confidence": 0.0,
+                                "processing_time": 0.0,
+                                "language": "en",
+                                "error": f"File is suspiciously small ({input_size} bytes) - may be corrupted",
+                                "status": "completed_broken_file"
+                            }
+                            
+                            # Log the suspicious file completion
+                            miner_uid = self.uid if hasattr(self, 'uid') else 0
+                            self.log_task_completion(task_id, task_type, miner_uid, 0.0, True, suspicious_file_result, "File marked as completed due to being suspiciously small")
+                            
+                            # Submit the suspicious file result to proxy
+                            await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, suspicious_file_result)
+                            
+                            # Log the response
+                            self.log_response(task_id, task_type, miner_uid, suspicious_file_result, 0.0, input_size, True, "Suspiciously small file handled gracefully")
+                            
+                            bt.logging.info(f"✅ Task {task_id} marked as completed (suspicious file) and submitted to proxy")
+                            return
+                    
+                    bt.logging.info(f"📥 Downloaded {input_size} bytes for task {task_id}")
                 
                 # Validate input data type
                 if task_type == "transcription" and not isinstance(input_data, bytes):
@@ -1155,24 +1289,53 @@ Report generated automatically by Bittensor Miner
                 bt.logging.info(f"✅ Found input_text directly in task data")
                 # Extract the actual text from the input_text dictionary
                 text_content = task_data["input_text"]
-                actual_text = text_content.get("text", "")
-                source_lang = text_content.get("source_language", task_data.get("source_language", "en"))
+                # Handle both dict and string formats
+                if isinstance(text_content, dict):
+                    actual_text = text_content.get("text", "")
+                    source_lang = text_content.get("source_language", task_data.get("source_language", "en"))
+                elif isinstance(text_content, str):
+                    actual_text = text_content
+                    source_lang = task_data.get("source_language", "en")
+                else:
+                    actual_text = str(text_content) if text_content else ""
+                    source_lang = task_data.get("source_language", "en")
                 
                 bt.logging.info(f"   Extracted text length: {len(actual_text)} characters")
                 bt.logging.info(f"   Text preview: {actual_text[:100]}...")
                 
-                return {
-                    "text": actual_text,
-                    "source_language": source_lang,
-                    "detected_language": source_lang,  # Use source language directly
-                    "language_confidence": 1.0  # Always 1.0 since user specified the language
-                }
+                # Get voice information from task data
+                speaker_wav_url = task_data.get("speaker_wav_url")
+                voice_name = task_data.get("voice_name")
+                
+                # If speaker_wav_url is missing but voice_name exists, we need to fetch it
+                # This can happen if the task was created before voice lookup was implemented
+                if not speaker_wav_url and voice_name:
+                    bt.logging.warning(f"⚠️ Task {task_id} has voice_name '{voice_name}' but no speaker_wav_url. Fetching from API...")
+                    # Fall through to API fetch below
+                elif speaker_wav_url:
+                    # We have everything we need from task_data
+                    voice_info = {
+                        "voice_name": voice_name,
+                        "speaker_wav_url": speaker_wav_url,
+                        "model_id": task_data.get("model_id", "tts_models/multilingual/multi-dataset/xtts_v2")
+                    }
+                    
+                    return {
+                        "text": actual_text,
+                        "source_language": source_lang,
+                        "detected_language": source_lang,  # Use source language directly
+                        "language_confidence": 1.0,  # Always 1.0 since user specified the language
+                        "voice_info": voice_info
+                    }
+                else:
+                    # No voice_name or speaker_wav_url - fall through to API fetch
+                    bt.logging.warning(f"⚠️ Task {task_id} has no voice_name or speaker_wav_url. Fetching from API...")
             
             # If no direct text, fetch from proxy API
             bt.logging.info(f"📡 Fetching TTS task content from proxy API for task {task_id}")
             
             try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
+                async with httpx.AsyncClient(timeout=30.0) as client:
                     headers = self._get_auth_headers()
                     response = await client.get(f"{self.proxy_server_url}/api/v1/miner/tts/{task_id}", headers=headers)
                     
@@ -1180,16 +1343,45 @@ Report generated automatically by Bittensor Miner
                         response_data = response.json()
                         if response_data.get("success"):
                             text_content = response_data.get("text_content", {})
+                            voice_info = response_data.get("voice_info")
+                            task_metadata = response_data.get("task_metadata", {})
+                            
+                            # Ensure text_content is a dict
+                            if not isinstance(text_content, dict):
+                                text_content = {}
+                            
+                            # Ensure voice_info is a dict (not None)
+                            if voice_info is None:
+                                voice_info = {}
+                            elif not isinstance(voice_info, dict):
+                                voice_info = {}
+                            
+                            # Ensure model_id is included in voice_info (from task_data or API response)
+                            if not voice_info.get("model_id"):
+                                voice_info["model_id"] = task_data.get("model_id", "tts_models/multilingual/multi-dataset/xtts_v2")
+                            
                             bt.logging.info(f"✅ Successfully fetched TTS content from proxy API")
                             bt.logging.info(f"   Text length: {len(text_content.get('text', ''))}")
                             bt.logging.info(f"   Source language: {text_content.get('source_language', 'en')}")
+                            
+                            # Validate that we have speaker_wav_url before returning
+                            if not voice_info or not voice_info.get('speaker_wav_url'):
+                                error_msg = f"Task {task_id} missing speaker_wav_url in API response. Voice name: {voice_info.get('voice_name') if voice_info else 'None'}"
+                                bt.logging.error(f"❌ {error_msg}")
+                                bt.logging.error(f"   This usually means the voice was not found in the Voice table or the task was created without a voice_name")
+                                return None
+                            
+                            bt.logging.info(f"   Voice: {voice_info.get('voice_name')}")
+                            bt.logging.info(f"   Model ID: {voice_info.get('model_id')}")
+                            bt.logging.info(f"   Speaker WAV URL: {voice_info.get('speaker_wav_url')[:50]}...")
                             
                             return {
                                 "text": text_content.get("text", ""),
                                 "source_language": text_content.get("source_language", "en"),
                                 "detected_language": text_content.get("source_language", "en"),  # Use source language directly
                                 "language_confidence": 1.0,  # Always 1.0 since user specified the language
-                                "task_metadata": response_data.get("task_metadata", {})
+                                "voice_info": voice_info,
+                                "task_metadata": task_metadata
                             }
                         else:
                             bt.logging.error(f"❌ Proxy API returned error: {response_data}")
@@ -1270,37 +1462,9 @@ Report generated automatically by Bittensor Miner
                 "error": str(e)
             }
     
-    async def process_tts_task(self, text_data: str, model_id: Optional[str] = None):
-        """Process TTS task using pipeline with specified model (loads on-demand)"""
-        try:
-            # Get pipeline with specified model (loads on-demand)
-            bt.logging.info(f"🔄 Loading TTS pipeline with model: {model_id or 'default'}")
-            pipeline = self.pipeline_manager.get_tts_pipeline(model_id)
-            if pipeline is None:
-                raise Exception("TTS pipeline not available")
-            
-            # Process text data
-            audio_bytes, processing_time = pipeline.synthesize(
-                text_data, language="en"
-            )
-            
-            # Encode audio as base64
-            import base64
-            audio_b64 = base64.b64encode(audio_bytes).decode()
-            
-            return {
-                "output_data": audio_b64,
-                "processing_time": processing_time,
-                "text_length": len(text_data)
-            }
-            
-        except Exception as e:
-            bt.logging.error(f"❌ Error processing TTS task: {e}")
-            return {
-                "output_data": "",
-                "processing_time": 0.0,
-                "error": str(e)
-            }
+    # NOTE: The process_tts_task function that expects a string has been removed
+    # because it was being overridden by the function at line 1639 that expects a dict.
+    # All TTS processing now uses the Coqui TTS API with voice cloning (process_tts_task with dict parameter).
     
     async def process_summarization_task_from_proxy(self, task_data: dict):
         """Process summarization task from proxy server using text-based input"""
@@ -1373,19 +1537,68 @@ Report generated automatically by Bittensor Miner
             task_id = task_data.get("task_id")
             bt.logging.info(f"🎵 Processing TTS task {task_id} from proxy server")
             
+            # Log task data structure for debugging
+            bt.logging.debug(f"📋 Task data keys: {list(task_data.keys())}")
+            bt.logging.debug(f"   Task type: {task_data.get('task_type')}")
+            bt.logging.debug(f"   Has input_text: {'input_text' in task_data}")
+            bt.logging.debug(f"   Has voice_name: {'voice_name' in task_data}")
+            bt.logging.debug(f"   Has speaker_wav_url: {'speaker_wav_url' in task_data}")
+            
             # Extract TTS data using the existing method
             tts_data = await self.extract_tts_data(task_data)
             
             if not tts_data:
                 error_msg = f"Failed to extract TTS data for task {task_id}"
                 bt.logging.error(f"❌ {error_msg}")
+                bt.logging.error(f"   Task data available keys: {list(task_data.keys())}")
                 miner_uid = self.uid if hasattr(self, 'uid') else 0
                 self.log_task_completion(task_id, "tts", miner_uid, 0.0, False, {}, error_msg)
                 return
             
-            # Process the TTS task
+            # Process the TTS task - get model_id from task_data or voice_info
+            # Safely extract voice_info to avoid NoneType errors
+            voice_info = tts_data.get("voice_info") or {}
+            if not isinstance(voice_info, dict):
+                voice_info = {}
+            
+            # Ensure model_id is extracted from task_data or voice_info, with fallback
+            model_id = task_data.get("model_id") or voice_info.get("model_id") or "tts_models/multilingual/multi-dataset/xtts_v2"
+            
+            # Update voice_info with model_id if it's missing
+            if not voice_info.get("model_id"):
+                voice_info["model_id"] = model_id
+                tts_data["voice_info"] = voice_info
+            
+            # Validate text content exists in tts_data
+            text_content = tts_data.get("text", "")
+            if not text_content:
+                error_msg = f"No text content found in TTS data for task {task_id}"
+                bt.logging.error(f"❌ {error_msg}")
+                bt.logging.error(f"   TTS data keys: {list(tts_data.keys())}")
+                miner_uid = self.uid if hasattr(self, 'uid') else 0
+                self.log_task_completion(task_id, "tts", miner_uid, 0.0, False, {}, error_msg)
+                return
+            
+            # Validate speaker_wav_url exists
+            speaker_wav_url = voice_info.get("speaker_wav_url")
+            if not speaker_wav_url:
+                error_msg = f"No speaker_wav_url found in voice_info for task {task_id}"
+                bt.logging.error(f"❌ {error_msg}")
+                bt.logging.error(f"   Voice info keys: {list(voice_info.keys())}")
+                bt.logging.error(f"   Voice name: {voice_info.get('voice_name', 'None')}")
+                miner_uid = self.uid if hasattr(self, 'uid') else 0
+                self.log_task_completion(task_id, "tts", miner_uid, 0.0, False, {}, error_msg)
+                return
+            
+            bt.logging.info(f"✅ Task {task_id} has all required data:")
+            bt.logging.info(f"   Text length: {len(text_content)} characters")
+            bt.logging.info(f"   Voice: {voice_info.get('voice_name', 'Unknown')}")
+            bt.logging.info(f"   Speaker WAV URL: {speaker_wav_url[:60]}...")
+            
+            # Pass tts_data (dict) to process_tts_task, not just the text string
+            # The process_tts_task function expects a dict with text, source_language, voice_info, etc.
             start_time = time.time()
-            result = await self.process_tts_task(tts_data)
+            result = await self.process_tts_task(tts_data, model_id=model_id)
             processing_time = time.time() - start_time
             
             # Validate result before submission
@@ -1489,27 +1702,105 @@ Report generated automatically by Bittensor Miner
             return error_result
 
     async def process_tts_task(self, tts_data: dict, model_id: Optional[str] = None):
-        """Process TTS task using pipeline with specified model or default"""
+        """Process TTS task using new Coqui TTS API with speaker cloning"""
         try:
-            # Get pipeline with specified model (loads on-demand)
-            bt.logging.info(f"🔄 Loading TTS pipeline with model: {model_id or 'default'}")
-            pipeline = self.pipeline_manager.get_tts_pipeline(model_id)
-            if pipeline is None:
-                raise Exception("TTS pipeline not available")
+            import tempfile
+            import os
+            import httpx
+            import sys  # Import sys explicitly to avoid scoping issues
+            
+            # IMPORTANT: Create LogitsWarper compatibility shim BEFORE any TTS imports
+            # This must happen before TTS imports its internal modules that try to import LogitsWarper
+            try:
+                from transformers import LogitsWarper
+                # Already available, no shim needed
+            except ImportError:
+                # LogitsWarper was removed in transformers 4.40.0+, create a compatibility shim
+                import transformers
+                import torch
+                
+                class LogitsWarper:
+                    """Compatibility shim for LogitsWarper (removed in transformers 4.40.0+)"""
+                    def __call__(self, input_ids, scores):
+                        return scores
+                
+                class TypicalLogitsWarper(LogitsWarper):
+                    """Compatibility shim for TypicalLogitsWarper"""
+                    def __init__(self, mass=0.9, filter_value=-float("Inf"), min_tokens_to_keep=1):
+                        self.mass = mass
+                        self.filter_value = filter_value
+                        self.min_tokens_to_keep = min_tokens_to_keep
+                    
+                    def __call__(self, input_ids, scores):
+                        # Simplified typical sampling implementation
+                        # This is a basic compatibility shim - may need refinement
+                        return scores
+                
+                # Inject into transformers module BEFORE any TTS code runs
+                # Patch both __dict__ and attribute access - this is what "from transformers import X" checks
+                transformers.__dict__['LogitsWarper'] = LogitsWarper
+                transformers.__dict__['TypicalLogitsWarper'] = TypicalLogitsWarper
+                setattr(transformers, 'LogitsWarper', LogitsWarper)
+                setattr(transformers, 'TypicalLogitsWarper', TypicalLogitsWarper)
+                # Also make it available for direct import
+                sys.modules['transformers'].__dict__['LogitsWarper'] = LogitsWarper
+                sys.modules['transformers'].__dict__['TypicalLogitsWarper'] = TypicalLogitsWarper
+                bt.logging.debug("✅ Created LogitsWarper compatibility shim for transformers 4.57.3")
+            
+            # Python 3.12 compatibility workaround for spacy/pydantic ForwardRef issue
+            python_version = sys.version_info
+            is_python_312 = python_version.major == 3 and python_version.minor == 12
+            
+            if is_python_312:
+                try:
+                    # Patch ForwardRef._evaluate to handle Python 3.12 compatibility
+                    import typing
+                    if hasattr(typing, 'ForwardRef'):
+                        original_evaluate = typing.ForwardRef._evaluate
+                        def patched_evaluate(self, globalns=None, localns=None, *args, **kwargs):
+                            # Python 3.12 requires recursive_guard as keyword-only argument
+                            # Handle calls that don't provide it
+                            if 'recursive_guard' not in kwargs:
+                                # Not provided, add default empty set
+                                kwargs['recursive_guard'] = set()
+                            # Call original with all arguments
+                            return original_evaluate(self, globalns, localns, *args, **kwargs)
+                        typing.ForwardRef._evaluate = patched_evaluate
+                        bt.logging.debug("✅ Applied Python 3.12 ForwardRef compatibility patch")
+                except Exception as patch_error:
+                    bt.logging.warning(f"⚠️ Could not apply Python 3.12 compatibility patch: {patch_error}")
+            
+            from TTS.api import TTS
             
             # Extract text and language information
             text = tts_data.get("text", "")
             source_language = tts_data.get("source_language", "en")
             detected_language = tts_data.get("detected_language", "en")
             language_confidence = tts_data.get("language_confidence", 1.0)
+            voice_info = tts_data.get("voice_info", {})
             
-            bt.logging.info(f"🎵 Processing TTS task:")
-            bt.logging.info(f"   Text type: {type(text)}")
+            # Get model_id from parameter, voice_info, or default fallback
+            # Handle None, empty string, or missing values
+            tts_model_id = None
+            if model_id and str(model_id).strip():
+                tts_model_id = str(model_id).strip()
+            elif voice_info and voice_info.get("model_id"):
+                tts_model_id = str(voice_info.get("model_id")).strip()
+            
+            # Default to XTTS v2 if no model_id provided
+            if not tts_model_id or tts_model_id == "":
+                tts_model_id = "tts_models/multilingual/multi-dataset/xtts_v2"
+                bt.logging.warning(f"⚠️ No model_id provided, using default: {tts_model_id}")
+            
+            bt.logging.info(f"   Using TTS model: {tts_model_id}")
+            
+            speaker_wav_url = voice_info.get("speaker_wav_url") if voice_info else None
+            
+            bt.logging.info(f"🎵 Processing TTS task with new API:")
             bt.logging.info(f"   Text length: {len(text) if isinstance(text, str) else 'N/A'}")
-            bt.logging.info(f"   Text preview: {str(text)[:100] if text else 'None'}...")
             bt.logging.info(f"   Source language: {source_language}")
-            bt.logging.info(f"   Detected language: {detected_language}")
-            bt.logging.info(f"   Language confidence: {language_confidence}")
+            bt.logging.info(f"   Model ID: {tts_model_id}")
+            bt.logging.info(f"   Speaker WAV URL: {speaker_wav_url if speaker_wav_url else 'None'}")
             
             if not text:
                 raise Exception("No text provided for TTS")
@@ -1517,13 +1808,160 @@ Report generated automatically by Bittensor Miner
             if not isinstance(text, str):
                 raise Exception(f"Text must be a string, got {type(text)}")
             
-            # Use the source language directly since user specified it
-            processing_language = source_language
+            if not speaker_wav_url:
+                raise Exception("No speaker_wav_url provided for voice cloning")
             
-            # Process text data with language support
-            audio_data, processing_time = pipeline.synthesize(
-                text, language=processing_language
-            )
+            # Download speaker audio from R2
+            bt.logging.info(f"📥 Downloading speaker audio from: {speaker_wav_url}")
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                speaker_response = await client.get(speaker_wav_url)
+                if speaker_response.status_code != 200:
+                    raise Exception(f"Failed to download speaker audio: HTTP {speaker_response.status_code}")
+                speaker_audio_data = speaker_response.content
+            
+            # Save speaker audio to temporary file
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as speaker_file:
+                speaker_file.write(speaker_audio_data)
+                speaker_wav_path = speaker_file.name
+            
+            bt.logging.info(f"✅ Speaker audio downloaded: {len(speaker_audio_data)} bytes")
+            
+            # Detect device (GPU or CPU)
+            try:
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                device = "cpu"
+            
+            bt.logging.info(f"🔄 Initializing TTS with model: {tts_model_id}")
+            bt.logging.info(f"   Device: {device}")
+            start_time = time.time()
+            
+            # Check transformers version (for logging only - compatibility shims are in place)
+            try:
+                import transformers
+                transformers_version = transformers.__version__
+                bt.logging.info(f"   Transformers version: {transformers_version}")
+                bt.logging.debug(f"   Compatibility shims enabled for transformers 4.57.3+")
+            except Exception as e:
+                bt.logging.debug(f"   Could not check transformers version: {e}")
+            
+            # Try to use device parameter, fallback to gpu parameter
+            try:
+                import inspect
+                sig = inspect.signature(TTS.__init__)
+                if 'device' in sig.parameters:
+                    tts = TTS(tts_model_id, device=device)
+                else:
+                    # Fallback to gpu parameter if device not available
+                    tts = TTS(tts_model_id, gpu=(device == "cuda"))
+            except ImportError as import_error:
+                # Handle import errors (like LogitsWarper)
+                error_msg = str(import_error)
+                if "LogitsWarper" in error_msg or "transformers" in error_msg.lower():
+                    bt.logging.error(f"❌ Transformers compatibility error: {error_msg}")
+                    bt.logging.error(f"   This is likely due to transformers version incompatibility with Coqui TTS")
+                    bt.logging.error(f"   Solution: Downgrade transformers to <4.40.0: pip install 'transformers<4.40.0'")
+                    raise Exception(f"Transformers version incompatibility: {error_msg}. Please downgrade transformers to <4.40.0")
+                else:
+                    raise
+            except TypeError as type_error:
+                # Handle Python 3.12 compatibility errors
+                error_msg = str(type_error)
+                if "ForwardRef._evaluate()" in error_msg or "recursive_guard" in error_msg:
+                    bt.logging.error(f"❌ Python 3.12 compatibility error: {error_msg}")
+                    bt.logging.error(f"   This is a known issue with Python 3.12 + spacy/pydantic")
+                    bt.logging.error(f"   Solutions:")
+                    bt.logging.error(f"     1. Use Python 3.11 instead: python3.11 -m venv venv311")
+                    bt.logging.error(f"     2. Or upgrade pydantic to v2 (may break other dependencies)")
+                    bt.logging.error(f"     3. Or wait for spacy/pydantic updates")
+                    raise Exception(f"Python 3.12 compatibility error: {error_msg}. Consider using Python 3.11 for TTS tasks.")
+                else:
+                    raise
+            except Exception as e:
+                # Final fallback
+                error_msg = str(e)
+                if "LogitsWarper" in error_msg or "transformers" in error_msg.lower():
+                    bt.logging.error(f"❌ Transformers compatibility error during TTS initialization: {error_msg}")
+                    bt.logging.error(f"   Solution: Downgrade transformers: pip install 'transformers<4.40.0'")
+                    raise Exception(f"Transformers version incompatibility: {error_msg}. Please downgrade transformers to <4.40.0")
+                elif "ForwardRef._evaluate()" in error_msg or "recursive_guard" in error_msg:
+                    bt.logging.error(f"❌ Python 3.12 compatibility error: {error_msg}")
+                    bt.logging.error(f"   Solution: Use Python 3.11 for TTS tasks")
+                    raise Exception(f"Python 3.12 compatibility error: {error_msg}. Consider using Python 3.11.")
+                bt.logging.warning(f"⚠️ Could not use device parameter, using gpu: {e}")
+                try:
+                    tts = TTS(tts_model_id, gpu=(device == "cuda"))
+                except Exception as e2:
+                    error_msg2 = str(e2)
+                    if "ForwardRef._evaluate()" in error_msg2 or "recursive_guard" in error_msg2:
+                        bt.logging.error(f"❌ Python 3.12 compatibility error in fallback: {error_msg2}")
+                        raise Exception(f"Python 3.12 compatibility error: {error_msg2}. Consider using Python 3.11.")
+                    raise
+            
+            init_time = time.time() - start_time
+            bt.logging.info(f"✅ TTS initialized in {init_time:.2f}s on {device}")
+            
+            # Note: is_multi_speaker is a read-only property in TTS library
+            # We don't need to set it - XTTS v2 is multi-speaker by default
+            # The library will handle this internally when we call tts_to_file with speaker_wav
+            
+            # Generate speech with voice cloning
+            # Use try/finally to ensure TTS object and memory are cleaned up
+            output_path = None
+            audio_data = None
+            processing_time = 0.0  # Initialize to avoid NameError if synthesis fails
+            try:
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as output_file:
+                    output_path = output_file.name
+                
+                bt.logging.info(f"🔊 Generating speech with voice cloning...")
+                synthesis_start = time.time()
+                tts.tts_to_file(
+                    text=text,
+                    file_path=output_path,
+                    speaker_wav=speaker_wav_path,
+                    language=source_language
+                )
+                processing_time = time.time() - synthesis_start
+                
+                # Read generated audio
+                with open(output_path, 'rb') as f:
+                    audio_data = f.read()
+                
+                bt.logging.info(f"✅ Speech generated: {len(audio_data)} bytes in {processing_time:.2f}s")
+            finally:
+                # Critical: Clean up TTS object and free memory to prevent memory corruption
+                try:
+                    # Delete TTS object explicitly
+                    del tts
+                    tts = None
+                    
+                    # Clear PyTorch cache if using GPU
+                    if device == "cuda":
+                        try:
+                            import torch
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                            bt.logging.debug("   Cleared CUDA cache")
+                        except Exception as e:
+                            bt.logging.debug(f"   Could not clear CUDA cache: {e}")
+                    
+                    # Force garbage collection
+                    import gc
+                    gc.collect()
+                    bt.logging.debug("   Forced garbage collection")
+                except Exception as cleanup_error:
+                    bt.logging.warning(f"⚠️ Error during TTS cleanup: {cleanup_error}")
+            
+            # Cleanup temporary files
+            try:
+                if speaker_wav_path and os.path.exists(speaker_wav_path):
+                    os.unlink(speaker_wav_path)
+                if output_path and os.path.exists(output_path):
+                    os.unlink(output_path)
+            except Exception as file_cleanup_error:
+                bt.logging.debug(f"   Could not clean up temp files: {file_cleanup_error}")
             
             # Generate unique filename for the audio
             import uuid
@@ -1555,8 +1993,13 @@ Report generated automatically by Bittensor Miner
                 # Get file metadata
                 file_metadata = await file_manager.get_file_metadata(file_id)
                 
-                bt.logging.info(f"✅ Audio file uploaded to Firebase Cloud Storage: {file_id}")
+                # Get public URL from metadata
+                public_url = file_metadata.get('public_url') if file_metadata else None
+                
+                bt.logging.info(f"✅ Audio file uploaded to R2: {file_id}")
                 bt.logging.info(f"   File size: {len(audio_data)} bytes")
+                if public_url:
+                    bt.logging.info(f"   Public URL: {public_url}")
                 
                 return {
                     "audio_file": {
@@ -1564,16 +2007,18 @@ Report generated automatically by Bittensor Miner
                         "filename": audio_filename,
                         "file_size": len(audio_data),
                         "file_type": "audio/wav",
-                        "cloud_path": file_metadata.get('cloud_path', f"tts_audio/{file_id}") if file_metadata else f"tts_audio/{file_id}",
-                        "file_url": f"/api/v1/tts/audio/{file_id}"
+                        "public_url": public_url,  # R2 public URL
+                        "storage_location": "r2"
                     },
-                    "processing_time": processing_time,
+                    "processing_time": processing_time + init_time,  # Include initialization time
                     "text_length": len(text),
                     "source_language": source_language,
                     "detected_language": detected_language,
                     "language_confidence": language_confidence,
-                    "processing_language": processing_language,
+                    "processing_language": source_language,
                     "word_count": len(text.split()),
+                    "model_id": tts_model_id,
+                    "voice_name": voice_info.get("voice_name"),
                     "audio_duration": 0.0,  # Will be calculated by validator
                     "sample_rate": 22050,   # Default, will be verified by validator
                     "bit_depth": 16,        # Default, will be verified by validator
@@ -1613,7 +2058,17 @@ Report generated automatically by Bittensor Miner
                 }
             
         except Exception as e:
+            error_msg = str(e)
             bt.logging.error(f"❌ Error processing TTS task: {e}")
+            
+            # Provide specific guidance based on error type
+            if "LogitsWarper" in error_msg:
+                bt.logging.error(f"   This is a transformers version issue. Run: pip install 'transformers<4.40.0'")
+            elif "ForwardRef._evaluate()" in error_msg or "recursive_guard" in error_msg:
+                bt.logging.error(f"   This is a Python 3.12 compatibility issue with spacy/pydantic.")
+                bt.logging.error(f"   Solution: Use Python 3.11 for TTS tasks: python3.11 -m venv venv311")
+                bt.logging.error(f"   Or run: ./fix_python312_tts.sh for more options")
+            
             return {
                 "audio_file": None,
                 "processing_time": 0.0,
@@ -1627,7 +2082,7 @@ Report generated automatically by Bittensor Miner
                 "sample_rate": 0,
                 "bit_depth": 0,
                 "channels": 0,
-                "error": str(e)
+                "error": error_msg
             }
     
     async def process_video_transcription_task(self, video_data: bytes, task_data: dict, model_id: Optional[str] = None):

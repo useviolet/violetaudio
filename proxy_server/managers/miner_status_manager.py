@@ -7,9 +7,8 @@ import asyncio
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
-from dataclasses import dataclass
-import firebase_admin
-from firebase_admin import firestore
+from dataclasses import dataclass, field
+from database.postgresql_adapter import PostgreSQLAdapter
 
 @dataclass
 class MinerStatusReport:
@@ -35,8 +34,8 @@ class MinerStatusManager:
     
     def __init__(self, db):
         self.db = db
-        self.miner_status_collection = db.collection('miner_status')
-        self.validators_collection = db.collection('validators')
+        # PostgreSQL only - no Firestore support
+        
         self.cleanup_interval = 300  # 5 minutes
         self.validator_timeout = 600  # 10 minutes
         self.miner_timeout = 900     # 15 minutes
@@ -64,14 +63,19 @@ class MinerStatusManager:
     async def _update_validator_last_seen(self, validator_uid: int, epoch: int):
         """Update validator's last seen timestamp"""
         try:
-            validator_doc = {
-                'validator_uid': validator_uid,
-                'last_seen': datetime.utcnow(),
-                'last_epoch': epoch,
-                'updated_at': datetime.utcnow()
-            }
-            
-            self.validators_collection.document(str(validator_uid)).set(validator_doc)
+            if self.is_postgresql:
+                # PostgreSQL: Validators table not yet in schema, skip for now
+                # TODO: Add validators table to PostgreSQL schema if needed
+                pass
+            else:
+                # Firestore (legacy)
+                validator_doc = {
+                    'validator_uid': validator_uid,
+                    'last_seen': datetime.utcnow(),
+                    'last_epoch': epoch,
+                    'updated_at': datetime.utcnow()
+                }
+                self.validators_collection.document(str(validator_uid)).set(validator_doc)
             
         except Exception as e:
             print(f"⚠️ Failed to update validator {validator_uid} last seen: {e}")
@@ -84,20 +88,41 @@ class MinerStatusManager:
                 print(f"⚠️ Skipping miner status without UID: {miner_data}")
                 return
             
-            # Get existing miner status
-            miner_doc_ref = self.miner_status_collection.document(str(miner_uid))
-            existing_doc = miner_doc_ref.get()
-            
-            if existing_doc.exists:
-                # Update existing miner status with conflict resolution
-                existing_data = existing_doc.to_dict()
-                updated_data = self._resolve_miner_status_conflicts(existing_data, miner_data, validator_uid)
+            if self.is_postgresql:
+                # PostgreSQL: Update or create miner status
+                from database.postgresql_schema import MinerStatus
+                session = self.db._get_session()
+                try:
+                    existing = session.query(MinerStatus).filter(MinerStatus.uid == miner_uid).first()
+                    if existing:
+                        # Update existing
+                        existing_data = self.db._miner_status_to_dict(existing)
+                        updated_data = self._resolve_miner_status_conflicts(existing_data, miner_data, validator_uid)
+                        # Update fields
+                        for key, value in updated_data.items():
+                            if hasattr(existing, key):
+                                setattr(existing, key, value)
+                        existing.updated_at = datetime.utcnow()
+                    else:
+                        # Create new
+                        updated_data = self._create_new_miner_status(miner_data, validator_uid)
+                        new_status = MinerStatus(**{k: v for k, v in updated_data.items() if hasattr(MinerStatus, k)})
+                        session.add(new_status)
+                    session.commit()
+                finally:
+                    session.close()
             else:
-                # Create new miner status
-                updated_data = self._create_new_miner_status(miner_data, validator_uid)
-            
-            # Update the document
-            miner_doc_ref.set(updated_data)
+                # Firestore (legacy)
+                miner_doc_ref = self.miner_status_collection.document(str(miner_uid))
+                existing_doc = miner_doc_ref.get()
+                
+                if existing_doc.exists:
+                    existing_data = existing_doc.to_dict()
+                    updated_data = self._resolve_miner_status_conflicts(existing_data, miner_data, validator_uid)
+                else:
+                    updated_data = self._create_new_miner_status(miner_data, validator_uid)
+                
+                miner_doc_ref.set(updated_data)
             
             print(f"   ✅ Updated miner {miner_uid} status")
             
@@ -219,14 +244,29 @@ class MinerStatusManager:
     async def get_available_miners(self, task_type: str = None, min_count: int = 1, max_count: int = 5) -> List[Dict]:
         """Get list of available miners for task assignment"""
         try:
-            # Get all miner status documents
-            docs = self.miner_status_collection.stream()
+            current_time = datetime.utcnow()
             available_miners = []
             
-            current_time = datetime.utcnow()
+            if self.is_postgresql:
+                # PostgreSQL: Get all miner statuses
+                from database.postgresql_schema import MinerStatus
+                session = self.db._get_session()
+                try:
+                    miners = session.query(MinerStatus).filter(
+                        MinerStatus.is_serving == True
+                    ).all()
+                    docs = [self.db._miner_status_to_dict(m) for m in miners]
+                finally:
+                    session.close()
+            else:
+                # Firestore (legacy)
+                docs = self.miner_status_collection.stream()
             
             for doc in docs:
-                miner_data = doc.to_dict()
+                if self.is_postgresql:
+                    miner_data = doc  # Already a dict
+                else:
+                    miner_data = doc.to_dict()
                 
                 # Check if miner is currently serving and recently seen
                 if miner_data.get('is_serving', False) and miner_data.get('last_seen'):
@@ -352,18 +392,32 @@ class MinerStatusManager:
             
             # Find stale miners
             stale_miners = []
-            docs = self.miner_status_collection.stream()
-            
-            for doc in docs:
-                miner_data = doc.to_dict()
-                last_seen = miner_data.get('last_seen')
+            if self.is_postgresql:
+                # PostgreSQL: Get and delete stale miners
+                from database.postgresql_schema import MinerStatus
+                session = self.db._get_session()
+                try:
+                    miners = session.query(MinerStatus).all()
+                    for miner in miners:
+                        last_seen = miner.last_seen
+                        if last_seen and last_seen < timeout_threshold:
+                            stale_miners.append(miner.uid)
+                            session.delete(miner)
+                    session.commit()
+                finally:
+                    session.close()
+            else:
+                # Firestore (legacy)
+                docs = self.miner_status_collection.stream()
+                for doc in docs:
+                    miner_data = doc.to_dict()
+                    last_seen = miner_data.get('last_seen')
+                    if last_seen and last_seen < timeout_threshold:
+                        stale_miners.append(doc.id)
                 
-                if last_seen and last_seen < timeout_threshold:
-                    stale_miners.append(doc.id)
-            
-            # Remove stale miners
-            for miner_id in stale_miners:
-                self.miner_status_collection.document(miner_id).delete()
+                # Remove stale miners
+                for miner_id in stale_miners:
+                    self.miner_status_collection.document(miner_id).delete()
             
             if stale_miners:
                 print(f"🧹 Cleaned up {len(stale_miners)} stale miners")
@@ -374,10 +428,25 @@ class MinerStatusManager:
     async def get_miner_status_summary(self) -> Dict[str, Any]:
         """Get summary of all miner statuses"""
         try:
-            docs = self.miner_status_collection.stream()
-            miners = []
+            if self.is_postgresql:
+                # PostgreSQL: Get all miner statuses
+                from database.postgresql_schema import MinerStatus
+                session = self.db._get_session()
+                try:
+                    miner_objs = session.query(MinerStatus).all()
+                    docs = [self.db._miner_status_to_dict(m) for m in miner_objs]
+                finally:
+                    session.close()
+            else:
+                # Firestore (legacy)
+                docs = self.miner_status_collection.stream()
             
+            miners = []
             for doc in docs:
+                if self.is_postgresql:
+                    miner_data = doc  # Already a dict
+                else:
+                    miner_data = doc.to_dict()
                 miner_data = doc.to_dict()
                 miners.append(miner_data)
             

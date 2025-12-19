@@ -6,139 +6,191 @@ Handles communication between proxy server and validators
 import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional, Any
-from firebase_admin import firestore
-from database.enhanced_schema import TaskStatus
+from database.enhanced_schema import TaskStatus, DatabaseOperations
+from database.postgresql_adapter import PostgreSQLAdapter
 
 class ValidatorIntegrationAPI:
     def __init__(self, db):
         self.db = db
-        self.tasks_collection = db.collection('tasks')
-        self.miner_responses_collection = db.collection('miner_responses')
-        self.validators_collection = db.collection('validators')
-        self.evaluations_collection = db.collection('evaluations') # Added this line
+        # PostgreSQL only - no Firestore support
+        self.is_postgresql = isinstance(db, PostgreSQLAdapter)
     
     async def get_tasks_for_evaluation(self, validator_uid: int = None) -> List[Dict]:
-        """Get tasks that are ready for validator evaluation (status: 'completed')"""
+        """
+        Get ALL tasks that are ready for validator evaluation (status: 'done' or 'completed').
+        NOTE: This returns ALL tasks - filtering by validators_seen is done by the validator itself.
+        Each validator sees all tasks, but filters out ones it has already seen.
+        """
         try:
-            print(f"🔍 Getting tasks for evaluation (validator_uid: {validator_uid})")
+            print(f"🔍 Getting ALL tasks for evaluation (validator_uid: {validator_uid})")
+            print(f"   NOTE: Returning ALL tasks - validator will filter based on its own validators_seen list")
             
-            # Get tasks with 'completed' status
-            query = self.tasks_collection.where('status', '==', TaskStatus.COMPLETED.value)
+            # Get tasks with 'completed' status (PostgreSQL)
+            # Return ALL tasks - filtering by validators_seen is done by the validator
+            # Use COMPLETED status only - this is the existing status that works
+            if isinstance(self.db, PostgreSQLAdapter):
+                session = None
+                try:
+                    from database.postgresql_schema import Task, TaskStatusEnum
+                    
+                    # Helper function to convert task to dict with input data
+                    def task_to_dict(task):
+                        task_dict = {
+                            'task_id': str(task.task_id),
+                            'task_type': task.task_type.value if hasattr(task.task_type, 'value') else str(task.task_type),
+                            'status': task.status.value if hasattr(task.status, 'value') else str(task.status),
+                            'validators_seen': task.validators_seen if hasattr(task, 'validators_seen') and task.validators_seen else [],
+                            'validators_seen_timestamps': task.validators_seen_timestamps if hasattr(task, 'validators_seen_timestamps') and task.validators_seen_timestamps else {},
+                            'miner_responses': task.miner_responses or [],
+                            'priority': task.priority.value if hasattr(task.priority, 'value') else str(task.priority),
+                            'created_at': task.created_at.isoformat() if task.created_at else None,
+                            'completed_at': task.completed_at.isoformat() if task.completed_at else None,
+                            'input_file_id': str(task.input_file_id) if task.input_file_id else None,
+                            'input_text_id': str(task.input_text_id) if task.input_text_id else None,
+                            'source_language': task.source_language,
+                            'target_language': task.target_language,
+                        }
+                        
+                        # Fetch input_text if input_text_id exists
+                        if task.input_text_id:
+                            from database.postgresql_schema import TextContent
+                            text_content = session.query(TextContent).filter(
+                                TextContent.content_id == task.input_text_id
+                            ).first()
+                            if text_content:
+                                task_dict['input_text'] = {
+                                    'content_id': str(text_content.content_id),
+                                    'text': text_content.text,
+                                    'source_language': text_content.source_language,
+                                }
+                        
+                        # Fetch input_file if input_file_id exists
+                        if task.input_file_id:
+                            from database.postgresql_schema import File
+                            file_obj = session.query(File).filter(
+                                File.file_id == task.input_file_id
+                            ).first()
+                            if file_obj:
+                                task_dict['input_file'] = {
+                                    'file_id': str(file_obj.file_id),
+                                    'file_name': file_obj.original_filename,
+                                    'file_type': file_obj.content_type,
+                                    'file_size': file_obj.file_size,
+                                    'storage_location': file_obj.storage_location,
+                                    'r2_key': file_obj.r2_key,
+                                    'public_url': file_obj.public_url
+                                }
+                        
+                        return task_dict
+                    
+                    # Query for COMPLETED tasks only (this status definitely exists and works)
+                    session = self.db._get_session()
+                    status_filter = Task.status == TaskStatusEnum.COMPLETED
+                    tasks_query = session.query(Task).filter(status_filter).limit(100)
+                    tasks = [task_to_dict(task) for task in tasks_query]
+                finally:
+                    if session:
+                        try:
+                            session.close()
+                        except:
+                            pass
+            else:
+                # Fallback to DatabaseOperations
+                completed_tasks = DatabaseOperations.get_tasks_by_status(
+                    self.db, TaskStatus.COMPLETED, limit=100
+                )
+                tasks = completed_tasks
             
-            # If validator_uid is provided, we need to check if it's already been evaluated
-            # But first, let's get all completed tasks and filter in Python to avoid Firestore query issues
-            print(f"   📋 Querying for completed tasks...")
-            tasks = query.limit(20).stream()  # Increased limit to get more tasks
+            print(f"   📋 Found {len(tasks)} total tasks ready for evaluation")
+            print(f"   ✅ Returning ALL tasks - each validator will filter based on its own validators_seen")
             
             task_list = []
             for doc in tasks:
-                task_data = doc.to_dict()
-                task_data['task_id'] = doc.id  # Use task_id for consistency
+                if self.is_postgresql:
+                    task_data = doc  # Already a dict
+                else:
+                    task_data = doc.to_dict()
+                    task_data['task_id'] = doc.id  # Use task_id for consistency
                 
-                # If validator_uid is provided, check if this task has already been evaluated by this validator
-                if validator_uid is not None:
-                    # Check if task has been evaluated by this specific validator
-                    evaluated_by = task_data.get('evaluated_by')
-                    if evaluated_by == validator_uid:
-                        print(f"   ⏭️ Task {doc.id} already evaluated by validator {validator_uid}, skipping...")
-                        continue
+                # IMPORTANT: Do NOT filter here - return ALL tasks
+                # The validator will filter based on validators_seen list
+                # This allows each validator to see all tasks, but only evaluate ones it hasn't seen
                 
-                print(f"   ✅ Processing task {doc.id} ({task_data.get('task_type', 'unknown')})")
+                task_id = task_data.get('task_id', 'unknown')
+                validators_seen = task_data.get('validators_seen', [])
+                print(f"   ✅ Task {task_id} ({task_data.get('task_type', 'unknown')}) - Seen by {len(validators_seen)} validator(s): {validators_seen}")
                 
-                # Get the complete input file data for the validator
-                input_file = task_data.get('input_file', {})
-                if input_file and isinstance(input_file, dict):
-                    # If input_file is a FileReference, get the actual file content
-                    file_id = input_file.get('file_id')
-                    if file_id:
+                # IMPORTANT: We return ALL tasks here - filtering by validators_seen happens in the validator
+                # This allows each validator to see all tasks, but only evaluate ones it hasn't seen
+                
+                # Get input_data from input_text or input_file
+                # Priority: input_text (text content) > input_file (file content)
+                
+                # First, try to get input_text (for summarization, translation tasks)
+                input_text = task_data.get('input_text', {})
+                if input_text and isinstance(input_text, dict) and input_text.get('text'):
+                    task_data['input_data'] = input_text.get('text')
+                    print(f"      ✅ Using input_text ({len(str(task_data['input_data']))} chars)")
+                else:
+                    # Try to get input_file content (for transcription, TTS tasks)
+                    input_file = task_data.get('input_file', {})
+                    input_file_id = task_data.get('input_file_id')
+                    
+                    if input_file_id or (input_file and isinstance(input_file, dict) and input_file.get('file_id')):
+                        file_id = input_file_id or input_file.get('file_id')
                         try:
                             print(f"      📁 Retrieving file content for {file_id}...")
                             
-                            # Get file metadata from database
-                            file_doc = self.db.collection('files').document(file_id).get()
-                            if file_doc.exists:
-                                file_data = file_doc.to_dict()
+                            # Download file from R2 storage
+                            try:
+                                from managers.file_manager import FileManager
                                 
-                                # Try to get content directly from file_data first
-                                if file_data.get('content'):
-                                    content = file_data.get('content')
-                                    
-                                    # Convert binary content to base64 if needed
-                                    if isinstance(content, bytes):
-                                        import base64
-                                        base64_content = base64.b64encode(content).decode('utf-8')
+                                # Get file_manager instance (FileManager takes db as parameter)
+                                file_manager = FileManager(self.db)
+                                
+                                # Download file content from R2
+                                file_content = await file_manager.download_file(file_id)
+                                
+                                if file_content:
+                                    # Convert binary data to base64 string for JSON serialization
+                                    import base64
+                                    if isinstance(file_content, bytes):
+                                        # For binary files (audio, etc.), convert to base64
+                                        base64_content = base64.b64encode(file_content).decode('utf-8')
                                         task_data['input_data'] = base64_content
-                                        print(f"         ✅ File content found in database and converted to base64 ({len(content)} bytes -> {len(base64_content)} chars)")
+                                        print(f"         ✅ File content retrieved from R2 and converted to base64 ({len(file_content)} bytes -> {len(base64_content)} chars)")
                                     else:
-                                        task_data['input_data'] = content
-                                        print(f"         ✅ File content found in database ({len(str(content))} chars)")
+                                        # For text files, use as-is
+                                        task_data['input_data'] = file_content
+                                        print(f"         ✅ File content retrieved from R2 ({len(str(file_content))} chars)")
                                 else:
-                                    # Try to construct the correct file path and read from disk
-                                    local_path = file_data.get('local_path', '')
-                                    if local_path:
-                                        # The database path is relative, convert to absolute path
-                                        import os
-                                        import glob
-                                        
-                                        # Get file content from Firebase Cloud Storage instead of local storage
-                                        try:
-                                            from proxy_server.managers.file_manager import FileManager
-                                            from firebase_admin import firestore
-                                            
-                                            # Use existing Firebase app and get Firestore client
-                                            db = firestore.client()
-                                            file_manager = FileManager(db)
-                                            
-                                            # Get file content from Firebase Cloud Storage
-                                            file_content = await file_manager.download_file(file_id)
-                                            
-                                            if file_content:
-                                                # Convert binary data to base64 string for JSON serialization
-                                                import base64
-                                                if isinstance(file_content, bytes):
-                                                    # For binary files (audio, etc.), convert to base64
-                                                    base64_content = base64.b64encode(file_content).decode('utf-8')
-                                                    task_data['input_data'] = base64_content
-                                                    print(f"         ✅ File content retrieved from Firebase Cloud Storage and converted to base64 ({len(file_content)} bytes -> {len(base64_content)} chars)")
-                                                else:
-                                                    # For text files, use as-is
-                                                    task_data['input_data'] = file_content
-                                                    print(f"         ✅ File content retrieved from Firebase Cloud Storage ({len(str(file_content))} chars)")
-                                            else:
-                                                print(f"         ❌ File content not found in Firebase Cloud Storage")
-                                                task_data['input_data'] = None
-                                                
-                                        except Exception as read_error:
-                                            print(f"         ❌ Failed to retrieve file from Firebase Cloud Storage: {read_error}")
-                                            task_data['input_data'] = None
-                                    else:
-                                        print(f"         ❌ No local_path in file metadata")
-                                        task_data['input_data'] = None
-                            else:
-                                print(f"         ❌ File metadata not found in database")
+                                    print(f"         ❌ File content not found in R2 storage")
+                                    task_data['input_data'] = None
+                                    
+                            except Exception as read_error:
+                                print(f"         ❌ Failed to retrieve file from R2: {read_error}")
+                                import traceback
+                                traceback.print_exc()
                                 task_data['input_data'] = None
                                     
                         except Exception as e:
-                            print(f"      ❌ Error retrieving file {file_id} for task {doc.id}: {e}")
+                            task_id = task_data.get('task_id', 'unknown')
+                            print(f"      ❌ Error retrieving file {file_id} for task {task_id}: {e}")
+                            import traceback
+                            traceback.print_exc()
                             task_data['input_data'] = None
                     else:
-                        # If input_file doesn't have file_id, try to get content directly
-                        task_data['input_data'] = input_file.get('content', '')
-                        print(f"      ✅ Using direct file content ({len(str(task_data['input_data']))} chars)")
-                else:
-                    # Fallback: try to get input_data directly from task
-                    task_data['input_data'] = task_data.get('input_data', '')
-                    if task_data['input_data']:
-                        print(f"      ✅ Using direct input_data ({len(str(task_data['input_data']))} chars)")
-                    else:
-                        print(f"      ⚠️ No input_data found in task")
+                        # No input_text or input_file found
+                        print(f"      ⚠️ No input_data found in task (no input_text or input_file)")
+                        task_data['input_data'] = None
                 
                 # Ensure we have the required fields for validator execution
+                task_id = task_data.get('task_id', 'unknown')
                 if not task_data.get('input_data'):
-                    print(f"      ❌ Task {doc.id} missing input_data, skipping...")
+                    print(f"      ❌ Task {task_id} missing input_data, skipping...")
                     continue
                 
-                print(f"      ✅ Task {doc.id} ready for validator execution")
+                print(f"      ✅ Task {task_id} ready for validator execution")
                 task_list.append(task_data)
             
             print(f"✅ Retrieved {len(task_list)} tasks with complete data for validator evaluation")

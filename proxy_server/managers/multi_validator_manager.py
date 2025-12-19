@@ -7,7 +7,7 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
-from firebase_admin import firestore
+from database.postgresql_adapter import PostgreSQLAdapter
 import statistics
 
 @dataclass
@@ -59,9 +59,7 @@ class MultiValidatorManager:
     
     def __init__(self, db):
         self.db = db
-        self.miner_status_collection = db.collection('miner_status')
-        self.validator_reports_collection = db.collection('validator_reports')
-        self.consensus_collection = db.collection('miner_consensus')
+        # PostgreSQL only - no Firestore support
         
         # Configuration
         self.min_consensus_validators = 2  # Minimum validators needed for consensus
@@ -148,25 +146,47 @@ class MultiValidatorManager:
     async def _store_validator_report(self, report: ValidatorReport):
         """Store individual validator report in database"""
         try:
-            # Create unique document ID for this report
-            doc_id = f"{report.validator_uid}_{report.miner_uid}_{report.timestamp.strftime('%Y%m%d_%H%M%S')}"
-            
-            # Store in validator_reports collection
-            report_ref = self.validator_reports_collection.document(doc_id)
-            report_ref.set(report.to_dict())
-            
-            # Also update miner_status collection with latest report - store full miner data
-            miner_ref = self.miner_status_collection.document(str(report.miner_uid))
-            miner_status_data = report.miner_status.copy() if isinstance(report.miner_status, dict) else {}
-            miner_status_data.update({
-                'uid': report.miner_uid,  # Ensure uid is set
-                'last_updated': report.timestamp,
-                'last_seen': report.timestamp,  # Set last_seen for cleanup
-                'last_reported_by_validator': report.validator_uid,
-                'epoch': report.epoch,
-                'validator_reports_count': firestore.Increment(1)
-            })
-            miner_ref.set(miner_status_data, merge=True)
+            # PostgreSQL: Store validator report and update miner status
+            from database.postgresql_schema import MinerStatus, ValidatorReport as ValidatorReportModel
+            session = self.db._get_session()
+            try:
+                # Store the validator report
+                # Ensure miner_status is a dict (JSON column)
+                miner_status_data = report.miner_status
+                if not isinstance(miner_status_data, dict):
+                    miner_status_data = {} if miner_status_data is None else {"data": miner_status_data}
+                
+                validator_report = ValidatorReportModel(
+                    validator_uid=report.validator_uid,
+                    miner_uid=report.miner_uid,
+                    timestamp=report.timestamp,
+                    epoch=report.epoch,
+                    miner_status=miner_status_data,
+                    confidence_score=report.confidence_score
+                )
+                session.add(validator_report)
+                
+                # Update miner status
+                miner = session.query(MinerStatus).filter(MinerStatus.uid == report.miner_uid).first()
+                if miner:
+                    # Update existing miner status
+                    miner_status_data = report.miner_status.copy() if isinstance(report.miner_status, dict) else {}
+                    for key, value in miner_status_data.items():
+                        if hasattr(miner, key):
+                            setattr(miner, key, value)
+                    miner.last_seen = report.timestamp
+                    miner.updated_at = report.timestamp
+                else:
+                    # Create new miner status
+                    miner_status_data = report.miner_status.copy() if isinstance(report.miner_status, dict) else {}
+                    miner_status_data['uid'] = report.miner_uid
+                    miner_status_data['last_seen'] = report.timestamp
+                    miner_status_data['updated_at'] = report.timestamp
+                    new_miner = MinerStatus(**{k: v for k, v in miner_status_data.items() if hasattr(MinerStatus, k)})
+                    session.add(new_miner)
+                session.commit()
+            finally:
+                session.close()
             
         except Exception as e:
             print(f"❌ Error storing validator report: {e}")
@@ -190,15 +210,32 @@ class MultiValidatorManager:
             # Calculate consensus status
             consensus_status = await self._calculate_consensus_status(miner_uid, recent_reports)
             
-            # Store consensus status
-            consensus_ref = self.consensus_collection.document(str(miner_uid))
-            consensus_ref.set({
-                'miner_uid': miner_uid,
-                'consensus_status': consensus_status,
-                'last_consensus': datetime.now(),
-                'validator_reports_count': len(recent_reports),
-                'consensus_confidence': consensus_status.get('confidence', 0.0)
-            }, merge=True)
+            # Store consensus status in PostgreSQL
+            from database.postgresql_schema import MinerConsensus
+            session = self.db._get_session()
+            try:
+                consensus = session.query(MinerConsensus).filter(MinerConsensus.miner_uid == miner_uid).first()
+                if consensus:
+                    # Update existing consensus
+                    consensus.consensus_status = consensus_status
+                    consensus.consensus_confidence = consensus_status.get('confidence', 0.0)
+                    consensus.validator_reports_count = len(recent_reports)
+                    consensus.last_consensus = datetime.now()
+                    consensus.updated_at = datetime.now()
+                else:
+                    # Create new consensus
+                    consensus = MinerConsensus(
+                        miner_uid=miner_uid,
+                        hotkey=consensus_status.get('hotkey', ''),
+                        consensus_status=consensus_status,
+                        consensus_confidence=consensus_status.get('confidence', 0.0),
+                        validator_reports_count=len(recent_reports),
+                        last_consensus=datetime.now()
+                    )
+                    session.add(consensus)
+                session.commit()
+            finally:
+                session.close()
             
             # Update cache
             self.consensus_cache[miner_uid] = consensus_status
@@ -215,22 +252,33 @@ class MultiValidatorManager:
             # Query recent reports (within consensus timeout)
             cutoff_time = datetime.now() - self.consensus_timeout
             
-            query = self.validator_reports_collection.where('miner_uid', '==', miner_uid)
-            docs = query.stream()
-            
-            recent_reports = []
-            for doc in docs:
-                report_data = doc.to_dict()
-                report_timestamp = report_data['timestamp']
+            # PostgreSQL: Query validator reports
+            from database.postgresql_schema import ValidatorReport as ValidatorReportModel
+            session = self.db._get_session()
+            try:
+                reports = session.query(ValidatorReportModel).filter(
+                    ValidatorReportModel.miner_uid == miner_uid,
+                    ValidatorReportModel.timestamp >= cutoff_time
+                ).order_by(ValidatorReportModel.timestamp.desc()).all()
                 
-                # Convert Firestore timestamp to datetime if needed
-                if hasattr(report_timestamp, 'timestamp'):
-                    report_timestamp = datetime.fromtimestamp(report_timestamp.timestamp())
-                
-                if report_timestamp >= cutoff_time:
-                    recent_reports.append(ValidatorReport(**report_data))
-            
-            return recent_reports
+                recent_reports = []
+                for report in reports:
+                    # Ensure miner_status is a dict (JSON column)
+                    miner_status_data = report.miner_status
+                    if not isinstance(miner_status_data, dict):
+                        miner_status_data = {} if miner_status_data is None else {"data": miner_status_data}
+                    
+                    recent_reports.append(ValidatorReport(
+                        validator_uid=report.validator_uid,
+                        miner_uid=report.miner_uid,
+                        timestamp=report.timestamp,
+                        epoch=report.epoch,
+                        miner_status=miner_status_data,
+                        confidence_score=report.confidence_score
+                    ))
+                return recent_reports
+            finally:
+                session.close()
             
         except Exception as e:
             print(f"❌ Error getting recent miner reports: {e}")
@@ -298,16 +346,33 @@ class MultiValidatorManager:
                     consensus_status[field] = consensus_value
             
             # Add consensus metadata
-            consensus_status['consensus_timestamp'] = datetime.now()
+            # Convert datetime to ISO format string for JSON serialization
+            consensus_status['consensus_timestamp'] = datetime.now().isoformat()
             consensus_status['consensus_validators'] = list(validator_reports.keys())
             consensus_status['consensus_confidence'] = self._calculate_overall_confidence(reports)
             consensus_status['conflicts_detected'] = conflicts
+            
+            # Ensure all datetime objects in the dict are converted to strings
+            consensus_status = self._serialize_datetime_objects(consensus_status)
             
             return consensus_status
             
         except Exception as e:
             print(f"❌ Error calculating consensus status: {e}")
             return {}
+    
+    def _serialize_datetime_objects(self, data: Any) -> Any:
+        """Recursively convert datetime objects to ISO format strings for JSON serialization"""
+        if isinstance(data, datetime):
+            return data.isoformat()
+        elif isinstance(data, dict):
+            return {key: self._serialize_datetime_objects(value) for key, value in data.items()}
+        elif isinstance(data, list):
+            return [self._serialize_datetime_objects(item) for item in data]
+        elif isinstance(data, tuple):
+            return tuple(self._serialize_datetime_objects(item) for item in data)
+        else:
+            return data
     
     def _weighted_average(self, values: List[float], weights: List[float]) -> float:
         """Calculate weighted average of numeric values"""
@@ -423,19 +488,23 @@ class MultiValidatorManager:
                 if cache_age < self.cache_ttl:
                     return self.consensus_cache[miner_uid]
             
-            # Query database
-            consensus_ref = self.consensus_collection.document(str(miner_uid))
-            consensus_doc = consensus_ref.get()
-            
-            if consensus_doc.exists:
-                consensus_data = consensus_doc.to_dict()
-                consensus_status = consensus_data.get('consensus_status', {})
-                
-                # Update cache
-                self.consensus_cache[miner_uid] = consensus_status
-                return consensus_status
-            
-            return None
+            # Query database (PostgreSQL)
+            from database.postgresql_schema import MinerConsensus
+            session = self.db._get_session()
+            try:
+                consensus = session.query(MinerConsensus).filter(MinerConsensus.miner_uid == miner_uid).first()
+                if consensus:
+                    consensus_status = consensus.consensus_status
+                    # Update cache
+                    self.consensus_cache[miner_uid] = consensus_status
+                    return consensus_status
+                else:
+                    # Check cache as fallback
+                    if miner_uid in self.consensus_cache:
+                        return self.consensus_cache[miner_uid]
+                    return None
+            finally:
+                session.close()
             
         except Exception as e:
             print(f"❌ Error getting consensus miner status: {e}")
@@ -444,23 +513,23 @@ class MultiValidatorManager:
     async def get_all_consensus_miners(self) -> List[Dict[str, Any]]:
         """Get consensus status for all miners"""
         try:
-            # Query all consensus documents
-            docs = self.consensus_collection.stream()
-            
-            miners = []
-            for doc in docs:
-                consensus_data = doc.to_dict()
-                miner_uid = consensus_data.get('miner_uid')
-                
-                if miner_uid:
-                    consensus_status = consensus_data.get('consensus_status', {})
-                    consensus_status['miner_uid'] = miner_uid
-                    consensus_status['consensus_confidence'] = consensus_data.get('consensus_confidence', 0.0)
-                    consensus_status['last_consensus'] = consensus_data.get('last_consensus')
-                    
-                    miners.append(consensus_status)
-            
-            return miners
+            # PostgreSQL: Query all consensus from database
+            from database.postgresql_schema import MinerConsensus
+            session = self.db._get_session()
+            try:
+                consensus_records = session.query(MinerConsensus).all()
+                miners = []
+                for consensus in consensus_records:
+                    miners.append({
+                        'miner_uid': consensus.miner_uid,
+                        'consensus_status': consensus.consensus_status,
+                        'consensus_confidence': consensus.consensus_confidence
+                    })
+                    # Update cache
+                    self.consensus_cache[consensus.miner_uid] = consensus.consensus_status
+                return miners
+            finally:
+                session.close()
             
         except Exception as e:
             print(f"❌ Error getting all consensus miners: {e}")
@@ -478,23 +547,29 @@ class MultiValidatorManager:
     async def get_validator_report_stats(self) -> Dict[str, Any]:
         """Get statistics about validator reports and consensus"""
         try:
-            # Count total reports
-            total_reports = len(list(self.validator_reports_collection.stream()))
-            
-            # Count consensus miners
-            consensus_miners = len(list(self.consensus_collection.stream()))
-            
-            # Count active validators
-            active_validators = set()
-            recent_reports = self.validator_reports_collection.where('timestamp', '>=', datetime.now() - timedelta(hours=1))
-            for doc in recent_reports.stream():
-                active_validators.add(doc.to_dict().get('validator_uid'))
-            
-            # Calculate consensus confidence distribution
-            confidence_scores = []
-            for doc in self.consensus_collection.stream():
-                confidence = doc.to_dict().get('consensus_confidence', 0.0)
-                confidence_scores.append(confidence)
+            # PostgreSQL: Query stats from database
+            from database.postgresql_schema import ValidatorReport as ValidatorReportModel, MinerConsensus
+            session = self.db._get_session()
+            try:
+                # Count total reports
+                total_reports = session.query(ValidatorReportModel).count()
+                
+                # Count consensus miners
+                consensus_miners = session.query(MinerConsensus).count()
+                
+                # Count active validators (validators that reported in last hour)
+                from datetime import timedelta
+                recent_cutoff = datetime.now() - timedelta(hours=1)
+                recent_reports = session.query(ValidatorReportModel).filter(
+                    ValidatorReportModel.timestamp >= recent_cutoff
+                ).all()
+                active_validators = set(report.validator_uid for report in recent_reports)
+                
+                # Get confidence scores from consensus
+                consensus_records = session.query(MinerConsensus).all()
+                confidence_scores = [c.consensus_confidence for c in consensus_records]
+            finally:
+                session.close()
             
             avg_confidence = statistics.mean(confidence_scores) if confidence_scores else 0.0
             

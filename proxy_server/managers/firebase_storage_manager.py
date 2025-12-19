@@ -16,7 +16,7 @@ from google.cloud import storage
 import mimetypes
 
 class FirebaseStorageManager:
-    def __init__(self, db, bucket_name: str = "violet-7063e.firebasestorage.app", credentials_path: str = "db/violet.json"):
+    def __init__(self, db, bucket_name: str = "violet-7063e.firebasestorage.app", credentials_path: str = None):
         self.db = db
         self.files_collection = db.collection('files')
         self.credentials_path = credentials_path
@@ -31,9 +31,30 @@ class FirebaseStorageManager:
             from google.oauth2 import service_account
             import os
             
+            # If credentials_path not provided, try to find it
+            if credentials_path is None:
+                possible_paths = [
+                    "/Users/user/Documents/Jarvis/violet/proxy_server/db/violet.json",  # Explicit path
+                    os.path.join(os.path.dirname(__file__), "..", "db", "violet.json"),  # Relative path
+                    "db/violet.json",  # From project root
+                    os.path.join(os.path.dirname(__file__), "..", "db", "violet-rename.json"),  # Fallback
+                    "db/violet-rename.json"
+                ]
+                for path in possible_paths:
+                    abs_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", path)) if not os.path.isabs(path) else path
+                    if os.path.exists(abs_path):
+                        credentials_path = abs_path
+                        print(f"✅ Found credentials at: {credentials_path}")
+                        break
+            
             # Check if credentials file exists
-            if not os.path.exists(credentials_path):
+            if credentials_path and not os.path.exists(credentials_path):
                 print(f"⚠️  Firebase credentials not found at {credentials_path}")
+                print(f"   File uploads will be disabled. To enable, add credentials file.")
+                return
+            
+            if not credentials_path:
+                print(f"⚠️  Firebase credentials path not provided and not found in default locations")
                 print(f"   File uploads will be disabled. To enable, add credentials file.")
                 return
             

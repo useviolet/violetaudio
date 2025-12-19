@@ -5,9 +5,8 @@ Handles API key validation and role-based access control with security hardening
 
 from fastapi import HTTPException, Security, Depends
 from fastapi.security import APIKeyHeader, APIKeyQuery
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from database.user_schema import UserOperations, UserRole
-from firebase_admin import firestore
 import os
 import hmac
 import hashlib
@@ -75,7 +74,8 @@ def validate_role(role: Optional[str]) -> str:
 class AuthMiddleware:
     """Authentication and authorization middleware with security hardening"""
     
-    def __init__(self, db: firestore.Client):
+    def __init__(self, db: Union[Any, None]):
+        """Initialize with database adapter (PostgreSQL or legacy Firestore)"""
         self.db = db
         # Load API keys from .env for miners, validators, and admin
         self.env_miner_api_key = os.getenv('MINER_API_KEY')

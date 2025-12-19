@@ -13,10 +13,13 @@ from enum import Enum
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, File, UploadFile, Form, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, ConfigDict
 import uvicorn
 import os
 from pathlib import Path
+import warnings
+# Suppress Pydantic model_id warnings
+warnings.filterwarnings("ignore", message=".*Field.*model_id.*has conflict with protected namespace.*")
 
 # Import our custom modules
 from database.enhanced_schema import (
@@ -29,6 +32,8 @@ from managers.file_manager import FileManager
 from managers.miner_response_handler import MinerResponseHandler
 from orchestrators.workflow_orchestrator import WorkflowOrchestrator
 from api.validator_integration import ValidatorIntegrationAPI
+from api.miner_metrics_api import MinerMetricsAPI
+from api.leaderboard_api import LeaderboardAPI
 
 # Import AuthMiddleware for type hints (lazy import to avoid circular dependencies)
 try:
@@ -40,13 +45,24 @@ except ImportError:
 def create_safe_filename(original_filename: str) -> str:
     """Create a safe filename for storage by removing problematic characters"""
     import re
+    # Handle None or empty filename
+    if not original_filename:
+        return "unnamed_file.wav"
+    
+    # Ensure filename is a string (handle bytes if needed)
+    if isinstance(original_filename, bytes):
+        try:
+            original_filename = original_filename.decode('utf-8', errors='replace')
+        except:
+            original_filename = "unnamed_file.wav"
+    
     # Remove or replace problematic characters
     safe_filename = re.sub(r'[^\w\s\-_.]', '_', original_filename)
     # Replace spaces with underscores
     safe_filename = safe_filename.replace(' ', '_')
     # Ensure it's not empty
     if not safe_filename:
-        safe_filename = "unnamed_file"
+        safe_filename = "unnamed_file.wav"
     return safe_filename
 
 # Simple in-memory cache for frequently accessed data
@@ -295,10 +311,14 @@ file_manager = None
 task_manager = None
 workflow_orchestrator = None
 validator_api = None
+miner_metrics_api = None
+leaderboard_api = None
 miner_response_handler = None
 
 # Pydantic models for API requests
 class TranscriptionRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+    
     source_language: str = Field(..., description="Source language code (e.g., 'en', 'es', 'fr')")
     priority: TaskPriority = Field(default=TaskPriority.NORMAL, description="Task priority level")
     callback_url: Optional[str] = Field(None, description="Optional webhook URL for task completion notification")
@@ -311,6 +331,8 @@ class TranscriptionRequest(BaseModel):
         return v.lower()
 
 class TTSRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+    
     text: str = Field(..., description="Text to convert to speech")
     source_language: str = Field(..., description="Source language code (e.g., 'en', 'es', 'fr')")
     priority: TaskPriority = Field(..., description="Task priority level")
@@ -332,6 +354,8 @@ class TTSRequest(BaseModel):
         return v.lower()
 
 class SummarizationRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+    
     text: str = Field(..., description="Text to summarize")
     source_language: str = Field(..., description="Source language code (e.g., 'en', 'es', 'fr')")
     priority: TaskPriority = Field(default=TaskPriority.NORMAL, description="Task priority level")
@@ -356,6 +380,8 @@ class SummarizationRequest(BaseModel):
 
 # Response models
 class TaskResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+    
     task_id: str
     status: TaskStatus
     message: str
@@ -364,6 +390,8 @@ class TaskResponse(BaseModel):
     source_language: str
 
 class TaskResult(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+    
     task_id: str
     status: TaskStatus
     task_type: str
@@ -379,42 +407,36 @@ class TaskResult(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     """Initialize all managers and start background tasks"""
-    global file_manager, task_manager, workflow_orchestrator, validator_api, miner_response_handler
+    global file_manager, task_manager, workflow_orchestrator, validator_api, miner_response_handler, miner_metrics_api
     
     try:
         print("🚀 Starting Enhanced Proxy Server...")
         
-        # Initialize database with robust path resolution
-        from database.schema import DatabaseManager
+        # Initialize PostgreSQL database
+        from database.postgresql_adapter import PostgreSQLAdapter
         import os
         
-        # Try multiple possible paths for the credentials file
-        possible_paths = [
-            "db/violet.json",  # From project root
-            os.path.join(os.path.dirname(__file__), "db", "violet.json")
-        ]
-        
-        credentials_path = None
-        for path in possible_paths:
-            if os.path.exists(path):
-                credentials_path = path
-                print(f"✅ Found credentials at: {path}")
-                break
-        
-        if not credentials_path:
-            raise FileNotFoundError(f"Firebase credentials not found. Tried paths: {possible_paths}")
+        # Get database URL from environment or use default
+        database_url = os.getenv(
+            'DATABASE_URL',
+            'postgresql://violet_db_user:ZiqeR2tAHgdaxjyi3YGwT3nbXBWW6t1w@dpg-d515p2vfte5s738uemkg-a.oregon-postgres.render.com/violet_db'
+        )
         
         global db_manager
-        db_manager = DatabaseManager(credentials_path)
-        db_manager.initialize()
+        db_manager = PostgreSQLAdapter(database_url)
+        print(f"✅ PostgreSQL database initialized")
         
-                # Initialize managers
-        global file_manager, task_manager, workflow_orchestrator, validator_api, miner_response_handler
-        file_manager = FileManager(db_manager.get_db())
-        task_manager = TaskManager(db_manager.get_db())
+        # Initialize managers
+        global file_manager, task_manager, workflow_orchestrator, validator_api, miner_response_handler, miner_metrics_api
+        # Pass PostgreSQL adapter directly (it implements the interface)
+        file_manager = FileManager(db_manager)
+        task_manager = TaskManager(db_manager)
         # Note: workflow_orchestrator will be initialized after miner_status_manager is created
-        validator_api = ValidatorIntegrationAPI(db_manager.get_db())
-        miner_response_handler = MinerResponseHandler(db_manager.get_db(), task_manager)
+        validator_api = ValidatorIntegrationAPI(db_manager)
+        miner_metrics_api = MinerMetricsAPI(db_manager)  # Now properly declared as global
+        global leaderboard_api
+        leaderboard_api = LeaderboardAPI(db_manager)
+        miner_response_handler = MinerResponseHandler(db_manager, task_manager)
         
         # 🔒 DUPLICATE PROTECTION: Assign components to app.state for endpoint access
         app.state.miner_response_handler = miner_response_handler
@@ -428,25 +450,37 @@ async def startup_event():
         class NetworkMinerStatusManager:
             def __init__(self, db):
                 self.db = db
-                self.miner_status_collection = db.collection('miner_status')
-                self.consensus_collection = db.collection('miner_consensus')
+                from database.postgresql_adapter import PostgreSQLAdapter
+                # PostgreSQL only - no Firestore support
             
             async def get_available_miners(self, task_type=None, min_count=1, max_count=5):
-                """Get real miners from Bittensor network via multi-validator consensus"""
+                """Get available miners from validator reports (simplified - no consensus)"""
                 try:
-                    # First try to get consensus-based miner status
-                    consensus_miners = await self._get_consensus_miners(task_type)
-                    if consensus_miners:
-                        print(f"🔍 Multi-validator consensus: Found {len(consensus_miners)} available miners")
-                        # Filter by task type if specified and limit to max_count
-                        filtered_miners = self._filter_miners_by_task_type(consensus_miners, task_type)
-                        return filtered_miners[:max_count]
+                    # Simplified: Just get miners from MinerStatus table (updated by validators)
+                    # No consensus needed - validators already handle that via weight setting
+                    from database.postgresql_schema import MinerStatus
+                    session = db_manager._get_session()
+                    try:
+                        miners = session.query(MinerStatus).filter(
+                            MinerStatus.is_serving == True
+                        ).limit(max_count * 2).all()
+                        miner_list = [db_manager._miner_status_to_dict(m) for m in miners]
+                    finally:
+                        session.close()
                     
-                    # Fallback to individual validator reports
-                    print(f"⚠️ No consensus available, falling back to individual validator reports")
-                    fallback_miners = await self._get_fallback_miners(task_type)
-                    filtered_miners = self._filter_miners_by_task_type(fallback_miners, task_type)
-                    return filtered_miners[:max_count]
+                    # Filter by task type if specified
+                    if task_type:
+                        miner_list = [m for m in miner_list if not m.get('task_type_specialization') or 
+                                     task_type in m.get('task_type_specialization', [])]
+                    
+                    # Filter by capacity
+                    available = [m for m in miner_list if 
+                                m.get('current_load', 0) < m.get('max_capacity', 5)]
+                    
+                    # Sort by availability score
+                    available.sort(key=lambda x: x.get('availability_score', 0), reverse=True)
+                    
+                    return available[:max_count]
                     
                 except Exception as e:
                     print(f"❌ Error getting network miners: {e}")
@@ -468,81 +502,26 @@ async def startup_event():
                 
                 return filtered
             
-            async def _get_consensus_miners(self, task_type=None):
-                """Get miners based on multi-validator consensus"""
-                try:
-                    # Query consensus collection
-                    docs = self.consensus_collection.stream()
-                    
-                    consensus_miners = []
-                    for doc in docs:
-                        consensus_data = doc.to_dict()
-                        consensus_status = consensus_data.get('consensus_status', {})
-                        
-                        # Only include miners with consensus confidence (lower threshold for single validator)
-                        consensus_confidence = consensus_data.get('consensus_confidence', 0.0)
-                        if consensus_confidence < 0.3:  # Lower threshold to allow single-validator scenarios
-                            continue
-                        
-                        # Remove stake requirement - allow miners with 0 stake (they can still be active)
-                        if consensus_status.get('is_serving'):
-                            # Get miner_uid from consensus_data or consensus_status
-                            miner_uid = consensus_data.get('miner_uid') or consensus_status.get('uid')
-                            if not miner_uid:
-                                continue
-                            
-                            # Calculate availability score based on consensus data
-                            performance_score = consensus_status.get('performance_score', 0.5)
-                            stake = float(consensus_status.get('stake', 0))
-                            current_load = consensus_status.get('current_load', 0)
-                            max_capacity = consensus_status.get('max_capacity', 5)
-                            
-                            # Boost score for high consensus confidence
-                            consensus_boost = consensus_confidence * 0.2
-                            
-                            # Calculate availability score (0.0 to 1.0)
-                            availability_score = min(1.0, max(0.1, 
-                                performance_score * (1 - current_load/max_capacity) + consensus_boost))
-                            
-                            consensus_miners.append({
-                                'uid': miner_uid,
-                                'hotkey': consensus_status.get('hotkey', 'unknown'),
-                                'stake': stake,
-                                'availability_score': availability_score,
-                                'task_type_specialization': consensus_status.get('task_type_specialization'),
-                                'current_load': current_load,
-                                'max_capacity': max_capacity,
-                                'performance_score': performance_score,
-                                'ip': consensus_status.get('ip'),
-                                'port': consensus_status.get('port'),
-                                'consensus_confidence': consensus_confidence,
-                                'consensus_validators': consensus_status.get('consensus_validators', [])
-                            })
-                    
-                    # Sort by availability score (higher is better)
-                    consensus_miners.sort(key=lambda x: x['availability_score'], reverse=True)
-                    
-                    # Log top miners with consensus info
-                    for miner in consensus_miners[:5]:
-                        print(f"   Miner {miner['uid']}: consensus={miner['consensus_confidence']:.3f}, score={miner['availability_score']:.3f}, load={miner['current_load']}/{miner['max_capacity']}, stake={miner['stake']:.2f}")
-                    
-                    return consensus_miners
-                    
-                except Exception as e:
-                    print(f"❌ Error getting consensus miners: {e}")
-                    return []
-            
-            async def _get_fallback_miners(self, task_type=None):
+            async def _get_available_miners_simple(self, task_type=None):
+                """Get available miners (simplified - no consensus needed)"""
                 """Fallback to individual validator reports"""
                 try:
-                    # Query miner status collection (populated by validators)
-                    query = self.miner_status_collection.where('is_serving', '==', True)
-                    docs = query.stream()
-                    
                     available_miners = []
                     current_time = datetime.utcnow()
+                    
+                    # PostgreSQL: Query miner status
+                    from database.postgresql_schema import MinerStatus
+                    session = self.db._get_session()
+                    try:
+                        miners = session.query(MinerStatus).filter(
+                            MinerStatus.is_serving == True
+                        ).all()
+                        docs = [self.db._miner_status_to_dict(m) for m in miners]
+                    finally:
+                        session.close()
+                    
                     for doc in docs:
-                        miner_data = doc.to_dict()
+                        miner_data = doc  # Already a dict
                         # Remove stake requirement - allow miners with 0 stake
                         if miner_data.get('is_serving'):
                             # Check last_seen with timezone handling
@@ -554,8 +533,8 @@ async def startup_event():
                                         if last_seen.tzinfo is not None:
                                             last_seen = last_seen.replace(tzinfo=None)
                                         time_diff = (current_time - last_seen).total_seconds()
-                                    elif hasattr(last_seen, 'timestamp'):  # Firestore Timestamp
-                                        time_diff = (current_time.timestamp() - last_seen.timestamp())
+                                    # Handle datetime objects only (PostgreSQL)
+                                    # Timestamp is already a datetime object
                                     elif isinstance(last_seen, str):
                                         from dateutil import parser
                                         last_seen_dt = parser.parse(last_seen)
@@ -595,26 +574,25 @@ async def startup_event():
                                 'performance_score': performance_score,
                                 'ip': miner_data.get('ip'),
                                 'port': miner_data.get('port'),
-                                'consensus_confidence': 0.0,  # No consensus
-                                'consensus_validators': [miner_data.get('reported_by_validator', 'unknown')]
                             })
                     
                     # Sort by availability score (higher is better)
                     available_miners.sort(key=lambda x: x['availability_score'], reverse=True)
                     
-                    print(f"🔍 Fallback miner discovery: Found {len(available_miners)} available miners")
-                    for miner in available_miners[:5]:  # Log top 5
-                        print(f"   Miner {miner['uid']}: score={miner['availability_score']:.3f}, load={miner['current_load']}/{miner['max_capacity']}, stake={miner['stake']:.2f}")
+                    if available_miners:
+                        # Only log if miners found (reduce noise)
+                        print(f"🔍 Found {len(available_miners)} available miners")
                     
                     return available_miners
                     
                 except Exception as e:
-                    print(f"❌ Error getting fallback miners: {e}")
+                    # Reduce logging noise - only log if it's not a known PostgreSQL issue
+                    if "miner_status_collection" not in str(e) and "collection" not in str(e):
+                        print(f"⚠️ Error getting fallback miners: {e}")
                     return []
         
-        # Initialize multi-validator manager for consensus-based miner status
-        from managers.multi_validator_manager import MultiValidatorManager
-        app.state.multi_validator_manager = MultiValidatorManager(db_manager.get_db())
+        # NOTE: Consensus tracking removed - not needed in proxy server
+        # Validators handle consensus via weight setting, proxy just needs miner availability
         
         app.state.miner_status_manager = NetworkMinerStatusManager(db_manager.get_db())
         app.state.task_distributor = TaskDistributor(
@@ -626,9 +604,10 @@ async def startup_event():
         # Initialize workflow orchestrator with miner_status_manager
         workflow_orchestrator = WorkflowOrchestrator(
             db_manager.get_db(), 
-            task_manager,
+            task_manager, 
             app.state.miner_status_manager
         )
+        app.state.workflow_orchestrator = workflow_orchestrator  # Make accessible for API endpoints
         
         print("🔒 Duplicate protection components assigned to app.state")
         print("🌐 Network-aware miner status manager initialized")
@@ -636,9 +615,9 @@ async def startup_event():
         # Start workflow orchestrator (includes task distribution loop every 5 seconds)
         await workflow_orchestrator.start_orchestration()
         
-        # Start TaskDistributor as a backup distribution mechanism (runs every 30 seconds)
+        # Start TaskDistributor as a backup distribution mechanism (runs every 3 minutes)
         asyncio.create_task(app.state.task_distributor.start_distribution())
-        print("✅ TaskDistributor polling started (30 second interval)")
+        print("✅ TaskDistributor polling started (3 minute interval)")
         
         # Log system startup to wandb
         if wandb_monitor.initialized:
@@ -744,77 +723,131 @@ def require_client_auth(
 
 @app.post("/api/v1/transcription")
 async def submit_transcription_task(
-    user_info: dict = Depends(require_client_auth),
     audio_file: UploadFile = File(...),
-    source_language: str = Form("en"),
-    priority: str = Form("normal"),
-    model_id: str = Form(None)  # Optional HuggingFace model ID (e.g., "openai/whisper-tiny", "openai/whisper-base", etc.)
+    user_info: dict = Depends(require_client_auth),
+    source_language: Optional[str] = Form("en"),
+    priority: Optional[str] = Form("normal"),
+    model_id: Optional[str] = Form(None)  # Optional HuggingFace model ID
 ):
-    """Submit transcription task"""
+    """Submit transcription task with raw audio file (no base64)"""
     try:
-        # Read file data
-        file_data = await audio_file.read()
+        # Ensure form fields are strings
+        source_language = source_language or "en"
+        priority = priority or "normal"
+        model_id = model_id if model_id else None
         
-        # Create a safe filename for storage
-        safe_filename = create_safe_filename(audio_file.filename)
+        # Validate file type
+        if not audio_file.content_type or not audio_file.content_type.startswith('audio/'):
+            raise HTTPException(status_code=400, detail="File must be an audio file")
         
-        # Upload file to local storage with transcription type
-        file_id = await file_manager.upload_file(
-            file_data, 
-            safe_filename,  # Use safe filename for storage
-            audio_file.content_type,
-            file_type="transcription"
+        # Check if R2 storage is enabled
+        if not file_manager.r2_storage_manager or not file_manager.r2_storage_manager.enabled:
+            raise HTTPException(
+                status_code=503,
+                detail="R2 Storage is not configured. Please configure R2 credentials in .env file to enable file uploads."
+            )
+        
+        # Read audio file data
+        audio_bytes = await audio_file.read()
+        if len(audio_bytes) == 0:
+            raise HTTPException(status_code=400, detail="Audio file is empty")
+        
+        # Create safe filename - handle potential encoding issues
+        try:
+            filename = audio_file.filename or "audio.wav"
+            if isinstance(filename, bytes):
+                filename = filename.decode('utf-8', errors='replace')
+            safe_filename = create_safe_filename(filename)
+        except Exception as e:
+            print(f"⚠️ Error processing filename: {e}, using default")
+            safe_filename = "audio.wav"
+        
+        # Upload audio file directly to R2 Storage (raw bytes, no base64)
+        try:
+            file_id = await file_manager.upload_file(
+                file_data=audio_bytes,
+                file_name=safe_filename,
+                content_type=audio_file.content_type or "audio/wav",
+                file_type="audio"
+            )
+            
+            # Get file metadata
+            file_metadata = await file_manager.get_file_metadata(file_id)
+            
+            # Create input_file data with R2 storage info
+            # Ensure all values are Firestore-compatible (no binary data)
+            public_url = file_metadata.get('public_url') if file_metadata else None
+            input_file_data = {
+                'file_id': str(file_id),  # Ensure string
+                'file_name': str(safe_filename),  # Ensure string
+                'file_type': str(audio_file.content_type or 'audio/wav'),  # Ensure string
+                'file_size': int(len(audio_bytes)),  # Ensure int
+                'uploaded_at': datetime.now(),
+                'storage_location': 'r2',
+                'public_url': str(public_url) if public_url else None  # Ensure string or None
+            }
+            
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to upload audio file to R2: {str(e)}"
+            )
+        
+        # Create task - ensure all data is Firestore-compatible
+        try:
+            task_data = {
+                'task_type': 'transcription',
+                'input_file': input_file_data,
+                'priority': str(priority) if priority else 'normal',
+                'source_language': str(source_language) if source_language else 'en',
+                'model_id': str(model_id) if model_id else "openai/whisper-tiny",  # Default transcription model
+                'required_miner_count': 3,
+                'min_miner_count': 1,
+                'max_miner_count': 3
+            }
+            
+            # Use enhanced database operations
+            task_id = DatabaseOperations.create_task(db_manager, task_data)
+        except Exception as db_error:
+            import traceback
+            print(f"❌ Database error: {db_error}")
+            print(f"   Traceback: {traceback.format_exc()}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to create task in database: {str(db_error)}"
+            )
+        
+        # Auto-assign task to available miners
+        assignment_success = DatabaseOperations.auto_assign_task(
+            db_manager, 
+            task_id, 
+            'transcription', 
+            task_data.get('required_miner_count', 3),
+            min_count=task_data.get('min_miner_count', 1),
+            max_count=task_data.get('max_miner_count', task_data.get('required_miner_count', 3))
         )
         
-        # Get the actual file metadata to get the correct path
-        file_metadata = await file_manager.get_file_metadata(file_id)
-        
-        # Determine the correct path based on storage type
-        if file_metadata and file_metadata.get('stored_in_cloud', False):
-            # File is stored in Firebase Cloud Storage
-            file_path = file_metadata.get('cloud_path', f"user_audio/{file_id}")
-            storage_location = "cloud_storage"
-        else:
-            # File is stored in Firestore (small files)
-            file_path = f"firestore/{file_id}"
-            storage_location = "firestore"
-        
-        # Create task using enhanced schema
-        task_data = {
-            'task_type': 'transcription',
-            'input_file': {
-                'file_id': file_id,
-                'file_name': audio_file.filename,  # Keep original filename for display
-                'file_type': audio_file.content_type,
-                'file_size': len(file_data),
-                'local_path': file_path,
-                'file_url': f"/api/v1/files/{file_id}",
-                'checksum': str(hash(file_data)),  # Simple hash for now
-                'uploaded_at': datetime.now(),
-                'storage_location': storage_location
-            },
-            'priority': priority,
-            'source_language': source_language,
-            'model_id': model_id if model_id else None,  # Store model_id if provided
-            'required_miner_count': 3
-        }
-        
-        # Use enhanced database operations
-        task_id = DatabaseOperations.create_task(db_manager.get_db(), task_data)
+        # Reduce logging - only log successful assignments
+        if assignment_success:
+            print(f"✅ Task {task_id} assigned to miners")
+        # Don't log assignment failures - they're expected when no miners available
         
         # Track metrics
         system_metrics.increment_tasks()
         
         # Log task creation to wandb
-        if wandb_monitor.initialized:
-            wandb_monitor.log_task_metrics({
-                'task_type': 'transcription',
-                'task_id': task_id,
-                'priority': priority,
-                'source_language': source_language,
-                'file_id': file_id,
-                'created_at': datetime.now().isoformat()
-            })
+        try:
+            if wandb_monitor.initialized:
+                wandb_monitor.log_task_metrics({
+                    'task_type': 'transcription',
+                    'task_id': task_id,
+                    'priority': priority,
+                    'source_language': source_language,
+                    'file_size': len(audio_bytes),
+                    'created_at': datetime.now().isoformat()
+                })
+        except Exception as wandb_error:
+            print(f"⚠️ Failed to log to wandb: {wandb_error}")
         
         # Start task distribution
         # Note: The workflow orchestrator handles task distribution automatically
@@ -823,63 +856,100 @@ async def submit_transcription_task(
         return {
             "success": True,
             "task_id": task_id,
-            "file_id": file_id,
-            "message": "Transcription task submitted successfully"
+            "message": "Transcription task submitted successfully",
+            "auto_assigned": assignment_success
         }
         
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        error_traceback = traceback.format_exc()
+        print(f"❌ Error in submit_transcription_task: {e}")
+        print(f"   Traceback: {error_traceback}")
         error_msg = str(e)
-        # Check if it's a Firebase storage error
-        if "403" in error_msg or "storage.googleapis.com" in error_msg or "Firebase" in error_msg or "not configured" in error_msg:
-            raise HTTPException(
-                status_code=503,
-                detail="File storage is not configured. Please configure Firebase credentials to enable file uploads."
-            )
         raise HTTPException(status_code=500, detail=f"Failed to submit task: {str(e)}")
 
 @app.post("/api/v1/tts")
 async def submit_tts_task(
-    request: Request,
+    text: str = Form(...),
+    source_language: str = Form("en"),
+    priority: str = Form("normal"),
+    model_id: Optional[str] = Form(None),
+    voice_name: Optional[str] = Form(None),
     user_info: dict = Depends(require_client_auth)
 ):
-    """Submit text-to-speech task with text stored directly in database - accepts both JSON and Form data"""
+    """Submit text-to-speech task with text stored directly in database - accepts form data"""
     try:
-        # Try to parse as JSON first, fallback to Form
-        content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type:
-            body = await request.json()
-            text = body.get("text", "")
-            source_language = body.get("source_language", "en")
-            priority = body.get("priority", "normal")
-            model_id = body.get("model_id", None)  # Optional HuggingFace model ID
-        else:
-            form_data = await request.form()
-            text = form_data.get("text", "")
-            source_language = form_data.get("source_language", "en")
-            priority = form_data.get("priority", "normal")
-            model_id = form_data.get("model_id", None)  # Optional HuggingFace model ID
+        # All parameters come from form data
         
         # Validate text length
         if not text or len(text.strip()) < 10:
             raise HTTPException(status_code=400, detail="Text too short for TTS (min 10 characters)")
         
+        # Validate and get voice information - voice_name is REQUIRED for TTS
+        speaker_wav_url = None
+        voice_data = None
+        
+        # If voice_name not provided, try to use a default voice
+        if not voice_name:
+            # Get the first available voice as default
+            from database.postgresql_adapter import PostgreSQLAdapter
+            from database.postgresql_schema import Voice
+            
+            session = db_manager._get_session()
+            try:
+                default_voice = session.query(Voice).first()
+                if default_voice:
+                    voice_name = default_voice.voice_name
+                    print(f"⚠️ No voice_name provided, using default voice: {voice_name}")
+                else:
+                    raise HTTPException(
+                        status_code=400, 
+                        detail="No voice_name provided and no default voice available. Please specify a voice_name or upload a voice first."
+                    )
+            finally:
+                session.close()
+        
+        # Get voice from database
+        if voice_name:
+            from database.postgresql_adapter import PostgreSQLAdapter
+            from database.postgresql_schema import Voice
+            
+            # PostgreSQL: Get voice
+            session = db_manager._get_session()
+            try:
+                voice = session.query(Voice).filter(Voice.voice_name == voice_name).first()
+                if not voice:
+                    raise HTTPException(status_code=404, detail=f"Voice '{voice_name}' not found. Please select a valid voice.")
+                speaker_wav_url = voice.public_url
+                voice_data = {
+                    'voice_name': voice.voice_name,
+                    'language': voice.language,
+                    'public_url': voice.public_url
+                }
+            finally:
+                session.close()
+            
+            if not speaker_wav_url:
+                raise HTTPException(status_code=404, detail=f"Voice '{voice_name}' has no audio file URL")
+            
+            # Override language if voice has a specific language
+            if voice_data and voice_data.get('language'):
+                source_language = voice_data.get('language')
+        
         # Use the source language provided by the user
         detected_language = source_language
         language_confidence = 1.0
         
-        # Create text content object
+        # Create text content object (don't set content_id - let PostgreSQLAdapter create it)
         text_content = {
-            'content_id': generate_text_content_id(),
             'text': text.strip(),
             'source_language': detected_language,
             'detected_language': detected_language,
             'language_confidence': language_confidence,
             'text_length': len(text),
             'word_count': len(text.split()),
-            'created_at': datetime.now(),
-            'updated_at': datetime.now(),
             'metadata': {
                 'original_source_language': source_language,
                 'detection_method': 'manual'
@@ -892,25 +962,29 @@ async def submit_tts_task(
             'input_text': text_content,
             'priority': priority,
             'source_language': detected_language,
-            'model_id': model_id if model_id else None,  # Store model_id if provided
+            'model_id': model_id or "tts_models/multilingual/multi-dataset/xtts_v2",  # Default TTS model
+            'voice_name': voice_name,  # Selected voice name
+            'speaker_wav_url': speaker_wav_url,  # URL to speaker audio file
             'required_miner_count': 3
         }
         
         # Create task in database
-        task_id = DatabaseOperations.create_task(db_manager.get_db(), task_data)
+        task_id = DatabaseOperations.create_task(db_manager, task_data)
         
         # Auto-assign task to available miners
         assignment_success = DatabaseOperations.auto_assign_task(
-            db_manager.get_db(),
+            db_manager,
             task_id,
             'tts',
-            task_data.get('required_miner_count', 3)
+            task_data.get('required_miner_count', 3),
+            min_count=task_data.get('min_miner_count', 1),
+            max_count=task_data.get('max_miner_count', task_data.get('required_miner_count', 3))
         )
         
+        # Reduce logging - only log successful assignments
         if assignment_success:
-            print(f"✅ Task {task_id} automatically assigned to miners")
-        else:
-            print(f"⚠️ Task {task_id} created but could not be assigned to miners")
+            print(f"✅ Task {task_id} assigned to miners")
+        # Don't log assignment failures - they're expected when no miners available
         
         # Track metrics
         system_metrics.increment_tasks()
@@ -933,7 +1007,7 @@ async def submit_tts_task(
         return {
             "success": True,
             "task_id": task_id,
-            "text_content_id": text_content['content_id'],
+            "model_id": task_data.get('model_id'),  # Include model_id in response
             "detected_language": detected_language,
             "language_confidence": language_confidence,
             "text_length": len(text),
@@ -947,25 +1021,15 @@ async def submit_tts_task(
 
 @app.post("/api/v1/summarization")
 async def submit_summarization_task(
-    request: Request,
+    text: str = Form(...),
+    source_language: str = Form("en"),
+    priority: str = Form("normal"),
+    model_id: Optional[str] = Form(None),
     user_info: dict = Depends(require_client_auth)
 ):
-    """Submit summarization task with text stored directly in database - accepts both JSON and Form data"""
+    """Submit summarization task with text stored directly in database - accepts form data"""
     try:
-        # Try to parse as JSON first, fallback to Form
-        content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type:
-            body = await request.json()
-            text = body.get("text", "")
-            source_language = body.get("source_language", "en")
-            priority = body.get("priority", "normal")
-            model_id = body.get("model_id", None)  # Optional HuggingFace model ID
-        else:
-            form_data = await request.form()
-            text = form_data.get("text", "")
-            source_language = form_data.get("source_language", "en")
-            priority = form_data.get("priority", "normal")
-            model_id = form_data.get("model_id", None)  # Optional HuggingFace model ID
+        # All parameters come from form data
         
         # Validate text length
         if not text or len(text.strip()) < 50:
@@ -975,17 +1039,14 @@ async def submit_summarization_task(
         detected_language = source_language
         language_confidence = 1.0
         
-        # Create text content object
+        # Create text content object (don't set content_id - let PostgreSQLAdapter create it)
         text_content = {
-            'content_id': generate_text_content_id(),
             'text': text.strip(),
             'source_language': detected_language,
             'detected_language': detected_language,
             'language_confidence': language_confidence,
             'text_length': len(text),
             'word_count': len(text.split()),
-            'created_at': datetime.now(),
-            'updated_at': datetime.now(),
             'metadata': {
                 'original_source_language': source_language,
                 'detection_method': 'auto' if source_language == "auto" else 'manual'
@@ -998,25 +1059,27 @@ async def submit_summarization_task(
             'input_text': text_content,
             'priority': priority,
             'source_language': detected_language,
-            'model_id': model_id if model_id else None,  # Store model_id if provided
+            'model_id': model_id or "facebook/bart-large-cnn",  # Default summarization model
             'required_miner_count': 3
         }
         
         # Use enhanced database operations
-        task_id = DatabaseOperations.create_task(db_manager.get_db(), task_data)
+        task_id = DatabaseOperations.create_task(db_manager, task_data)
         
         # Automatically assign task to available miners
         assignment_success = DatabaseOperations.auto_assign_task(
-            db_manager.get_db(), 
+            db_manager, 
             task_id, 
             'summarization', 
-            task_data.get('required_miner_count', 3)
+            task_data.get('required_miner_count', 3),
+            min_count=task_data.get('min_miner_count', 1),
+            max_count=task_data.get('max_miner_count', task_data.get('required_miner_count', 3))
         )
         
+        # Reduce logging - only log successful assignments
         if assignment_success:
-            print(f"✅ Task {task_id} automatically assigned to miners")
-        else:
-            print(f"⚠️ Task {task_id} created but could not be assigned to miners")
+            print(f"✅ Task {task_id} assigned to miners")
+        # Don't log assignment failures - they're expected when no miners available
         
         # Track metrics
         system_metrics.increment_tasks()
@@ -1039,7 +1102,7 @@ async def submit_summarization_task(
         return {
             "success": True,
             "task_id": task_id,
-            "text_content_id": text_content['content_id'],
+            "model_id": task_data.get('model_id'),  # Include model_id in response
             "detected_language": detected_language,
             "language_confidence": language_confidence,
             "text_length": len(text),
@@ -1063,15 +1126,25 @@ async def submit_video_transcription_task(
 ):
     """Submit video transcription task - miner will extract audio and transcribe"""
     try:
-        # Check if Firebase storage is enabled
-        if not file_manager.firebase_storage_manager or not file_manager.firebase_storage_manager.enabled:
+        # Check if R2 storage is enabled
+        if not file_manager.r2_storage_manager or not file_manager.r2_storage_manager.enabled:
             raise HTTPException(
                 status_code=503, 
-                detail="File storage is not configured. Please configure Firebase credentials to enable file uploads."
+                detail="R2 Storage is not configured. Please configure R2 credentials in .env file to enable file uploads."
             )
         
-        # Validate file type
-        if not video_file.content_type.startswith('video/'):
+        # Validate file type - check content_type first, then fallback to file extension
+        is_video = False
+        if video_file.content_type and video_file.content_type.startswith('video/'):
+            is_video = True
+        else:
+            # Fallback: check file extension
+            filename = video_file.filename or ""
+            video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v']
+            if any(filename.lower().endswith(ext) for ext in video_extensions):
+                is_video = True
+        
+        if not is_video:
             raise HTTPException(status_code=400, detail="File must be a video file")
         
         # Validate file size (max 100MB for video files)
@@ -1124,14 +1197,16 @@ async def submit_video_transcription_task(
         }
         
         # Use enhanced database operations
-        task_id = DatabaseOperations.create_task(db_manager.get_db(), task_data)
+        task_id = DatabaseOperations.create_task(db_manager, task_data)
         
         # Automatically assign task to available miners
         assignment_success = DatabaseOperations.auto_assign_task(
-            db_manager.get_db(), 
+            db_manager, 
             task_id, 
             'video_transcription', 
-            task_data.get('required_miner_count', 3)
+            task_data.get('required_miner_count', 3),
+            min_count=task_data.get('min_miner_count', 1),
+            max_count=task_data.get('max_miner_count', task_data.get('required_miner_count', 3))
         )
         
         if assignment_success:
@@ -1180,27 +1255,16 @@ async def submit_video_transcription_task(
 
 @app.post("/api/v1/text-translation")
 async def submit_text_translation_task(
-    request: Request,
+    text: str = Form(...),
+    source_language: str = Form(...),
+    target_language: str = Form(...),
+    priority: str = Form("normal"),
+    model_id: Optional[str] = Form(None),
     user_info: dict = Depends(require_client_auth)
 ):
-    """Submit text translation task with text stored directly in database - accepts both JSON and Form data"""
+    """Submit text translation task with text stored directly in database - accepts form data"""
     try:
-        # Try to parse as JSON first, fallback to Form
-        content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type:
-            body = await request.json()
-            text = body.get("text", "")
-            source_language = body.get("source_language", "")
-            target_language = body.get("target_language", "")
-            priority = body.get("priority", "normal")
-            model_id = body.get("model_id", None)  # Optional HuggingFace model ID
-        else:
-            form_data = await request.form()
-            text = form_data.get("text", "")
-            source_language = form_data.get("source_language", "")
-            target_language = form_data.get("target_language", "")
-            priority = form_data.get("priority", "normal")
-            model_id = form_data.get("model_id", None)  # Optional HuggingFace model ID
+        # All parameters come from form data
         
         # Validate text length
         if not text or len(text.strip()) < 10:
@@ -1210,16 +1274,13 @@ async def submit_text_translation_task(
         if source_language == target_language:
             raise HTTPException(status_code=400, detail="Source and target languages must be different")
         
-        # Create text content object
+        # Create text content object (don't set content_id - let PostgreSQLAdapter create it)
         text_content = {
-            'content_id': generate_text_content_id(),
             'text': text.strip(),
             'source_language': source_language,
             'target_language': target_language,
             'text_length': len(text),
             'word_count': len(text.split()),
-            'created_at': datetime.now(),
-            'updated_at': datetime.now(),
             'metadata': {
                 'translation_type': 'text',
                 'source_language': source_language,
@@ -1234,25 +1295,27 @@ async def submit_text_translation_task(
             'priority': priority,
             'source_language': source_language,
             'target_language': target_language,
-            'model_id': model_id if model_id else None,  # Store model_id if provided
+            'model_id': model_id or "facebook/mbart-large-50-many-to-many-mmt",  # Default translation model
             'required_miner_count': 3
         }
         
         # Create task in database
-        task_id = DatabaseOperations.create_task(db_manager.get_db(), task_data)
+        task_id = DatabaseOperations.create_task(db_manager, task_data)
         
         # Auto-assign task to available miners
         assignment_success = DatabaseOperations.auto_assign_task(
-            db_manager.get_db(), 
+            db_manager, 
             task_id, 
             'text_translation', 
-            task_data.get('required_miner_count', 3)
+            task_data.get('required_miner_count', 3),
+            min_count=task_data.get('min_miner_count', 1),
+            max_count=task_data.get('max_miner_count', task_data.get('required_miner_count', 3))
         )
         
+        # Reduce logging - only log successful assignments
         if assignment_success:
-            print(f"✅ Text translation task {task_id} automatically assigned to miners")
-        else:
-            print(f"⚠️ Text translation task {task_id} created but could not be assigned to miners")
+            print(f"✅ Task {task_id} assigned to miners")
+        # Don't log assignment failures - they're expected when no miners available
         
         # Track metrics
         system_metrics.increment_tasks()
@@ -1274,7 +1337,7 @@ async def submit_text_translation_task(
         return {
             "success": True,
             "task_id": task_id,
-            "text_content_id": text_content['content_id'],
+            "model_id": task_data.get('model_id'),  # Include model_id in response
             "source_language": source_language,
             "target_language": target_language,
             "text_length": len(text),
@@ -1364,20 +1427,22 @@ async def submit_document_translation_task(
         }
         
         # Use enhanced database operations
-        task_id = DatabaseOperations.create_task(db_manager.get_db(), task_data)
+        task_id = DatabaseOperations.create_task(db_manager, task_data)
         
         # Automatically assign task to available miners
         assignment_success = DatabaseOperations.auto_assign_task(
-            db_manager.get_db(), 
+            db_manager, 
             task_id, 
             'document_translation', 
-            task_data.get('required_miner_count', 3)
+            task_data.get('required_miner_count', 3),
+            min_count=task_data.get('min_miner_count', 1),
+            max_count=task_data.get('max_miner_count', task_data.get('required_miner_count', 3))
         )
         
+        # Reduce logging - only log successful assignments
         if assignment_success:
-            print(f"✅ Document translation task {task_id} automatically assigned to miners")
-        else:
-            print(f"⚠️ Document translation task {task_id} created but could not be assigned to miners")
+            print(f"✅ Task {task_id} assigned to miners")
+        # Don't log assignment failures - they're expected when no miners available
         
         # Track metrics
         system_metrics.increment_tasks()
@@ -1400,6 +1465,7 @@ async def submit_document_translation_task(
         return {
             "success": True,
             "task_id": task_id,
+            "model_id": task_data.get('model_id'),  # Include model_id in response
             "file_id": file_id,
             "file_name": document_file.filename,
             "file_size": len(file_data),
@@ -1427,7 +1493,7 @@ async def get_summarization_task_content(task_id: str):
     """Get summarization task text content for miners"""
     try:
         # Get task from database
-        task = DatabaseOperations.get_task(db_manager.get_db(), task_id)
+        task = DatabaseOperations.get_task(db_manager, task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
         
@@ -1474,7 +1540,7 @@ async def get_tts_task_content(task_id: str):
     """Get TTS task text content for miners"""
     try:
         # Get task from database
-        task = DatabaseOperations.get_task(db_manager.get_db(), task_id)
+        task = DatabaseOperations.get_task(db_manager, task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
         
@@ -1500,14 +1566,25 @@ async def get_tts_task_content(task_id: str):
         else:
             raise HTTPException(status_code=404, detail="No input content found for task")
         
+        # Get voice information for TTS
+        voice_info = None
+        if task.get('voice_name'):
+            voice_info = {
+                'voice_name': task.get('voice_name'),
+                'speaker_wav_url': task.get('speaker_wav_url'),
+                'model_id': task.get('model_id', 'tts_models/multilingual/multi-dataset/xtts_v2')
+            }
+        
         return {
             "success": True,
             "task_id": task_id,
             "text_content": text_content,
+            "voice_info": voice_info,  # Include voice information for TTS
             "task_metadata": {
                 "priority": task.get("priority"),
                 "source_language": task.get("source_language", "en"),
-                "required_miner_count": task.get("required_miner_count", 1)
+                "required_miner_count": task.get("required_miner_count", 1),
+                "model_id": task.get("model_id", "tts_models/multilingual/multi-dataset/xtts_v2")
             }
         }
         
@@ -1516,36 +1593,139 @@ async def get_tts_task_content(task_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get task content: {str(e)}")
 
+@app.get("/api/v1/miner/transcription/{task_id}")
+async def get_transcription_task_content(task_id: str, request: Request):
+    """Get transcription task audio content for miners - returns R2 URL or download URL (no base64)"""
+    try:
+        # Get task from database
+        task = DatabaseOperations.get_task(db_manager, task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        
+        if task.get('task_type') != 'transcription':
+            raise HTTPException(status_code=400, detail="Task is not a transcription task")
+        
+        # Get audio file URL from R2 Storage
+        if 'input_file' in task and task['input_file']:
+            input_file = task['input_file']
+            
+            # Check for R2 Storage (preferred method - no base64)
+            if 'file_id' in input_file and input_file.get('storage_location') == 'r2':
+                public_url = input_file.get('public_url')
+                if public_url:
+                    return {
+                        "success": True,
+                        "task_id": task_id,
+                        "audio_url": public_url,  # Direct R2 URL for download (no base64)
+                        "file_metadata": {
+                            "file_id": input_file.get('file_id'),
+                            "file_name": input_file.get('file_name', 'audio.wav'),
+                            "file_type": input_file.get('file_type', 'audio/wav'),
+                            "file_size": input_file.get('file_size', 0),
+                            "storage_location": "r2"
+                        },
+                        "task_metadata": {
+                            "priority": task.get("priority"),
+                            "source_language": task.get("source_language", "en"),
+                            "required_miner_count": task.get("required_miner_count", 1)
+                        }
+                    }
+                else:
+                    raise HTTPException(status_code=404, detail="R2 public URL not found for audio file")
+            
+            # Fallback: Handle database-stored files (old storage method)
+            elif input_file.get('storage_location') == 'database' or 'file_id' in input_file:
+                file_id = input_file.get('file_id')
+                if file_id:
+                    # Check if it's actually in R2 (might have been migrated)
+                    file_metadata = await file_manager.get_file_metadata(file_id)
+                    if file_metadata and file_metadata.get('storage_location') == 'r2':
+                        public_url = file_metadata.get('public_url')
+                        if public_url:
+                            return {
+                                "success": True,
+                                "task_id": task_id,
+                                "audio_url": public_url,
+                                "file_metadata": {
+                                    "file_id": file_id,
+                                    "file_name": input_file.get('file_name', 'audio.wav'),
+                                    "file_type": input_file.get('file_type', 'audio/wav'),
+                                    "file_size": input_file.get('file_size', 0),
+                                    "storage_location": "r2"
+                                },
+                                "task_metadata": {
+                                    "priority": task.get("priority"),
+                                    "source_language": task.get("source_language", "en"),
+                                    "required_miner_count": task.get("required_miner_count", 1)
+                                }
+                            }
+                    
+                    # Fallback: Provide download URL for database-stored files
+                    base_url = str(request.base_url).rstrip('/')
+                    download_url = f"{base_url}/api/v1/files/{file_id}/download"
+                    return {
+                        "success": True,
+                        "task_id": task_id,
+                        "audio_url": download_url,  # Download URL for database-stored files
+                        "file_metadata": {
+                            "file_id": file_id,
+                            "file_name": input_file.get('file_name', 'audio.wav'),
+                            "file_type": input_file.get('file_type', 'audio/wav'),
+                            "file_size": input_file.get('file_size', 0),
+                            "storage_location": input_file.get('storage_location', 'database')
+                        },
+                        "task_metadata": {
+                            "priority": task.get("priority"),
+                            "source_language": task.get("source_language", "en"),
+                            "required_miner_count": task.get("required_miner_count", 1)
+                        }
+                    }
+                else:
+                    raise HTTPException(status_code=404, detail="No file_id found in task input_file")
+            else:
+                raise HTTPException(status_code=404, detail="No valid audio file found in task (neither R2 nor database storage)")
+        else:
+            raise HTTPException(status_code=404, detail="No input file found for transcription task")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get transcription task content: {str(e)}")
+
 @app.get("/api/v1/miner/video-transcription/{task_id}")
 async def get_video_transcription_task_content(task_id: str):
     """Get video transcription task file content for miners"""
     try:
         # Get task from database
-        task = DatabaseOperations.get_task(db_manager.get_db(), task_id)
+        task = DatabaseOperations.get_task(db_manager, task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
         
         if task.get('task_type') != 'video_transcription':
             raise HTTPException(status_code=400, detail="Task is not a video transcription task")
         
-        # Get file content
+        # Get file metadata (miners will download from R2 URL themselves)
         if 'input_file' in task and task['input_file']:
-            file_id = task['input_file']['file_id']
-            file_content = await file_manager.get_file_content(file_id)
-            if file_content:
-                return {
-                    "success": True,
-                    "task_id": task_id,
-                    "file_content": file_content,
-                    "file_metadata": task['input_file'],
-                    "task_metadata": {
-                        "priority": task.get("priority"),
-                        "source_language": task.get("source_language", "en"),
-                        "required_miner_count": task.get("required_miner_count", 1)
-                    }
+            file_metadata = task['input_file']
+            # Ensure we have a download URL
+            if not file_metadata.get('public_url') and file_metadata.get('file_id'):
+                # Get file metadata from database to get R2 URL
+                file_info = await file_manager.get_file_metadata(file_metadata['file_id'])
+                if file_info and file_info.get('public_url'):
+                    file_metadata['public_url'] = file_info['public_url']
+                    file_metadata['r2_key'] = file_info.get('r2_key')
+            
+            return {
+                "success": True,
+                "task_id": task_id,
+                "file_metadata": file_metadata,
+                "download_url": file_metadata.get('public_url') or f"/api/v1/files/{file_metadata.get('file_id')}",
+                "task_metadata": {
+                    "priority": task.get("priority"),
+                    "source_language": task.get("source_language", "en"),
+                    "required_miner_count": task.get("required_miner_count", 1)
                 }
-            else:
-                raise HTTPException(status_code=404, detail="Video file content not found")
+            }
         else:
             raise HTTPException(status_code=404, detail="No input file found for video transcription task")
         
@@ -1559,7 +1739,7 @@ async def get_text_translation_task_content(task_id: str):
     """Get text translation task text content for miners"""
     try:
         # Get task from database
-        task = DatabaseOperations.get_task(db_manager.get_db(), task_id)
+        task = DatabaseOperations.get_task(db_manager, task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
         
@@ -1594,7 +1774,7 @@ async def get_document_translation_task_content(task_id: str):
     """Get document translation task file content for miners"""
     try:
         # Get task from database
-        task = DatabaseOperations.get_task(db_manager.get_db(), task_id)
+        task = DatabaseOperations.get_task(db_manager, task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
         
@@ -1735,20 +1915,23 @@ async def upload_tts_audio(
 
 @app.get("/api/v1/tts/audio/{file_id}")
 async def get_tts_audio(file_id: str):
-    """Serve TTS audio files from Firebase Cloud Storage"""
+    """Serve TTS audio files from R2 Storage or public URL"""
     try:
-        # Get file from Firebase Cloud Storage
-        file_content = await file_manager.download_file(file_id)
-        
-        if not file_content:
-            raise HTTPException(status_code=404, detail="Audio file not found")
-        
-        # Get file metadata
+        # Get file metadata first to check for public URL
         file_metadata = await file_manager.get_file_metadata(file_id)
         if not file_metadata:
             raise HTTPException(status_code=404, detail="Audio file metadata not found")
         
-        filename = file_metadata.get('file_name', f"{file_id}.wav")
+        # Get file from R2 Storage or use public URL if available
+        file_content = await file_manager.download_file(file_id)
+        if not file_content:
+            # If download fails but we have a public URL, return redirect
+            if file_metadata.get('public_url'):
+                from fastapi.responses import RedirectResponse
+                return RedirectResponse(url=file_metadata['public_url'], status_code=302)
+            raise HTTPException(status_code=404, detail="Audio file not found")
+        
+        filename = file_metadata.get('original_filename') or file_metadata.get('file_name', f"{file_id}.wav")
         
         # Handle Unicode filenames properly
         safe_filename = urllib.parse.quote(filename)
@@ -1770,31 +1953,19 @@ async def get_tts_audio(file_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to serve audio: {str(e)}")
 
 @app.post("/api/v1/miner/video-transcription/upload-result")
-async def upload_video_transcription_result(request: Request):
-    """Upload video transcription result from miner - accepts both JSON and Form data"""
+async def upload_video_transcription_result(
+    task_id: str = Form(...),
+    miner_uid: int = Form(...),
+    transcript: str = Form(...),
+    processing_time: float = Form(0.0),
+    accuracy_score: float = Form(0.0),
+    speed_score: float = Form(0.0),
+    confidence: float = Form(0.0),
+    language: str = Form("en")
+):
+    """Upload video transcription result from miner - accepts form data"""
     try:
-        # Try to parse as JSON first, fallback to Form
-        content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type:
-            body = await request.json()
-            task_id = body.get("task_id", "")
-            miner_uid = body.get("miner_uid", 0)
-            transcript = body.get("transcript", "")
-            processing_time = body.get("processing_time", 0.0)
-            accuracy_score = body.get("accuracy_score", 0.0)
-            speed_score = body.get("speed_score", 0.0)
-            confidence = body.get("confidence", 0.0)
-            language = body.get("language", "en")
-        else:
-            form_data = await request.form()
-            task_id = form_data.get("task_id", "")
-            miner_uid = int(form_data.get("miner_uid", 0))
-            transcript = form_data.get("transcript", "")
-            processing_time = float(form_data.get("processing_time", 0.0))
-            accuracy_score = float(form_data.get("accuracy_score", 0.0))
-            speed_score = float(form_data.get("speed_score", 0.0))
-            confidence = float(form_data.get("confidence", 0.0))
-            language = form_data.get("language", "en")
+        # All parameters come from form data
         
         # Validate required parameters
         if not task_id or task_id == "None" or task_id == "null":
@@ -1827,9 +1998,8 @@ async def upload_video_transcription_result(request: Request):
         print(f"   Language: {language}")
         
         # Check if task exists first
-        task_ref = miner_response_handler.tasks_collection.document(task_id)
-        task_doc = task_ref.get()
-        if not task_doc.exists:
+        task = DatabaseOperations.get_task(db_manager, task_id)
+        if not task:
             raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
         
         # Handle the response with miner_response_handler
@@ -1856,31 +2026,19 @@ async def upload_video_transcription_result(request: Request):
         raise HTTPException(status_code=500, detail=f"Failed to upload result: {str(e)}")
 
 @app.post("/api/v1/miner/text-translation/upload-result")
-async def upload_text_translation_result(request: Request):
-    """Upload text translation result from miner - accepts both JSON and Form data"""
+async def upload_text_translation_result(
+    task_id: str = Form(...),
+    miner_uid: int = Form(...),
+    translated_text: str = Form(...),
+    processing_time: float = Form(0.0),
+    accuracy_score: float = Form(0.0),
+    speed_score: float = Form(0.0),
+    source_language: str = Form(""),
+    target_language: str = Form("")
+):
+    """Upload text translation result from miner - accepts form data"""
     try:
-        # Try to parse as JSON first, fallback to Form
-        content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type:
-            body = await request.json()
-            task_id = body.get("task_id", "")
-            miner_uid = body.get("miner_uid", 0)
-            translated_text = body.get("translated_text", "")
-            processing_time = body.get("processing_time", 0.0)
-            accuracy_score = body.get("accuracy_score", 0.0)
-            speed_score = body.get("speed_score", 0.0)
-            source_language = body.get("source_language", "")
-            target_language = body.get("target_language", "")
-        else:
-            form_data = await request.form()
-            task_id = form_data.get("task_id", "")
-            miner_uid = int(form_data.get("miner_uid", 0))
-            translated_text = form_data.get("translated_text", "")
-            processing_time = float(form_data.get("processing_time", 0.0))
-            accuracy_score = float(form_data.get("accuracy_score", 0.0))
-            speed_score = float(form_data.get("speed_score", 0.0))
-            source_language = form_data.get("source_language", "")
-            target_language = form_data.get("target_language", "")
+        # All parameters come from form data
         
         # Validate required parameters
         if not task_id or task_id == "None" or task_id == "null":
@@ -1906,9 +2064,8 @@ async def upload_text_translation_result(request: Request):
         }
         
         # Check if task exists first
-        task_ref = miner_response_handler.tasks_collection.document(task_id)
-        task_doc = task_ref.get()
-        if not task_doc.exists:
+        task = DatabaseOperations.get_task(db_manager, task_id)
+        if not task:
             raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
         
         # Log the response submission for debugging
@@ -1941,33 +2098,20 @@ async def upload_text_translation_result(request: Request):
         raise HTTPException(status_code=500, detail=f"Failed to upload result: {str(e)}")
 
 @app.post("/api/v1/miner/document-translation/upload-result")
-async def upload_document_translation_result(request: Request):
-    """Upload document translation result from miner - accepts both JSON and Form data"""
+async def upload_document_translation_result(
+    task_id: str = Form(...),
+    miner_uid: int = Form(...),
+    translated_text: str = Form(...),
+    processing_time: float = Form(0.0),
+    accuracy_score: float = Form(0.0),
+    speed_score: float = Form(0.0),
+    source_language: str = Form(""),
+    target_language: str = Form(""),
+    metadata: str = Form("{}")
+):
+    """Upload document translation result from miner - accepts form data"""
     try:
-        # Try to parse as JSON first, fallback to Form
-        content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type:
-            body = await request.json()
-            task_id = body.get("task_id", "")
-            miner_uid = body.get("miner_uid", 0)
-            translated_text = body.get("translated_text", "")
-            processing_time = body.get("processing_time", 0.0)
-            accuracy_score = body.get("accuracy_score", 0.0)
-            speed_score = body.get("speed_score", 0.0)
-            source_language = body.get("source_language", "")
-            target_language = body.get("target_language", "")
-            metadata = body.get("metadata", "{}")
-        else:
-            form_data = await request.form()
-            task_id = form_data.get("task_id", "")
-            miner_uid = int(form_data.get("miner_uid", 0))
-            translated_text = form_data.get("translated_text", "")
-            processing_time = float(form_data.get("processing_time", 0.0))
-            accuracy_score = float(form_data.get("accuracy_score", 0.0))
-            speed_score = float(form_data.get("speed_score", 0.0))
-            source_language = form_data.get("source_language", "")
-            target_language = form_data.get("target_language", "")
-            metadata = form_data.get("metadata", "{}")
+        # All parameters come from form data
         
         # Validate required parameters
         if not task_id or task_id == "None" or task_id == "null":
@@ -2001,9 +2145,8 @@ async def upload_document_translation_result(request: Request):
         }
         
         # Check if task exists first
-        task_ref = miner_response_handler.tasks_collection.document(task_id)
-        task_doc = task_ref.get()
-        if not task_doc.exists:
+        task = DatabaseOperations.get_task(db_manager, task_id)
+        if not task:
             raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
         
         # Log the response submission for debugging
@@ -2091,29 +2234,20 @@ def require_client_auth(
 
 @app.post("/api/v1/miner/response")
 async def submit_miner_response(
-    request: Request,
+    task_id: str = Form(...),
+    miner_uid: int = Form(...),
+    response_data: str = Form(...),
+    processing_time: float = Form(0.0),
+    accuracy_score: float = Form(0.0),
+    speed_score: float = Form(0.0),
+    hotkey: Optional[str] = Form(None),
+    coldkey_address: Optional[str] = Form(None),
+    network: Optional[str] = Form(None),
     user_info: dict = Depends(require_miner_auth)
 ):
-    """Submit miner response for a task - accepts both JSON and Form data"""
+    """Submit miner response for a task - accepts form data"""
     try:
-        # Try to parse as JSON first, fallback to Form
-        content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type:
-            body = await request.json()
-            task_id = body.get("task_id", "")
-            miner_uid = body.get("miner_uid", 0)
-            response_data = body.get("response_data", body.get("response", ""))
-            processing_time = body.get("processing_time", 0.0)
-            accuracy_score = body.get("accuracy_score", 0.0)
-            speed_score = body.get("speed_score", 0.0)
-        else:
-            form_data = await request.form()
-            task_id = form_data.get("task_id", "")
-            miner_uid = int(form_data.get("miner_uid", 0))
-            response_data = form_data.get("response_data", form_data.get("response", ""))
-            processing_time = float(form_data.get("processing_time", 0.0))
-            accuracy_score = float(form_data.get("accuracy_score", 0.0))
-            speed_score = float(form_data.get("speed_score", 0.0))
+        # All parameters come from form data
         
         # Validate required parameters
         if not task_id or task_id == "None" or task_id == "null":
@@ -2122,18 +2256,10 @@ async def submit_miner_response(
         if not miner_uid or miner_uid <= 0:
             raise HTTPException(status_code=400, detail="Invalid miner_uid provided")
         
-        # Extract miner credentials from request if provided (for validation)
-        miner_hotkey = None
-        miner_coldkey = None
-        miner_network = None
-        if "application/json" in content_type:
-            miner_hotkey = body.get("hotkey")
-            miner_coldkey = body.get("coldkey_address")
-            miner_network = body.get("network")
-        else:
-            miner_hotkey = form_data.get("hotkey")
-            miner_coldkey = form_data.get("coldkey_address")
-            miner_network = form_data.get("network")
+        # Extract miner credentials from form (for validation)
+        miner_hotkey = hotkey
+        miner_coldkey = coldkey_address
+        miner_network = network
         
         # If credentials provided, verify they match the API key
         if miner_hotkey and miner_coldkey and miner_network:
@@ -2171,9 +2297,8 @@ async def submit_miner_response(
         }
         
         # Check if task exists first
-        task_ref = miner_response_handler.tasks_collection.document(task_id)
-        task_doc = task_ref.get()
-        if not task_doc.exists:
+        task = DatabaseOperations.get_task(db_manager, task_id)
+        if not task:
             raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
         
         # Log the response submission for debugging
@@ -2373,41 +2498,209 @@ async def get_tasks_for_validator(
         print(f"❌ Error in get_tasks_for_validator: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get tasks: {str(e)}")
 
-@app.post("/api/v1/validator/evaluation")
-async def submit_validator_evaluation(
-    request: Request,
+@app.get("/api/v1/miners/{miner_uid}/metrics")
+async def get_miner_metrics_endpoint(
+    miner_uid: int,
+    hotkey: str = None,
     user_info: dict = Depends(require_validator_auth)
 ):
-    """Submit validator evaluation and rewards - accepts both JSON and Form data"""
+    """
+    Get centralized miner metrics for a specific miner.
+    This is the SINGLE SOURCE OF TRUTH for all validators.
+    All validators should use this endpoint to get the same metrics.
+    """
     try:
-        # Try to parse as JSON first, fallback to Form
-        content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type:
-            body = await request.json()
-            task_id = body.get("task_id", "")
-            validator_uid = body.get("validator_uid", 0)
-            evaluation_dict = body.get("evaluation_data", body)
-        else:
-            form_data = await request.form()
-            task_id = form_data.get("task_id", "")
-            validator_uid = int(form_data.get("validator_uid", 0))
-            evaluation_data_str = form_data.get("evaluation_data", "{}")
-            # Parse evaluation JSON
-            evaluation_dict = json.loads(evaluation_data_str)
+        if not miner_metrics_api:
+            raise HTTPException(status_code=500, detail="Miner metrics API not initialized")
         
-        # Extract validator credentials from request if provided (for validation)
-        validator_hotkey = None
-        validator_coldkey = None
-        validator_network = None
-        if "application/json" in content_type:
-            validator_hotkey = body.get("hotkey")
-            validator_coldkey = body.get("coldkey_address")
-            validator_network = body.get("network")
+        metrics = await miner_metrics_api.get_miner_metrics(miner_uid, hotkey)
+        
+        if not metrics:
+            return {
+                "success": False,
+                "message": f"No metrics found for miner {miner_uid}",
+                "metrics": None
+            }
+        
+        return {
+            "success": True,
+            "metrics": metrics
+        }
+    except Exception as e:
+        print(f"❌ Error getting miner metrics: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get miner metrics: {str(e)}")
+
+@app.get("/api/v1/miners/metrics/all")
+async def get_all_miner_metrics_endpoint(
+    user_info: dict = Depends(require_validator_auth)
+):
+    """
+    Get metrics for all miners.
+    This allows validators to fetch all metrics at once for reward calculation.
+    """
+    try:
+        if not miner_metrics_api:
+            raise HTTPException(status_code=500, detail="Miner metrics API not initialized")
+        
+        all_metrics = await miner_metrics_api.get_all_miner_metrics()
+        
+        return {
+            "success": True,
+            "count": len(all_metrics),
+            "metrics": all_metrics
+        }
+    except Exception as e:
+        print(f"❌ Error getting all miner metrics: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get all miner metrics: {str(e)}")
+
+@app.post("/api/v1/validators/mark-task-seen")
+async def mark_task_as_seen_by_validator(
+    task_id: str = Form(...),
+    validator_uid: int = Form(...),
+    validator_identifier: str = Form(...),
+    evaluated_at: str = Form(...),
+    user_info: dict = Depends(require_validator_auth)
+):
+    """Mark a task as seen/evaluated by a validator to prevent duplicate rewards"""
+    try:
+        from database.postgresql_adapter import PostgreSQLAdapter
+        db = db_manager.get_db()
+        
+        if not isinstance(db, PostgreSQLAdapter):
+            raise HTTPException(status_code=500, detail="Database adapter not supported")
+        
+        # Get current task
+        task = db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+        
+        # Get current validators_seen list
+        validators_seen = task.get('validators_seen', [])
+        validators_seen_timestamps = task.get('validators_seen_timestamps', {})
+        
+        # Add validator if not already present
+        if validator_identifier not in validators_seen:
+            validators_seen.append(validator_identifier)
+            validators_seen_timestamps[validator_identifier] = evaluated_at
+            
+            # Update task in database
+            db.update_task(task_id, {
+                'validators_seen': validators_seen,
+                'validators_seen_timestamps': validators_seen_timestamps
+            })
+            
+            print(f"✅ Task {task_id} marked as seen by validator {validator_identifier}")
+            return {
+                "success": True,
+                "message": f"Task {task_id} marked as seen by validator {validator_identifier}",
+                "validators_seen": validators_seen
+            }
         else:
-            form_data = await request.form()
-            validator_hotkey = form_data.get("hotkey")
-            validator_coldkey = form_data.get("coldkey_address")
-            validator_network = form_data.get("network")
+            print(f"ℹ️  Task {task_id} already seen by validator {validator_identifier}")
+            return {
+                "success": True,
+                "message": f"Task {task_id} already seen by validator {validator_identifier}",
+                "validators_seen": validators_seen
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error marking task as seen: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to mark task as seen: {str(e)}")
+
+@app.get("/api/v1/validator/{validator_uid}/evaluated_tasks")
+async def get_validator_evaluated_tasks(
+    validator_uid: int,
+    validator_identifier: str = None,
+    user_info: dict = Depends(require_validator_auth)
+):
+    """Get list of task IDs that have been evaluated by a specific validator"""
+    try:
+        from database.postgresql_adapter import PostgreSQLAdapter
+        from database.postgresql_schema import Task
+        from sqlalchemy import text
+        
+        db = db_manager.get_db()
+        
+        if not isinstance(db, PostgreSQLAdapter):
+            raise HTTPException(status_code=500, detail="Database adapter not supported")
+        
+        # If validator_identifier is not provided, construct it to match validator's format
+        # The validator uses "validator_{uid}" format when marking tasks
+        if validator_identifier is None:
+            # Try to get from user_info if available (hotkey)
+            hotkey = user_info.get('hotkey') if user_info else None
+            if hotkey:
+                # Validator might use hotkey-based identifier in some cases
+                validator_identifier = f"validator_{hotkey}"
+            else:
+                # Default: use UID-based identifier (matches validator's mark_task_as_validator_evaluated)
+                validator_identifier = f"validator_{validator_uid}"
+        
+        print(f"🔍 Getting evaluated tasks for validator {validator_uid} (identifier: {validator_identifier})")
+        
+        # Query tasks where this validator is in validators_seen
+        session = db._get_session()
+        try:
+            # Use SQLAlchemy's native JSONB operators for efficient querying
+            from sqlalchemy import or_, cast
+            from sqlalchemy.dialects.postgresql import JSONB
+            
+            # Create JSONB arrays for the contains operator (@>)
+            # The @> operator checks if the left JSONB value contains the right JSONB value
+            validator_array = [validator_identifier]
+            uid_array = [str(validator_uid)]
+            
+            # Use native SQLAlchemy JSONB operators - no raw SQL needed
+            query = session.query(Task.task_id).filter(
+                or_(
+                    Task.validators_seen.op('@>')(cast(validator_array, JSONB)),
+                    Task.validators_seen.op('@>')(cast(uid_array, JSONB))
+                )
+            )
+            
+            task_ids = [str(task_id) for task_id, in query.all()]
+            
+            print(f"✅ Found {len(task_ids)} evaluated tasks for validator {validator_uid}")
+            
+            return {
+                "success": True,
+                "evaluated_tasks": task_ids,
+                "count": len(task_ids)
+            }
+        finally:
+            session.close()
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error getting evaluated tasks: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to get evaluated tasks: {str(e)}")
+
+@app.post("/api/v1/validator/evaluation")
+async def submit_validator_evaluation(
+    task_id: str = Form(...),
+    validator_uid: int = Form(...),
+    evaluation_data: str = Form("{}"),
+    hotkey: Optional[str] = Form(None),
+    coldkey_address: Optional[str] = Form(None),
+    network: Optional[str] = Form(None),
+    user_info: dict = Depends(require_validator_auth)
+):
+    """Submit validator evaluation and rewards - accepts form data"""
+    try:
+        # All parameters come from form data
+        import json
+        # Parse evaluation JSON
+        evaluation_dict = json.loads(evaluation_data)
+        
+        # Extract validator credentials from form (for validation)
+        validator_hotkey = hotkey
+        validator_coldkey = coldkey_address
+        validator_network = network
         
         # If credentials provided, verify they match the API key
         if validator_hotkey and validator_coldkey and validator_network:
@@ -2461,13 +2754,10 @@ async def get_task_status(task_id: str):
         system_metrics.increment_database_operations()
         
         # Get task from database using enhanced operations
-        task_ref = db_manager.get_db().collection(COLLECTIONS['tasks']).document(task_id)
-        task_doc = task_ref.get()
+        task_data = DatabaseOperations.get_task(db_manager, task_id)
         
-        if not task_doc.exists:
+        if not task_data:
             raise HTTPException(status_code=404, detail="Task not found")
-        
-        task_data = task_doc.to_dict()
         
         # Format response
         task_status = {
@@ -2563,9 +2853,19 @@ async def api_health_check():
         try:
             if 'db_manager' in globals() and db_manager:
                 # Try a simple database operation
-                test_collection = db_manager.get_db().collection('health_check')
-                # Just check if we can access the database
-                db_healthy = True
+                from database.postgresql_adapter import PostgreSQLAdapter
+                if isinstance(db_manager, PostgreSQLAdapter):
+                    # PostgreSQL: Test connection
+                    try:
+                        session = db_manager._get_session()
+                        session.close()
+                        db_healthy = True
+                    except:
+                        db_healthy = False
+                else:
+                    # Firestore (legacy)
+                    test_collection = db_manager.get_db().collection('health_check')
+                    db_healthy = True
             else:
                 db_healthy = False
                 db_errors.append("Database manager not initialized")
@@ -2707,24 +3007,30 @@ async def get_file_stats():
 
 @app.get("/api/v1/files/{file_id}")
 async def serve_file(file_id: str):
-    """Serve files from Firebase Cloud Storage"""
+    """Serve files from R2 Storage"""
     try:
         # Validate file_id parameter
         if not file_id or file_id == "None" or file_id == "null":
             raise HTTPException(status_code=400, detail="Invalid file ID provided")
         
-        # Get file from Firebase Cloud Storage
-        file_content = await file_manager.download_file(file_id)
-        if not file_content:
-            raise HTTPException(status_code=404, detail=f"File not found: {file_id}")
-        
-        # Get file metadata
+        # Get file metadata first to check for public URL
         file_metadata = await file_manager.get_file_metadata(file_id)
         if not file_metadata:
             raise HTTPException(status_code=404, detail=f"File metadata not found: {file_id}")
         
+        # Get file from R2 Storage or use public URL if available
+        file_content = await file_manager.download_file(file_id)
+        if not file_content:
+            # If download fails but we have a public URL, return redirect
+            if file_metadata.get('public_url'):
+                from fastapi.responses import RedirectResponse
+                return RedirectResponse(url=file_metadata['public_url'], status_code=302)
+            raise HTTPException(status_code=404, detail=f"File not found: {file_id}")
+        if not file_metadata:
+            raise HTTPException(status_code=404, detail=f"File metadata not found: {file_id}")
+        
         # Handle Unicode filenames properly
-        filename = file_metadata['file_name']
+        filename = file_metadata.get('original_filename') or file_metadata.get('file_name', f"{file_id}")
         
         # Create a safe filename for Content-Disposition header
         import urllib.parse
@@ -2733,7 +3039,7 @@ async def serve_file(file_id: str):
         # Return file with appropriate headers
         return StreamingResponse(
             iter([file_content]),
-            media_type=file_metadata['content_type'],
+            media_type=file_metadata.get('content_type', 'application/octet-stream'),
             headers={
                 "Content-Disposition": f"attachment; filename*=UTF-8''{safe_filename}",
                 "Cache-Control": "no-cache"
@@ -2756,15 +3062,7 @@ async def download_file(file_id: str):
                 detail="Invalid file ID provided. File ID cannot be None or null."
             )
         
-        # Get file from Firebase Cloud Storage
-        file_content = await file_manager.download_file(file_id)
-        if not file_content:
-            raise HTTPException(
-                status_code=404, 
-                detail=f"File not found in Firebase Cloud Storage for ID: {file_id}"
-            )
-        
-        # Get file metadata
+        # Get file metadata first to check for public URL
         file_metadata = await file_manager.get_file_metadata(file_id)
         if not file_metadata:
             raise HTTPException(
@@ -2772,11 +3070,23 @@ async def download_file(file_id: str):
                 detail=f"File metadata not found for ID: {file_id}"
             )
         
+        # Get file from R2 Storage or use public URL if available
+        file_content = await file_manager.download_file(file_id)
+        if not file_content:
+            # If download fails but we have a public URL, return redirect
+            if file_metadata.get('public_url'):
+                from fastapi.responses import RedirectResponse
+                return RedirectResponse(url=file_metadata['public_url'], status_code=302)
+            raise HTTPException(
+                status_code=404, 
+                detail=f"File not found in R2 Storage for ID: {file_id}"
+            )
+        
         # Determine content type for proper headers
         content_type = file_metadata.get('content_type', 'application/octet-stream')
         
         # Handle Unicode filenames properly
-        filename = file_metadata['file_name']
+        filename = file_metadata.get('original_filename') or file_metadata.get('file_name', f"{file_id}")
         
         # Create a safe filename for Content-Disposition header
         import urllib.parse
@@ -2818,6 +3128,285 @@ async def list_files_by_type(file_type: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list files: {str(e)}")
+
+# ============================================================================
+# Voice Management Endpoints
+# ============================================================================
+
+@app.get("/api/v1/voices")
+async def list_voices(user_info: dict = Depends(require_client_auth)):
+    """List all available voices"""
+    try:
+        from database.postgresql_schema import Voice
+        session = db_manager._get_session()
+        try:
+            voices = session.query(Voice).all()
+            voice_list = []
+            for voice in voices:
+                voice_list.append({
+                    "voice_name": voice.voice_name,
+                    "display_name": voice.display_name,
+                    "language": voice.language,
+                    "public_url": voice.public_url,
+                    "file_name": voice.file_name,
+                    "file_size": voice.file_size,
+                    "file_type": voice.file_type,
+                    "created_at": voice.created_at.isoformat() if voice.created_at else None,
+                    "updated_at": voice.updated_at.isoformat() if voice.updated_at else None
+                })
+            return {
+                "success": True,
+                "count": len(voice_list),
+                "voices": voice_list
+            }
+        finally:
+            session.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list voices: {str(e)}")
+
+@app.post("/api/v1/voices")
+async def add_voice(
+    voice_name: str = Form(...),
+    display_name: str = Form(...),
+    language: str = Form("en"),
+    audio_file: UploadFile = File(...),
+    user_info: dict = Depends(require_client_auth)
+):
+    """Add a new voice for TTS voice cloning"""
+    try:
+        from database.postgresql_schema import Voice
+        
+        # Validate voice_name (must be unique)
+        session = db_manager._get_session()
+        try:
+            existing_voice = session.query(Voice).filter(Voice.voice_name == voice_name).first()
+            if existing_voice:
+                raise HTTPException(status_code=400, detail=f"Voice '{voice_name}' already exists")
+        finally:
+            session.close()
+        
+        # Validate audio file
+        if not audio_file.filename:
+            raise HTTPException(status_code=400, detail="Audio file is required")
+        
+        # Check file extension
+        file_ext = os.path.splitext(audio_file.filename)[1].lower()
+        if file_ext not in ['.wav', '.mp3', '.flac', '.ogg']:
+            raise HTTPException(status_code=400, detail="Audio file must be .wav, .mp3, .flac, or .ogg")
+        
+        # Read audio file
+        audio_data = await audio_file.read()
+        if len(audio_data) == 0:
+            raise HTTPException(status_code=400, detail="Audio file is empty")
+        
+        # Upload audio file to R2 storage
+        safe_filename = create_safe_filename(audio_file.filename)
+        file_id = await file_manager.upload_file(
+            audio_data,
+            safe_filename,
+            audio_file.content_type or "audio/wav",
+            file_type="tts_speaker"
+        )
+        
+        # Get file metadata to retrieve public URL
+        file_metadata = await file_manager.get_file_metadata(file_id)
+        if not file_metadata:
+            raise HTTPException(status_code=500, detail="Failed to retrieve file metadata after upload")
+        
+        public_url = file_metadata.get('public_url')
+        if not public_url:
+            raise HTTPException(status_code=500, detail="File uploaded but no public URL available")
+        
+        # Create voice record in database
+        session = db_manager._get_session()
+        try:
+            voice = Voice(
+                voice_name=voice_name,
+                display_name=display_name,
+                language=language,
+                file_id=file_id,
+                r2_key=file_metadata.get('r2_key'),
+                public_url=public_url,
+                file_name=safe_filename,
+                file_size=len(audio_data),
+                file_type=audio_file.content_type or "audio/wav"
+            )
+            session.add(voice)
+            session.commit()
+            
+            print(f"✅ Voice '{voice_name}' added successfully")
+            return {
+                "success": True,
+                "message": f"Voice '{voice_name}' added successfully",
+                "voice": {
+                    "voice_name": voice.voice_name,
+                    "display_name": voice.display_name,
+                    "language": voice.language,
+                    "public_url": voice.public_url,
+                    "file_id": str(file_id),
+                    "file_size": voice.file_size
+                }
+            }
+        except Exception as e:
+            session.rollback()
+            raise HTTPException(status_code=500, detail=f"Failed to create voice record: {str(e)}")
+        finally:
+            session.close()
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to add voice: {str(e)}")
+
+@app.put("/api/v1/voices/{voice_name}")
+async def update_voice(
+    voice_name: str,
+    display_name: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
+    audio_file: Optional[UploadFile] = File(None),
+    user_info: dict = Depends(require_client_auth)
+):
+    """Update an existing voice"""
+    try:
+        from database.postgresql_schema import Voice
+        
+        session = db_manager._get_session()
+        try:
+            voice = session.query(Voice).filter(Voice.voice_name == voice_name).first()
+            if not voice:
+                raise HTTPException(status_code=404, detail=f"Voice '{voice_name}' not found")
+            
+            # Update display_name if provided
+            if display_name is not None:
+                voice.display_name = display_name
+            
+            # Update language if provided
+            if language is not None:
+                voice.language = language
+            
+            # Update audio file if provided
+            if audio_file is not None:
+                # Validate audio file
+                if not audio_file.filename:
+                    raise HTTPException(status_code=400, detail="Audio file is required")
+                
+                # Check file extension
+                file_ext = os.path.splitext(audio_file.filename)[1].lower()
+                if file_ext not in ['.wav', '.mp3', '.flac', '.ogg']:
+                    raise HTTPException(status_code=400, detail="Audio file must be .wav, .mp3, .flac, or .ogg")
+                
+                # Read audio file
+                audio_data = await audio_file.read()
+                if len(audio_data) == 0:
+                    raise HTTPException(status_code=400, detail="Audio file is empty")
+                
+                # Delete old file if it exists
+                if voice.file_id:
+                    try:
+                        await file_manager.delete_file(voice.file_id)
+                    except:
+                        pass  # Ignore errors when deleting old file
+                
+                # Upload new audio file to R2 storage
+                safe_filename = create_safe_filename(audio_file.filename)
+                file_id = await file_manager.upload_file(
+                    audio_data,
+                    safe_filename,
+                    audio_file.content_type or "audio/wav",
+                    file_type="tts_speaker"
+                )
+                
+                # Get file metadata to retrieve public URL
+                file_metadata = await file_manager.get_file_metadata(file_id)
+                if not file_metadata:
+                    raise HTTPException(status_code=500, detail="Failed to retrieve file metadata after upload")
+                
+                public_url = file_metadata.get('public_url')
+                if not public_url:
+                    raise HTTPException(status_code=500, detail="File uploaded but no public URL available")
+                
+                # Update voice record
+                voice.file_id = file_id
+                voice.r2_key = file_metadata.get('r2_key')
+                voice.public_url = public_url
+                voice.file_name = safe_filename
+                voice.file_size = len(audio_data)
+                voice.file_type = audio_file.content_type or "audio/wav"
+            
+            voice.updated_at = datetime.utcnow()
+            session.commit()
+            
+            print(f"✅ Voice '{voice_name}' updated successfully")
+            return {
+                "success": True,
+                "message": f"Voice '{voice_name}' updated successfully",
+                "voice": {
+                    "voice_name": voice.voice_name,
+                    "display_name": voice.display_name,
+                    "language": voice.language,
+                    "public_url": voice.public_url,
+                    "file_id": str(voice.file_id) if voice.file_id else None,
+                    "file_size": voice.file_size
+                }
+            }
+        except HTTPException:
+            session.rollback()
+            raise
+        except Exception as e:
+            session.rollback()
+            raise HTTPException(status_code=500, detail=f"Failed to update voice: {str(e)}")
+        finally:
+            session.close()
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update voice: {str(e)}")
+
+@app.delete("/api/v1/voices/{voice_name}")
+async def delete_voice(
+    voice_name: str,
+    user_info: dict = Depends(require_client_auth)
+):
+    """Delete a voice"""
+    try:
+        from database.postgresql_schema import Voice
+        
+        session = db_manager._get_session()
+        try:
+            voice = session.query(Voice).filter(Voice.voice_name == voice_name).first()
+            if not voice:
+                raise HTTPException(status_code=404, detail=f"Voice '{voice_name}' not found")
+            
+            # Delete associated file from R2 storage
+            if voice.file_id:
+                try:
+                    await file_manager.delete_file(voice.file_id)
+                except Exception as e:
+                    print(f"⚠️ Warning: Failed to delete file {voice.file_id}: {e}")
+            
+            # Delete voice record
+            session.delete(voice)
+            session.commit()
+            
+            print(f"✅ Voice '{voice_name}' deleted successfully")
+            return {
+                "success": True,
+                "message": f"Voice '{voice_name}' deleted successfully"
+            }
+        except HTTPException:
+            session.rollback()
+            raise
+        except Exception as e:
+            session.rollback()
+            raise HTTPException(status_code=500, detail=f"Failed to delete voice: {str(e)}")
+        finally:
+            session.close()
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete voice: {str(e)}")
 
 @app.get("/api/v1/transcription/{task_id}/result")
 async def get_transcription_result(task_id: str):
@@ -3136,22 +3725,41 @@ async def get_miner_performance():
     """Get comprehensive miner performance metrics"""
     try:
         # Get all completed tasks
-        tasks_collection = workflow_orchestrator.db.collection('tasks')
-        completed_tasks = tasks_collection.where('status', 'in', ['done', 'approved']).stream()
+        from database.postgresql_adapter import PostgreSQLAdapter
+        from database.postgresql_schema import Task, TaskStatusEnum
         
+        is_postgresql = isinstance(workflow_orchestrator.db, PostgreSQLAdapter)
         miner_stats = {}
         
-        for task_doc in completed_tasks:
-            task = task_doc.to_dict()
-            task_id = task['task_id']
+        if is_postgresql:
+            # PostgreSQL: Get completed tasks
+            session = workflow_orchestrator.db._get_session()
+            try:
+                completed_tasks = session.query(Task).filter(
+                    Task.status.in_([TaskStatusEnum.COMPLETED, TaskStatusEnum.APPROVED])
+                ).all()
+                tasks = [workflow_orchestrator.db._task_to_dict(t) for t in completed_tasks]
+            finally:
+                session.close()
+        else:
+            # Firestore (legacy)
+            tasks_collection = workflow_orchestrator.db.collection('tasks')
+            completed_tasks = tasks_collection.where('status', 'in', ['done', 'approved']).stream()
+            tasks = [doc.to_dict() for doc in completed_tasks]
+        
+        for task in tasks:
+            task_id = task.get('task_id')
+            if not task_id:
+                continue
             
             # Get miner responses for this task
-            responses_collection = workflow_orchestrator.db.collection('miner_responses')
-            responses = responses_collection.where('task_id', '==', task_id).stream()
+            miner_responses = task.get('miner_responses', [])
             
-            for response_doc in responses:
-                response = response_doc.to_dict()
-                miner_uid = response['miner_uid']
+            for response in miner_responses:
+                if isinstance(response, dict):
+                    miner_uid = response.get('miner_uid')
+                    if not miner_uid:
+                        continue
                 
                 if miner_uid not in miner_stats:
                     miner_stats[miner_uid] = {
@@ -3261,7 +3869,7 @@ async def get_miner_tasks(
             # Still allow the request but log the warning
         
         # Use enhanced database operations with proper filtering
-        tasks = DatabaseOperations.get_miner_tasks(db_manager.get_db(), miner_uid, status)
+        tasks = DatabaseOperations.get_miner_tasks(db_manager, miner_uid, status)
         
         # Log what we found
         print(f"📋 Found {len(tasks)} tasks for miner {miner_uid} with status '{status}'")
@@ -3300,13 +3908,10 @@ async def get_task_responses(task_id: str):
         print(f"🔍 Getting filtered task responses for task: {task_id}")
         
         # Get task from database
-        task_ref = db_manager.get_db().collection('tasks').document(task_id)
-        task_doc = task_ref.get()
+        task_data = DatabaseOperations.get_task(db_manager, task_id)
         
-        if not task_doc.exists:
+        if not task_data:
             raise HTTPException(status_code=404, detail="Task not found")
-        
-        task_data = task_doc.to_dict()
         
         # Extract best response
         best_response = task_data.get('best_response', {})
@@ -3370,13 +3975,22 @@ async def get_completed_tasks():
         print(f"🔍 Getting completed tasks for validator evaluation")
         
         # Get all completed tasks from database
-        tasks_ref = db_manager.get_db().collection('tasks')
-        completed_tasks = tasks_ref.where('status', '==', 'completed').stream()
+        # Note: get_tasks_by_status returns dictionaries for PostgreSQL, Firestore documents for Firestore
+        completed_tasks = DatabaseOperations.get_tasks_by_status(db_manager, TaskStatus.COMPLETED, limit=100)
         
         tasks = []
         for task_doc in completed_tasks:
-            task_data = task_doc.to_dict()
-            task_data['task_id'] = task_doc.id
+            # Handle both PostgreSQL (dict) and Firestore (document) cases
+            if isinstance(task_doc, dict):
+                # Already a dictionary (PostgreSQL)
+                task_data = task_doc.copy()
+                # Ensure task_id is present
+                if 'task_id' not in task_data:
+                    task_data['task_id'] = task_data.get('id', 'unknown')
+            else:
+                # Firestore document - convert to dict
+                task_data = task_doc.to_dict()
+                task_data['task_id'] = task_doc.id
             
             # Ensure miner_responses is included for evaluation
             if 'miner_responses' not in task_data:
@@ -3389,6 +4003,8 @@ async def get_completed_tasks():
         
     except Exception as e:
         print(f"❌ Error getting completed tasks: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to get completed tasks: {str(e)}")
 
 @app.post("/api/v1/miners/register")
@@ -3416,7 +4032,7 @@ async def register_miner(
         }
         
         # Register miner in database
-        success = DatabaseOperations.register_miner(db_manager.get_db(), miner_data)
+        success = DatabaseOperations.register_miner(db_manager, miner_data)
         
         if success:
             print(f"✅ Miner {uid} registered successfully")
@@ -3443,22 +4059,39 @@ async def get_miners(
         print(f"🔍 GET /api/v1/miners - Fetching active miners from miner_status collection")
         
         # Query miner_status collection (where validators send active miners)
-        db = db_manager.get_db()
-        miner_status_collection = db.collection('miner_status')
-        docs = miner_status_collection.stream()
+        from database.postgresql_adapter import PostgreSQLAdapter
+        from database.postgresql_schema import MinerStatus
         
+        is_postgresql = isinstance(db_manager, PostgreSQLAdapter)
         current_time = datetime.utcnow()
         miner_timeout = 900  # 15 minutes - same as network-status endpoint
         
         miners = []
         stale_count = 0
         
+        if is_postgresql:
+            # PostgreSQL: Query miner status
+            session = db_manager._get_session()
+            try:
+                miner_statuses = session.query(MinerStatus).all()
+                docs = [db_manager._miner_status_to_dict(m) for m in miner_statuses]
+            finally:
+                session.close()
+        else:
+            # Firestore (legacy)
+            db = db_manager.get_db()
+            miner_status_collection = db.collection('miner_status')
+            docs = miner_status_collection.stream()
+        
         for doc in docs:
             try:
-                miner_data = doc.to_dict()
-                
-                # CRITICAL: Add miner_id from document ID
-                miner_data['miner_id'] = doc.id
+                if is_postgresql:
+                    miner_data = doc  # Already a dict
+                    miner_data['miner_id'] = str(miner_data.get('uid', ''))
+                else:
+                    miner_data = doc.to_dict()
+                    # CRITICAL: Add miner_id from document ID
+                    miner_data['miner_id'] = doc.id
                 
                 # Ensure uid is present
                 if 'uid' not in miner_data:
@@ -3550,36 +4183,57 @@ async def get_all_tasks(
         
         # Query ALL tasks directly instead of filtering by status
         # This is more reliable and catches tasks with any status value
-        db = db_manager.get_db()
-        tasks_collection = db.collection(COLLECTIONS.get('tasks', 'tasks'))
+        from database.postgresql_adapter import PostgreSQLAdapter
+        from database.postgresql_schema import Task
         
-        # Get all tasks (limit to 1000 to avoid timeout)
-        docs = tasks_collection.limit(1000).stream()
-        
+        is_postgresql = isinstance(db_manager, PostgreSQLAdapter)
         all_tasks = []
         status_counts = {}
         error_count = 0
         
-        for doc in docs:
+        if is_postgresql:
+            # PostgreSQL: Get all tasks
+            session = db_manager._get_session()
             try:
-                task_data = doc.to_dict()
-                if task_data:
-                    # CRITICAL: Add task_id from document ID (Firestore doesn't include it in to_dict())
-                    task_data['task_id'] = doc.id
-                    all_tasks.append(task_data)
-                    
-                    # Track status distribution for debugging
-                    task_status = task_data.get('status', 'unknown')
-                    # Handle enum status values
-                    if hasattr(task_status, 'value'):
-                        task_status = task_status.value
-                    status_counts[task_status] = status_counts.get(task_status, 0) + 1
-            except Exception as e:
-                error_count += 1
-                print(f"⚠️ Error processing task document {doc.id}: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
+                tasks = session.query(Task).limit(1000).all()
+                for task in tasks:
+                    try:
+                        task_data = db_manager._task_to_dict(task)
+                        all_tasks.append(task_data)
+                        
+                        # Track status distribution
+                        task_status = task_data.get('status', 'unknown')
+                        if hasattr(task_status, 'value'):
+                            task_status = task_status.value
+                        status_counts[task_status] = status_counts.get(task_status, 0) + 1
+                    except Exception as e:
+                        error_count += 1
+                        print(f"⚠️ Error processing task {task.task_id}: {e}")
+            finally:
+                session.close()
+        else:
+            # Firestore (legacy)
+            db = db_manager.get_db()
+            tasks_collection = db.collection(COLLECTIONS.get('tasks', 'tasks'))
+            docs = tasks_collection.limit(1000).stream()
+            
+            for doc in docs:
+                try:
+                    task_data = doc.to_dict()
+                    if task_data:
+                        task_data['task_id'] = doc.id
+                        all_tasks.append(task_data)
+                        
+                        task_status = task_data.get('status', 'unknown')
+                        if hasattr(task_status, 'value'):
+                            task_status = task_status.value
+                        status_counts[task_status] = status_counts.get(task_status, 0) + 1
+                except Exception as e:
+                    error_count += 1
+                    print(f"⚠️ Error processing task document {doc.id}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
         
         print(f"📋 Found {len(all_tasks)} total tasks in database")
         if status_counts:
@@ -3599,7 +4253,7 @@ async def get_all_tasks(
 async def get_task_by_id(task_id: str):
     """Get specific task by ID"""
     try:
-        task = DatabaseOperations.get_task(db_manager.get_db(), task_id)
+        task = DatabaseOperations.get_task(db_manager, task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
         return task
@@ -3826,22 +4480,9 @@ async def receive_miner_status_from_validator(
         print(f"📥 Received miner status from validator {validator_uid} for epoch {epoch}")
         print(f"   Miners reported: {len(miner_data)}")
         
-        # Use multi-validator manager for consensus-based processing
-        if hasattr(app.state, 'multi_validator_manager'):
-            result = await app.state.multi_validator_manager.receive_validator_report(
-                validator_uid, miner_data, epoch
-            )
-            
-            if result.get('success'):
-                print(f"   ✅ Multi-validator consensus processing completed")
-                print(f"      Miners processed: {result.get('miners_processed', 0)}")
-                print(f"      Consensus updated: {result.get('consensus_updated', 0)}")
-            else:
-                print(f"   ❌ Multi-validator processing failed: {result.get('error', 'Unknown error')}")
-        else:
-            # Fallback to legacy single-validator processing
-            print(f"   ⚠️ Multi-validator manager not available, using legacy processing")
-            result = await _legacy_miner_status_processing(validator_uid, miner_data, epoch)
+        # Simplified: Just update miner status from validator report (no consensus tracking)
+        # Validators handle consensus via weight setting, proxy just needs availability
+        result = await _legacy_miner_status_processing(validator_uid, miner_data, epoch)
         
         # Track metrics
         system_metrics.increment_database_operations()
@@ -3851,8 +4492,18 @@ async def receive_miner_status_from_validator(
     except json.JSONDecodeError as e:
         print(f"❌ Invalid JSON from validator {validator_uid}: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid JSON data: {str(e)}")
+    except ModuleNotFoundError as e:
+        print(f"❌ Missing module error processing miner status from validator {validator_uid}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Missing required module: {str(e)}. Please install python-dateutil: pip install python-dateutil"
+        )
     except Exception as e:
         print(f"❌ Error processing miner status from validator {validator_uid}: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to process miner status: {str(e)}")
 
 async def _legacy_miner_status_processing(validator_uid: int, miner_data: List[Dict], epoch: int) -> Dict[str, Any]:
@@ -3863,9 +4514,6 @@ async def _legacy_miner_status_processing(validator_uid: int, miner_data: List[D
             try:
                 miner_uid = miner_status.get('uid')
                 if miner_uid is not None:
-                    # Use the existing miner status collection
-                    miner_ref = db_manager.get_db().collection('miner_status').document(str(miner_uid))
-                    
                     # Add timestamp and validator info
                     # Convert ISO string timestamps to datetime objects if needed
                     if 'last_seen' in miner_status and isinstance(miner_status['last_seen'], str):
@@ -3873,20 +4521,44 @@ async def _legacy_miner_status_processing(validator_uid: int, miner_data: List[D
                             from dateutil import parser
                             miner_status['last_seen'] = parser.parse(miner_status['last_seen'])
                         except:
-                            miner_status['last_seen'] = datetime.now()
+                            miner_status['last_seen'] = datetime.utcnow()
                     else:
-                        miner_status['last_seen'] = datetime.now()  # Ensure last_seen is set
+                        miner_status['last_seen'] = datetime.utcnow()  # Ensure last_seen is set
                     
-                    miner_status['last_updated'] = datetime.now()
+                    miner_status['updated_at'] = datetime.utcnow()
                     miner_status['reported_by_validator'] = validator_uid
                     miner_status['epoch'] = epoch
                     
-                    # Ensure uid is set in the document
+                    # Ensure uid is set
                     if 'uid' not in miner_status:
                         miner_status['uid'] = miner_uid
                     
-                    # Store in database (use set instead of merge to ensure all fields are present)
-                    miner_ref.set(miner_status, merge=True)
+                    # Store in database
+                    from database.postgresql_adapter import PostgreSQLAdapter
+                    if isinstance(db_manager, PostgreSQLAdapter):
+                        # PostgreSQL: Update or create miner status
+                        from database.postgresql_schema import MinerStatus
+                        session = db_manager._get_session()
+                        try:
+                            existing = session.query(MinerStatus).filter(MinerStatus.uid == miner_uid).first()
+                            if existing:
+                                # Update existing
+                                for key, value in miner_status.items():
+                                    if hasattr(existing, key):
+                                        setattr(existing, key, value)
+                                existing.updated_at = datetime.utcnow()
+                            else:
+                                # Create new
+                                new_status = MinerStatus(**{k: v for k, v in miner_status.items() if hasattr(MinerStatus, k)})
+                                session.add(new_status)
+                            session.commit()
+                        finally:
+                            session.close()
+                    else:
+                        # Firestore (legacy)
+                        miner_ref = db_manager.get_db().collection('miner_status').document(str(miner_uid))
+                        miner_status['last_updated'] = datetime.utcnow()
+                        miner_ref.set(miner_status, merge=True)
                     
                     print(f"      ✅ Updated miner {miner_uid} in miner_status collection")
                     updated_count += 1
@@ -3930,17 +4602,34 @@ async def get_network_miner_status(
         from dateutil import parser
         
         # Query miner status collection
-        miner_status_collection = db_manager.get_db().collection('miner_status')
-        docs = miner_status_collection.stream()
+        from database.postgresql_adapter import PostgreSQLAdapter
+        from database.postgresql_schema import MinerStatus
         
+        is_postgresql = isinstance(db_manager, PostgreSQLAdapter)
         current_time = datetime.utcnow()
         miner_timeout = 900  # 15 minutes - same as cleanup timeout
         
         miners = []
         stale_count = 0
         
+        if is_postgresql:
+            # PostgreSQL: Query miner status
+            session = db_manager._get_session()
+            try:
+                miner_statuses = session.query(MinerStatus).all()
+                docs = [db_manager._miner_status_to_dict(m) for m in miner_statuses]
+            finally:
+                session.close()
+        else:
+            # Firestore (legacy)
+            miner_status_collection = db_manager.get_db().collection('miner_status')
+            docs = miner_status_collection.stream()
+        
         for doc in docs:
-            miner_data = doc.to_dict()
+            if is_postgresql:
+                miner_data = doc  # Already a dict
+            else:
+                miner_data = doc.to_dict()
             last_seen = miner_data.get('last_seen')
             
             # Filter out stale miners (not seen in last 15 minutes)
@@ -4093,10 +4782,222 @@ async def get_miner_consensus_status(miner_uid: int):
         raise HTTPException(status_code=500, detail=f"Failed to get miner consensus status: {str(e)}")
 
 # ============================================================================
+# ADMIN/MANAGEMENT ENDPOINTS
+# ============================================================================
+
+@app.post("/api/v1/admin/tasks/complete-stale")
+async def complete_stale_tasks(
+    user_info: dict = Depends(require_client_auth)
+):
+    """
+    Manually trigger completion of stale tasks with partial responses.
+    Tasks with at least 1 response that are > 1 hour old will be marked as completed.
+    """
+    try:
+        if not hasattr(app.state, 'workflow_orchestrator'):
+            raise HTTPException(status_code=500, detail="Workflow orchestrator not initialized")
+        
+        result = await app.state.workflow_orchestrator.handle_stale_tasks_manual()
+        
+        completed_count = result.get('completed_count', 0)
+        failed_count = result.get('failed_count', 0)
+        total_processed = completed_count + failed_count
+        
+        return {
+            "success": result.get('success', False),
+            "message": f"Processed {total_processed} stale tasks: {completed_count} completed, {failed_count} failed",
+            "statistics": {
+                "completed_count": completed_count,
+                "failed_count": failed_count,
+                "skipped_count": result.get('skipped_count', 0),
+                "total_checked": result.get('total_checked', 0),
+                "completed_task_ids": result.get('completed_task_ids', []),
+                "failed_task_ids": result.get('failed_task_ids', [])
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error completing stale tasks: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to complete stale tasks: {str(e)}")
+
+@app.get("/api/v1/admin/tasks/stale-stats")
+async def get_stale_tasks_stats(
+    user_info: dict = Depends(require_client_auth)  # Use client auth for now, can be changed to admin
+):
+    """
+    Get statistics about stale tasks (assigned tasks > 1 hour old with partial responses).
+    """
+    try:
+        from database.postgresql_schema import Task, TaskStatusEnum
+        from datetime import timedelta
+        
+        one_hour_ago = datetime.now() - timedelta(hours=1)
+        session = db_manager._get_session()
+        
+        try:
+            # Get stale assigned tasks
+            stale_assigned_tasks = session.query(Task).filter(
+                Task.status == TaskStatusEnum.ASSIGNED,
+                Task.created_at < one_hour_ago
+            ).all()
+            
+            # Get stale pending tasks (never assigned)
+            stale_pending_tasks = session.query(Task).filter(
+                Task.status == TaskStatusEnum.PENDING,
+                Task.created_at < one_hour_ago
+            ).all()
+            
+            stats = {
+                'total_stale_assigned_tasks': len(stale_assigned_tasks),
+                'total_stale_pending_tasks': len(stale_pending_tasks),
+                'total_stale_tasks': len(stale_assigned_tasks) + len(stale_pending_tasks),
+                'assigned_tasks_with_responses': 0,
+                'assigned_tasks_without_responses': 0,
+                'total_responses': 0,
+                'oldest_task_age_hours': 0,
+                'newest_task_age_hours': 0
+            }
+            
+            all_stale_tasks = stale_assigned_tasks + stale_pending_tasks
+            
+            if all_stale_tasks:
+                oldest_task = min(all_stale_tasks, key=lambda t: t.created_at)
+                newest_task = max(all_stale_tasks, key=lambda t: t.created_at)
+                
+                oldest_age = (datetime.now() - oldest_task.created_at).total_seconds() / 3600
+                newest_age = (datetime.now() - newest_task.created_at).total_seconds() / 3600
+                
+                stats['oldest_task_age_hours'] = round(oldest_age, 2)
+                stats['newest_task_age_hours'] = round(newest_age, 2)
+                
+                # Process assigned tasks
+                for task in stale_assigned_tasks:
+                    miner_responses = task.miner_responses if hasattr(task, 'miner_responses') else []
+                    if isinstance(miner_responses, str):
+                        import json
+                        try:
+                            miner_responses = json.loads(miner_responses)
+                        except:
+                            miner_responses = []
+                    response_count = len(miner_responses) if isinstance(miner_responses, list) else 0
+                    
+                    if response_count >= 1:
+                        stats['assigned_tasks_with_responses'] += 1
+                        stats['total_responses'] += response_count
+                    else:
+                        stats['assigned_tasks_without_responses'] += 1
+            
+            return {
+                "success": True,
+                "statistics": stats,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+        finally:
+            session.close()
+            
+    except Exception as e:
+        print(f"❌ Error getting stale tasks stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get stale tasks stats: {str(e)}")
+
+# ============================================================================
+# LEADERBOARD ENDPOINTS
+# ============================================================================
+
+@app.get("/api/v1/leaderboard")
+async def get_leaderboard(
+    limit: int = 100,
+    sort_by: str = "overall_score",
+    order: str = "desc",
+    user_info: dict = Depends(require_client_auth)
+):
+    """
+    Get comprehensive miner leaderboard with all metrics.
+    
+    Query Parameters:
+    - limit: Maximum number of miners to return (default: 100)
+    - sort_by: Field to sort by (default: overall_score)
+        Options: overall_score, uptime_score, invocation_count, diversity_count, 
+                 bounty_count, total_tasks_completed, average_response_time
+    - order: Sort order - "asc" or "desc" (default: desc)
+    
+    Returns:
+    - Comprehensive leaderboard with all miner metrics, rankings, and statistics
+    """
+    try:
+        global leaderboard_api
+        if not leaderboard_api:
+            raise HTTPException(status_code=500, detail="Leaderboard API not initialized")
+        
+        leaderboard = await leaderboard_api.get_leaderboard(
+            limit=limit,
+            sort_by=sort_by,
+            order=order
+        )
+        
+        return {
+            "success": True,
+            "leaderboard": leaderboard,
+            "total_miners": len(leaderboard),
+            "sort_by": sort_by,
+            "order": order,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error getting leaderboard: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get leaderboard: {str(e)}")
+
+@app.get("/api/v1/leaderboard/{miner_uid}")
+async def get_miner_leaderboard_position(
+    miner_uid: int,
+    user_info: dict = Depends(require_client_auth)
+):
+    """
+    Get a specific miner's leaderboard position and metrics.
+    """
+    try:
+        global leaderboard_api
+        if not leaderboard_api:
+            raise HTTPException(status_code=500, detail="Leaderboard API not initialized")
+        
+        # Get full leaderboard
+        leaderboard = await leaderboard_api.get_leaderboard(limit=1000)
+        
+        # Find miner in leaderboard
+        miner_entry = None
+        for entry in leaderboard:
+            if entry.get('uid') == miner_uid:
+                miner_entry = entry
+                break
+        
+        if not miner_entry:
+            raise HTTPException(status_code=404, detail=f"Miner {miner_uid} not found in leaderboard")
+        
+        return {
+            "success": True,
+            "miner": miner_entry,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error getting miner leaderboard position: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get miner leaderboard position: {str(e)}")
+
+# ============================================================================
 # USER AUTHENTICATION ENDPOINTS
 # ============================================================================
 
 class RegisterRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+    
     email: str = Field(..., description="User email address")
     role: str = Field(..., description="User role: 'client' or 'admin' (miner/validator roles require API key generation with credentials)")
     
@@ -4107,9 +5008,13 @@ class RegisterRequest(BaseModel):
         return v
 
 class LoginRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+    
     email: str = Field(..., description="User email address")
 
 class GenerateAPIKeyRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+    
     email: str = Field(..., description="User email address")
     hotkey: Optional[str] = Field(None, description="Bittensor hotkey address (required for miner/validator role upgrade)")
     coldkey_address: Optional[str] = Field(None, description="Bittensor coldkey address (required for miner/validator role upgrade)")
@@ -4118,6 +5023,8 @@ class GenerateAPIKeyRequest(BaseModel):
     target_role: Optional[str] = Field(None, description="Target role: 'miner' or 'validator' (optional, for role upgrade)")
 
 class APIKeyResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+    
     success: bool
     api_key: Optional[str] = None
     role: Optional[str] = None
@@ -4137,7 +5044,7 @@ async def register_user(request: RegisterRequest):
             )
         
         # Check if user already exists
-        if UserOperations.verify_user_exists(db_manager.get_db(), request.email):
+        if UserOperations.verify_user_exists(db_manager, request.email):
             raise HTTPException(status_code=400, detail="User with this email already exists")
         
         # Client and admin don't need Bittensor credentials
@@ -4147,8 +5054,8 @@ async def register_user(request: RegisterRequest):
         }
         
         # Create user
-        user_id = UserOperations.create_user(db_manager.get_db(), user_data)
-        user = UserOperations.get_user_by_email(db_manager.get_db(), request.email)
+        user_id = UserOperations.create_user(db_manager, user_data)
+        user = UserOperations.get_user_by_email(db_manager, request.email)
         
         return {
             "success": True,
@@ -4173,7 +5080,7 @@ async def login_user(request: LoginRequest):
     try:
         from database.user_schema import UserOperations
         
-        user = UserOperations.get_user_by_email(db_manager.get_db(), request.email)
+        user = UserOperations.get_user_by_email(db_manager, request.email)
         
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
@@ -4182,7 +5089,7 @@ async def login_user(request: LoginRequest):
             raise HTTPException(status_code=403, detail="User account is inactive")
         
         # Update last login
-        UserOperations.update_last_login(db_manager.get_db(), user['user_id'])
+        UserOperations.update_last_login(db_manager, user['user_id'])
         
         return {
             "success": True,
@@ -4211,7 +5118,7 @@ async def generate_api_key(request: GenerateAPIKeyRequest):
         from utils.bittensor_verifier import BittensorVerifier
         from datetime import datetime
         
-        user = UserOperations.get_user_by_email(db_manager.get_db(), request.email)
+        user = UserOperations.get_user_by_email(db_manager, request.email)
         
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
@@ -4262,15 +5169,18 @@ async def generate_api_key(request: GenerateAPIKeyRequest):
             # Update API key index with new role (will be done in generate_new_api_key)
         
         # Generate new API key (this will update the API key index with current role)
-        api_key = UserOperations.generate_new_api_key(db_manager.get_db(), user['user_id'])
+        api_key = UserOperations.generate_new_api_key(db_manager, user['user_id'])
         
         # Get updated user info
-        updated_user = UserOperations.get_user_by_email(db_manager.get_db(), request.email)
+        updated_user = UserOperations.get_user_by_email(db_manager, request.email)
         final_role = updated_user.get('role', current_role)
         
         message = f"API key generated successfully"
         if target_role and target_role != current_role:
             message = f"API key generated successfully. User upgraded from {current_role} to {final_role} role."
+            if final_role in ['validator', 'miner']:
+                key_name = f"{final_role.upper()}_API_KEY"
+                message += f" Please manually add {key_name}={api_key} to your .env file."
         
         return {
             "success": True,
@@ -4321,6 +5231,8 @@ async def verify_api_key(api_key: str = None):
 
 class MinerAuthRequest(BaseModel):
     """Miner authentication request with credentials"""
+    model_config = ConfigDict(protected_namespaces=())
+    
     hotkey: str = Field(..., description="Miner hotkey address")
     coldkey_address: str = Field(..., description="Miner coldkey address")
     uid: int = Field(..., description="Miner UID")
@@ -4377,6 +5289,8 @@ async def authenticate_miner(
 
 class ValidatorAuthRequest(BaseModel):
     """Validator authentication request with credentials"""
+    model_config = ConfigDict(protected_namespaces=())
+    
     hotkey: str = Field(..., description="Validator hotkey address")
     coldkey_address: str = Field(..., description="Validator coldkey address")
     uid: int = Field(..., description="Validator UID")

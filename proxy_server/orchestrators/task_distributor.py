@@ -7,18 +7,23 @@ import asyncio
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
-import firebase_admin
-from firebase_admin import firestore
+from database.enhanced_schema import TaskStatus, DatabaseOperations
+from database.postgresql_adapter import PostgreSQLAdapter
 
 class TaskDistributor:
     """Distributes tasks to available miners intelligently"""
     
     def __init__(self, db, task_manager, miner_status_manager):
         self.db = db
+        self.is_postgresql = isinstance(db, PostgreSQLAdapter)
         self.task_manager = task_manager
         self.miner_status_manager = miner_status_manager
-        self.tasks_collection = db.collection('tasks')
-        self.distribution_interval = 30  # 30 seconds
+        
+        if not self.is_postgresql:
+            # Firestore (legacy)
+            self.tasks_collection = db.collection('tasks')
+        
+        self.distribution_interval = 180  # 3 minutes
         self.max_retries = 3
         self.retry_delay = 60  # 1 minute
         
@@ -74,15 +79,8 @@ class TaskDistributor:
     async def _get_pending_tasks(self) -> List[Dict[str, Any]]:
         """Get tasks that are pending distribution"""
         try:
-            # Query for pending tasks
-            query = self.tasks_collection.where('status', '==', 'pending').limit(50)
-            docs = query.stream()
-            
-            pending_tasks = []
-            for doc in docs:
-                task_data = doc.to_dict()
-                pending_tasks.append(task_data)
-            
+            # Use DatabaseOperations for PostgreSQL compatibility
+            pending_tasks = DatabaseOperations.get_tasks_by_status(self.db, TaskStatus.PENDING, limit=50)
             return pending_tasks
             
         except Exception as e:
@@ -130,8 +128,8 @@ class TaskDistributor:
             
             print(f"      ✅ Selected {len(selected_miners)} miners: {[m['uid'] for m in selected_miners]}")
             
-            # Assign task to selected miners
-            success = await self._assign_task_to_miners(task_id, selected_miners)
+            # Assign task to selected miners (pass task data for min/max counts)
+            success = await self._assign_task_to_miners(task_id, selected_miners, task)
             
             if success:
                 print(f"      ✅ Task {task_id} successfully assigned to miners")
@@ -189,9 +187,26 @@ class TaskDistributor:
             print(f"⚠️ Error checking miner task compatibility: {e}")
             return True  # Default to allowing the task
     
-    async def _assign_task_to_miners(self, task_id: str, selected_miners: List[Dict[str, Any]]) -> bool:
+    async def _assign_task_to_miners(self, task_id: str, selected_miners: List[Dict[str, Any]], task: Dict[str, Any] = None) -> bool:
         """Assign a task to the selected miners"""
+        # DatabaseOperations is already imported at module level
         try:
+            # Get task data if not provided
+            if task is None:
+                try:
+                    task = DatabaseOperations.get_task(self.db, task_id)
+                    if not task:
+                        print(f"❌ Task {task_id} not found")
+                        return False
+                except Exception as e:
+                    print(f"❌ Error fetching task {task_id}: {e}")
+                    return False
+            
+            # Ensure task is a dict
+            if not isinstance(task, dict):
+                print(f"❌ Task {task_id} data is not a dictionary")
+                return False
+            
             # Create assignments for each miner
             assignments = []
             miner_uids = []
@@ -206,15 +221,24 @@ class TaskDistributor:
                 assignments.append(assignment)
                 miner_uids.append(miner['uid'])
             
-            # Update task with assignments
-            task_ref = self.tasks_collection.document(task_id)
-            task_ref.update({
-                'assigned_miners': miner_uids,
-                'task_assignments': assignments,
-                'status': 'assigned',
-                'distributed_at': datetime.utcnow(),
-                'updated_at': datetime.utcnow()
-            })
+            # Update task with assignments using DatabaseOperations
+            min_count = task.get('min_miner_count', 1)
+            max_count = task.get('max_miner_count', len(miner_uids))
+            success = DatabaseOperations.assign_task_to_miners(
+                self.db, task_id, miner_uids, min_count, max_count
+            )
+            
+            if not success:
+                # Fallback for Firestore (legacy)
+                if not self.is_postgresql:
+                    task_ref = self.tasks_collection.document(task_id)
+                    task_ref.update({
+                        'assigned_miners': miner_uids,
+                        'task_assignments': assignments,
+                        'status': 'assigned',
+                        'distributed_at': datetime.utcnow(),
+                        'updated_at': datetime.utcnow()
+                    })
             
             # Update miner load
             for miner in selected_miners:
@@ -222,8 +246,16 @@ class TaskDistributor:
             
             return True
             
+        except NameError as e:
+            # Handle name errors specifically
+            import traceback
+            print(f"❌ NameError in _assign_task_to_miners: {e}")
+            traceback.print_exc()
+            return False
         except Exception as e:
+            import traceback
             print(f"❌ Error assigning task to miners: {e}")
+            traceback.print_exc()
             return False
     
     def get_duplicate_protection_stats(self) -> Dict[str, Any]:
@@ -296,11 +328,30 @@ class TaskDistributor:
             status_counts = {}
             statuses = ['pending', 'assigned', 'in_progress', 'completed', 'failed']
             
-            for status in statuses:
-                query = self.tasks_collection.where('status', '==', status)
-                docs = query.stream()
-                count = len(list(docs))
-                status_counts[status] = count
+            if self.is_postgresql:
+                # PostgreSQL: Count tasks by status
+                from database.postgresql_schema import Task, TaskStatusEnum
+                session = self.db._get_session()
+                try:
+                    status_mapping = {
+                        'pending': TaskStatusEnum.PENDING,
+                        'assigned': TaskStatusEnum.ASSIGNED,
+                        'in_progress': TaskStatusEnum.IN_PROGRESS,
+                        'completed': TaskStatusEnum.COMPLETED,
+                        'failed': TaskStatusEnum.FAILED
+                    }
+                    for status_str, status_enum in status_mapping.items():
+                        count = session.query(Task).filter(Task.status == status_enum).count()
+                        status_counts[status_str] = count
+                finally:
+                    session.close()
+            else:
+                # Firestore (legacy)
+                for status in statuses:
+                    query = self.tasks_collection.where('status', '==', status)
+                    docs = query.stream()
+                    count = len(list(docs))
+                    status_counts[status] = count
             
             # Get miner assignment counts
             total_assignments = sum(status_counts.get('assigned', 0), 
@@ -337,7 +388,10 @@ class TaskDistributor:
             
             cleaned_count = 0
             for doc in docs:
-                task_data = doc.to_dict()
+                if self.is_postgresql:
+                    task_data = doc  # Already a dict
+                else:
+                    task_data = doc.to_dict()
                 distributed_at = task_data.get('distributed_at')
                 
                 if distributed_at and distributed_at < timeout_threshold:
@@ -346,11 +400,12 @@ class TaskDistributor:
                     
                     if not miner_responses:
                         # No responses, mark as failed
-                        doc.reference.update({
-                            'status': 'failed',
-                            'updated_at': datetime.utcnow()
-                        })
-                        cleaned_count += 1
+                        task_id = task_data.get('task_id')
+                        if task_id:
+                            DatabaseOperations.update_task_status(
+                                self.db, task_id, TaskStatus.FAILED
+                            )
+                            cleaned_count += 1
             
             if cleaned_count > 0:
                 print(f"🧹 Cleaned up {cleaned_count} failed task assignments")
@@ -367,17 +422,21 @@ class TaskDistributor:
             
             redistributed_count = 0
             for doc in docs:
-                task_data = doc.to_dict()
+                if self.is_postgresql:
+                    task_data = self.db._task_to_dict(doc) if hasattr(doc, 'task_id') else doc
+                else:
+                    task_data = doc.to_dict()
+                
                 task_id = task_data.get('task_id')
                 
                 # Reset task to pending for redistribution
-                doc.reference.update({
-                    'status': 'pending',
-                    'assigned_miners': [],
-                    'task_assignments': [],
-                    'miner_responses': [],
-                    'updated_at': datetime.utcnow()
-                })
+                if task_id:
+                    DatabaseOperations.update_task_status(
+                        self.db, task_id, TaskStatus.PENDING,
+                        assigned_miners=[],
+                        task_assignments=[],
+                        miner_responses=[]
+                    )
                 
                 redistributed_count += 1
                 print(f"🔄 Redistributed failed task {task_id}")
@@ -394,8 +453,11 @@ class TaskDistributor:
             print(f"🚨 Emergency distribution of task {task_id} to miners {miner_uids}")
             
             # Force assign task to specified miners
+            # Get task data first (DatabaseOperations is already imported at module level)
+            task_data = DatabaseOperations.get_task(self.db, task_id)
             success = await self._assign_task_to_miners(task_id, 
-                                                      [{'uid': uid} for uid in miner_uids])
+                                                      [{'uid': uid} for uid in miner_uids],
+                                                      task_data)
             
             if success:
                 print(f"✅ Emergency distribution successful for task {task_id}")

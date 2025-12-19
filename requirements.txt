@@ -11,8 +11,9 @@ rich>=13
 PyMuPDF>=1.23.0  # Provides 'fitz' module
 python-docx>=1.1.0  # For DOCX document processing
 
-# TTS (optional - Coqui TTS, note: may not support Python 3.12)
-# TTS>=0.22.0  # Uncomment if using Python <3.12
+# TTS - Coqui TTS for text-to-speech
+# Note: Coqui TTS officially supports Python 3.9-3.11, not 3.12
+# For Python 3.12, use Python 3.11 in a virtual environment
 
 # Firebase and Google Cloud
 firebase-admin>=6.2.0
@@ -24,8 +25,11 @@ aiofiles>=23.2.0
 
 # Machine Learning and Audio Processing
 torch>=2
-numpy<2,>=1.24.0
-transformers>=4.30.0
+numpy>=2.0.1,<3.0.0  # Updated for bittensor 9.10.0 compatibility
+# Transformers version - using 4.57.3 (same as Colab)
+# Note: LogitsWarper was removed in transformers 4.40.0+, but we use compatibility shims
+# The miner and validator code include LogitsWarper compatibility shims for transformers 4.57.3+
+transformers>=4.57.3
 onnx>=1.20.0  # Required for torchvision compatibility with ml_dtypes
 ml_dtypes>=0.5.0  # Compatible with onnx 1.20.0+
 librosa>=0.10.0
@@ -34,7 +38,8 @@ scipy>=1.10.0
 
 # HTTP and Networking
 requests>=2.31.0
-httpx>=0.25.0
+httpx>=0.25.0,<0.28.0  # Pinned to avoid anyio circular import issues
+anyio>=4.0.0,<5.0.0  # Ensure compatible anyio version for httpx
 
 # Testing
 pytest>=8
@@ -51,6 +56,8 @@ python-dateutil>=2.8.0  # For date parsing in proxy server
 
 # Weights & Biases for monitoring
 wandb>=0.15.0
-
+librosa
+torchcodec
+coqui-tts
 # Bittensor (pinned to working version)
 bittensor==9.10.0

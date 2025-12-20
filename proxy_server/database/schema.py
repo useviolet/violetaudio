@@ -1,12 +1,16 @@
 """
-Firestore Database Schema for Enhanced Proxy Server
+Legacy Database Schema for Enhanced Proxy Server
+NOTE: This file is deprecated. Use postgresql_schema.py instead.
+Firebase/Firestore imports removed - this file is kept for backward compatibility only.
 """
 
 from enum import Enum
 from typing import Optional, List, Dict, Any
-from firebase_admin import firestore
 from datetime import datetime
 from dataclasses import dataclass
+
+# NOTE: Firebase/Firestore imports removed - this file is deprecated
+# Use postgresql_schema.py and postgresql_adapter.py instead
 
 class TaskStatus(str, Enum):
     PENDING = "pending"
@@ -226,37 +230,28 @@ class FileModel:
         )
 
 class DatabaseManager:
-    def __init__(self, credentials_path: str):
+    """
+    DEPRECATED: This class is kept for backward compatibility only.
+    Use PostgreSQLAdapter from postgresql_adapter.py instead.
+    """
+    def __init__(self, credentials_path: str = None):
         self.credentials_path = credentials_path
         self.db = None
         self.initialized = False
+        print("⚠️  DatabaseManager is deprecated. Use PostgreSQLAdapter instead.")
     
     def initialize(self):
-        """Initialize Firebase connection"""
-        try:
-            import firebase_admin
-            from firebase_admin import credentials, firestore
-            
-            # Initialize Firebase
-            cred = credentials.Certificate(self.credentials_path)
-            firebase_admin.initialize_app(cred)
-            
-            # Get Firestore client
-            self.db = firestore.client()
-            
-            self.initialized = True
-            
-            print("✅ Database initialized successfully")
-            
-        except Exception as e:
-            print(f"❌ Failed to initialize database: {e}")
-            raise
+        """DEPRECATED: Use PostgreSQLAdapter instead"""
+        raise NotImplementedError(
+            "DatabaseManager is deprecated. Use PostgreSQLAdapter from postgresql_adapter.py instead. "
+            "Firebase/Firestore support has been removed."
+        )
     
     def get_db(self):
-        """Get Firestore database client"""
-        if not self.initialized:
-            raise Exception("Database not initialized")
-        return self.db
+        """DEPRECATED: Use PostgreSQLAdapter instead"""
+        raise NotImplementedError(
+            "DatabaseManager is deprecated. Use PostgreSQLAdapter from postgresql_adapter.py instead."
+        )
 @dataclass
 class MinerStatusModel:
     """Track miner status and performance from validator reports"""

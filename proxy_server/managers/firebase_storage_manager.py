@@ -16,22 +16,59 @@ from google.cloud import storage
 import mimetypes
 
 class FirebaseStorageManager:
-    def __init__(self, db, bucket_name: str = "violet-7063e.firebasestorage.app", credentials_path: str = "db/violet.json"):
+    def __init__(self, db, bucket_name: str = "violet-7063e.firebasestorage.app", credentials_path: str = None):
         self.db = db
         self.files_collection = db.collection('files')
         self.credentials_path = credentials_path
+        self.storage_client = None
+        self.bucket = None
+        self.bucket_name = bucket_name
+        self.enabled = False
         
         # Initialize Google Cloud Storage client with Firebase credentials
-        from google.cloud import storage
-        from google.oauth2 import service_account
-        
-        # Load service account credentials
-        credentials = service_account.Credentials.from_service_account_file(credentials_path)
-        
-        # Initialize storage client with credentials
-        self.storage_client = storage.Client(credentials=credentials)
-        self.bucket_name = bucket_name
-        self.bucket = self.storage_client.bucket(bucket_name)
+        try:
+            from google.cloud import storage
+            from google.oauth2 import service_account
+            import os
+            
+            # If credentials_path not provided, try to find it
+            if credentials_path is None:
+                possible_paths = [
+                    "/Users/user/Documents/Jarvis/violet/proxy_server/db/violet.json",  # Explicit path
+                    os.path.join(os.path.dirname(__file__), "..", "db", "violet.json"),  # Relative path
+                    "db/violet.json",  # From project root
+                    os.path.join(os.path.dirname(__file__), "..", "db", "violet-rename.json"),  # Fallback
+                    "db/violet-rename.json"
+                ]
+                for path in possible_paths:
+                    abs_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", path)) if not os.path.isabs(path) else path
+                    if os.path.exists(abs_path):
+                        credentials_path = abs_path
+                        print(f"✅ Found credentials at: {credentials_path}")
+                        break
+            
+            # Check if credentials file exists
+            if credentials_path and not os.path.exists(credentials_path):
+                print(f"⚠️  Firebase credentials not found at {credentials_path}")
+                print(f"   File uploads will be disabled. To enable, add credentials file.")
+                return
+            
+            if not credentials_path:
+                print(f"⚠️  Firebase credentials path not provided and not found in default locations")
+                print(f"   File uploads will be disabled. To enable, add credentials file.")
+                return
+            
+            # Load service account credentials
+            credentials = service_account.Credentials.from_service_account_file(credentials_path)
+            
+            # Initialize storage client with credentials
+            self.storage_client = storage.Client(credentials=credentials)
+            self.bucket = self.storage_client.bucket(bucket_name)
+            self.enabled = True
+        except Exception as e:
+            print(f"⚠️  Failed to initialize Firebase Cloud Storage: {e}")
+            print(f"   File uploads will be disabled. To enable, configure Firebase credentials.")
+            return
         
         # File size limits
         self.max_file_size_firestore = 1 * 1024 * 1024  # 1MB limit for Firestore
@@ -40,10 +77,13 @@ class FirebaseStorageManager:
         # Base URL for remote access
         self.base_url = "https://violet-proxy.onrender.com/api/v1/files"
         
-        print(f"✅ Firebase Cloud Storage initialized")
-        print(f"   Bucket: {self.bucket_name}")
-        print(f"   ALL files will be stored in Cloud Storage")
-        print(f"   Cloud Storage limit: {self.max_file_size_cloud / (1024*1024*1024):.1f}GB")
+        if self.enabled:
+            print(f"✅ Firebase Cloud Storage initialized")
+            print(f"   Bucket: {self.bucket_name}")
+            print(f"   ALL files will be stored in Cloud Storage")
+            print(f"   Cloud Storage limit: {self.max_file_size_cloud / (1024*1024*1024):.1f}GB")
+        else:
+            print(f"⚠️  Firebase Cloud Storage disabled (credentials not configured)")
     
     def _get_storage_path_for_type(self, file_type: str) -> str:
         """Get the appropriate storage path based on file type"""
@@ -78,6 +118,9 @@ class FirebaseStorageManager:
     async def store_file(self, file_data: bytes, file_name: str, content_type: str, file_type: str = "audio") -> Dict:
         """Store file using Firebase Cloud Storage - ALL files go to Cloud Storage"""
         try:
+            if not self.enabled:
+                raise Exception("Firebase Cloud Storage is not configured. Please add credentials file at db/violet.json")
+            
             file_size = len(file_data)
             file_id = str(uuid.uuid4())
             

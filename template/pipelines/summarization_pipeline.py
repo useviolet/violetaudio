@@ -7,6 +7,7 @@ import time
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from typing import Optional, Tuple
+from template.utils.hf_token import get_hf_token_dict
 
 
 class SummarizationPipeline:
@@ -31,14 +32,17 @@ class SummarizationPipeline:
         print(f"🔄 Loading summarization model: {model_name} on {self.device}...")
         
         try:
+            # Get HF token if available
+            hf_token_kwargs = get_hf_token_dict()
+            
             # Load tokenizer first (faster)
             print(f"   Loading tokenizer...")
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, **hf_token_kwargs)
             print(f"   ✅ Tokenizer loaded")
             
             # Load model (slower, may download if not cached)
             print(f"   Loading model (this may take a while on first run)...")
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name, **hf_token_kwargs)
             self.model.to(self.device)
             print(f"   ✅ Model loaded and moved to {self.device}")
             

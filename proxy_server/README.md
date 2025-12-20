@@ -1,480 +1,330 @@
-# Bittensor Audio Processing Proxy Server
+# Violet Proxy Server
 
-A FastAPI-based proxy server that provides REST API endpoints for audio processing services and integrates with the Bittensor network for distributed task processing.
+A distributed task processing proxy server that coordinates between miners and validators for AI-powered transcription, text-to-speech, summarization, and translation tasks.
 
-## 🚀 Features
+## Features
 
-- **Service-Specific REST API Endpoints** for audio transcription, TTS, and summarization
-- **Priority-based Task Queue** with Redis backend
-- **Bittensor Network Integration** for distributed processing
-- **Automatic Miner Evaluation** with accuracy and speed scoring
-- **Task Status Tracking** with real-time updates
-- **Webhook Support** for task completion notifications
-- **Retry Mechanism** for failed tasks
-- **Health Monitoring** and statistics
-- **Input Validation** and formatting for each service type
+- **Multi-Task Support**: Transcription, TTS, Summarization, Text Translation, Document Translation, Video Transcription
+- **PostgreSQL Database**: Full PostgreSQL integration for task management, user authentication, and file metadata
+- **R2 Storage**: Cloudflare R2 integration for file storage with public URL fallback
+- **Load Balancing**: Intelligent task distribution with miner load tracking
+- **Multi-Validator Consensus**: Consensus-based validation for miner responses
+- **RESTful API**: Comprehensive REST API with FastAPI and automatic OpenAPI documentation
 
-## 🌍 Supported Languages
+## Quick Start
 
-The proxy server supports multiple languages across different endpoints based on the underlying AI models:
+### Prerequisites
 
-### 📝 Transcription Endpoints
-**Supported Languages**: English (en), Spanish (es), French (fr), German (de), Italian (it), Portuguese (pt), Russian (ru), Japanese (ja), Korean (ko), Chinese (zh), Arabic (ar), Hindi (hi), Dutch (nl), Polish (pl), Swedish (sv), Turkish (tr)
+- Python 3.10+ (Python 3.12+ recommended)
+- PostgreSQL database
+- Cloudflare R2 credentials (optional, for file storage)
+- Bittensor network access (for miner/validator authentication)
 
-**Endpoints**:
-- `/api/v1/transcription` - Audio transcription
-- `/api/v1/video-transcription` - Video transcription
+### Installation
 
-### 🎤 Text-to-Speech (TTS) Endpoints
-**Supported Languages**: English (en), Spanish (es), French (fr-fr), German (de), Italian (it), Portuguese (pt-br), Russian (ru), Japanese (ja), Korean (ko), Chinese (zh), Arabic (ar), Hindi (hi), Dutch (nl), Polish (pl), Swedish (sv), Turkish (tr)
+1. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
 
-**Endpoints**:
-- `/api/v1/tts` - Text-to-speech synthesis
-- `/api/v1/miner/tts/upload-audio` - TTS audio upload
+2. Configure environment variables in `.env`:
+```env
+DATABASE_URL=postgresql://user:password@host:port/database
+R2_ACCESS_KEY_ID=your_r2_access_key
+R2_SECRET_ACCESS_KEY=your_r2_secret_key
+R2_BUCKET_NAME=your_bucket_name
+R2_ENDPOINT_URL=your_r2_endpoint_url
+R2_PUBLIC_URL=your_r2_public_url
+```
 
-### 📊 Summarization Endpoints
-**Supported Languages**: English (en), Spanish (es), French (fr), German (de), Italian (it), Portuguese (pt), Russian (ru), Japanese (ja), Korean (ko), Chinese (zh)
+3. Start the server:
+```bash
+python main.py
+```
 
-**Endpoints**:
-- `/api/v1/summarization` - Text summarization
+The server will start on `http://localhost:8000` by default.
 
-### 🌐 Translation Endpoints
-**Supported Languages**: All major languages supported by the underlying translation models
+## API Documentation
 
-**Endpoints**:
-- `/api/v1/text-translation` - Text translation (requires source_language and target_language)
-- `/api/v1/document-translation` - Document translation (requires source_language and target_language)
+Once the server is running, visit:
+- **Swagger UI**: `http://localhost:8000/docs`
+- **ReDoc**: `http://localhost:8000/redoc`
+- **OpenAPI JSON**: `http://localhost:8000/openapi.json`
 
-### 🔧 Language Usage Examples
+## Working Model IDs
 
-**Transcription**:
+The proxy server supports various model IDs for different task types. Here are the currently supported models:
+
+### Transcription Models
+
+| Model ID | Description | Status |
+|----------|-------------|--------|
+| `openai/whisper-tiny` | Fast, lightweight Whisper model (default) | ✅ Recommended |
+| `openai/whisper-base` | Base Whisper model | ✅ Supported |
+| `openai/whisper-small` | Small Whisper model | ✅ Supported |
+| `openai/whisper-medium` | Medium Whisper model | ✅ Supported |
+| `openai/whisper-large` | Large Whisper model (best quality) | ✅ Supported |
+| `openai/whisper-large-v2` | Large Whisper v2 model | ✅ Supported |
+
+**Note**: All Whisper models support multiple languages (en, es, fr, de, it, pt, ru, ja, ko, zh, ar, hi).
+
+### Text-to-Speech (TTS) Models
+
+| Model ID | Description | Status |
+|----------|-------------|--------|
+| `tts_models/multilingual/multi-dataset/xtts_v2` | Coqui XTTS v2 (multilingual, voice cloning) | ✅ Recommended |
+| `tts_models/multilingual/multi-dataset/your_tts` | Coqui YourTTS (multilingual) | ✅ Supported |
+| `tts_models/en/ljspeech/tacotron2-DDC` | English TTS (Tacotron2) | ✅ Supported |
+| `tts_models/en/vctk/vits` | English multi-speaker TTS | ✅ Supported |
+
+**Note**: TTS models require Coqui TTS library. Voice cloning requires a speaker WAV file.
+
+### Summarization Models
+
+| Model ID | Description | Status |
+|----------|-------------|--------|
+| `facebook/bart-large-cnn` | BART large model for summarization (default) | ✅ Recommended |
+| `facebook/bart-base` | BART base model | ✅ Supported |
+| `google/pegasus-xsum` | Google Pegasus for abstractive summarization | ✅ Supported |
+| `t5-small` | T5 small model (can be used for summarization) | ✅ Supported |
+
+**Note**: Summarization models work best with English text but support multiple languages.
+
+### Translation Models
+
+| Model ID | Description | Status |
+|----------|-------------|--------|
+| `facebook/mbart-large-50-many-to-many-mmt` | Multilingual many-to-many translation (default) | ✅ Recommended |
+| `t5-small` | T5 small model for translation | ✅ Supported |
+| `Helsinki-NLP/opus-mt-en-es` | English to Spanish (Marian model) | ✅ Supported |
+| `Helsinki-NLP/opus-mt-en-fr` | English to French | ✅ Supported |
+| `Helsinki-NLP/opus-mt-en-de` | English to German | ✅ Supported |
+| `Helsinki-NLP/opus-mt-en-zh` | English to Chinese | ✅ Supported |
+
+**Important**: Translation tasks **require both** `source_language` and `target_language` parameters. These are stored in the database `tasks` table (`source_language` and `target_language` columns) and are mandatory for all translation endpoints.
+
+**Note**: 
+- `facebook/mbart-large-50-many-to-many-mmt` supports 50+ languages and is recommended for multilingual translation tasks.
+- Both `source_language` and `target_language` are required parameters and are stored in the database.
+- The system validates that source and target languages are different.
+
+### Video Transcription Models
+
+Video transcription uses the same models as audio transcription (Whisper models). The system automatically extracts audio from video files before transcription.
+
+| Model ID | Description | Status |
+|----------|-------------|--------|
+| `openai/whisper-tiny` | Fast video transcription (default) | ✅ Recommended |
+| `openai/whisper-large` | High-quality video transcription | ✅ Supported |
+
+## API Endpoints
+
+### Task Submission
+
+- `POST /api/v1/transcription` - Submit audio transcription task
+- `POST /api/v1/tts` - Submit text-to-speech task
+- `POST /api/v1/summarization` - Submit text summarization task
+- `POST /api/v1/text-translation` - Submit text translation task (requires `source_language` and `target_language`)
+- `POST /api/v1/document-translation` - Submit document translation task (requires `source_language` and `target_language`)
+- `POST /api/v1/video-transcription` - Submit video transcription task
+
+### Task Status & Results
+
+- `GET /api/v1/task/{task_id}/status` - Get task status
+- `GET /api/v1/task/{task_id}/responses` - Get task responses
+- `GET /api/v1/transcription/{task_id}/result` - Get transcription result
+- `GET /api/v1/tts/{task_id}/result` - Get TTS result
+- `GET /api/v1/summarization/{task_id}/result` - Get summarization result
+
+### Miner Endpoints
+
+- `GET /api/v1/miner/transcription/{task_id}` - Get transcription task for miner
+- `GET /api/v1/miner/tts/{task_id}` - Get TTS task for miner
+- `GET /api/v1/miner/summarization/{task_id}` - Get summarization task for miner
+- `GET /api/v1/miner/text-translation/{task_id}` - Get text translation task for miner
+- `GET /api/v1/miner/video-transcription/{task_id}` - Get video transcription task for miner
+- `GET /api/v1/miner/document-translation/{task_id}` - Get document translation task for miner
+- `POST /api/v1/miner/response` - Submit miner response (requires miner API key)
+- `POST /api/v1/miner/video-transcription/upload-result` - Upload video transcription result
+- `POST /api/v1/miner/text-translation/upload-result` - Upload text translation result
+- `POST /api/v1/miner/document-translation/upload-result` - Upload document translation result
+- `POST /api/v1/miner/tts/upload` - Upload TTS audio (requires miner API key)
+- `POST /api/v1/miner/tts/upload-audio` - Upload TTS audio file
+
+### Validator Endpoints
+
+- `GET /api/v1/validator/tasks` - Get tasks for validation (requires validator API key)
+- `POST /api/v1/validator/evaluation` - Submit validator evaluation (requires validator API key)
+- `POST /api/v1/validators/miner-status` - Submit miner status report
+
+### File Management
+
+- `GET /api/v1/files/{file_id}` - Get file metadata or download file
+- `GET /api/v1/files/{file_id}/download` - Download file
+- `GET /api/v1/files/stats` - Get file storage statistics
+- `GET /api/v1/files/list/{file_type}` - List files by type
+- `GET /api/v1/tts/audio/{file_id}` - Get TTS audio file
+
+### Authentication
+
+- `POST /api/v1/auth/register` - Register new user
+- `POST /api/v1/auth/login` - Login user
+- `POST /api/v1/auth/generate-api-key` - Generate API key (for role upgrade)
+- `GET /api/v1/auth/verify-api-key` - Verify API key
+- `POST /api/v1/miner/authenticate` - Authenticate miner
+- `POST /api/v1/validator/authenticate` - Authenticate validator
+
+### System & Monitoring
+
+- `GET /health` - Health check
+- `GET /api/v1/health` - API health check
+- `GET /api/v1/metrics` - System metrics
+- `GET /api/v1/metrics/json` - System metrics (JSON)
+- `GET /api/v1/miners` - List all miners
+- `GET /api/v1/miners/performance` - Get miner performance stats
+- `GET /api/v1/miners/network-status` - Get network status
+- `GET /api/v1/tasks` - List all tasks
+- `GET /api/v1/tasks/completed` - Get completed tasks
+
+## Usage Examples
+
+### Submit Transcription Task
+
 ```bash
 curl -X POST "http://localhost:8000/api/v1/transcription" \
+  -H "X-API-Key: your_api_key" \
   -F "audio_file=@audio.wav" \
-  -F "source_language=en"
+  -F "source_language=en" \
+  -F "model_id=openai/whisper-tiny" \
+  -F "priority=normal"
 ```
 
-**TTS**:
+### Submit TTS Task
+
 ```bash
 curl -X POST "http://localhost:8000/api/v1/tts" \
-  -F "text=Hello world" \
-  -F "source_language=en"
+  -H "X-API-Key: your_api_key" \
+  -F "text=Hello, this is a test" \
+  -F "source_language=en" \
+  -F "voice_name=english_alice" \
+  -F "model_id=tts_models/multilingual/multi-dataset/xtts_v2" \
+  -F "priority=normal"
 ```
 
-**Translation**:
+### Submit Summarization Task
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/summarization" \
+  -H "X-API-Key: your_api_key" \
+  -F "text=Your long text here..." \
+  -F "source_language=en" \
+  -F "model_id=facebook/bart-large-cnn" \
+  -F "priority=normal"
+```
+
+### Submit Translation Task
+
+**Note**: Translation tasks **require both** `source_language` and `target_language` parameters. These are stored in the database and are mandatory.
+
 ```bash
 curl -X POST "http://localhost:8000/api/v1/text-translation" \
-  -F "text=Hello world" \
+  -H "X-API-Key: your_api_key" \
+  -F "text=Hello, world" \
   -F "source_language=en" \
-  -F "target_language=es"
-```
-
-**Summarization**:
-```bash
-curl -X POST "http://localhost:8000/api/v1/summarization" \
-  -F "text=Long text to summarize..." \
-  -F "source_language=en"
-```
-
-## 🏗️ Architecture
-
-```
-User Request → FastAPI Server → Task Queue → Bittensor Network → Miners
-                ↓                    ↓              ↓
-            Response ← Result ← Validator ← Miner Responses
-```
-
-## 📋 Prerequisites
-
-- Python 3.8+
-- Redis server
-- Bittensor wallet configured
-- Access to Bittensor network (finney/testnet)
-
-## 🛠️ Installation
-
-1. **Clone the repository and navigate to the proxy server directory:**
-   ```bash
-   cd proxy_server
-   ```
-
-2. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Install and start Redis:**
-   ```bash
-   # macOS
-   brew install redis
-   brew services start redis
-   
-   # Ubuntu/Debian
-   sudo apt-get install redis-server
-   sudo systemctl start redis-server
-   
-   # Or use Docker
-   docker run -d -p 6379:6379 redis:alpine
-   ```
-
-4. **Set environment variables (optional):**
-   ```bash
-   export ENVIRONMENT=development
-   export BT_NETUID=49
-   export BT_NETWORK=finney
-   export BT_WALLET_NAME=luno
-   export BT_WALLET_HOTKEY=arusha
-   ```
-
-## 🚀 Running the Server
-
-### Development Mode
-```bash
-python start_server.py
-```
-
-### Production Mode
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
-```
-
-The server will start on `http://localhost:8000`
-
-## 📚 API Endpoints
-
-### 1. Audio Transcription
-```http
-POST /api/v1/transcription
-Content-Type: multipart/form-data
-
-Form Data:
-- audio_file: Audio file (WAV, MP3, etc.)
-- source_language: Language code (e.g., 'en', 'es', 'fr')
-- priority: Task priority (low, normal, high, urgent)
-- callback_url: Optional webhook URL
-```
-
-**Example with curl:**
-```bash
-curl -X POST "http://localhost:8000/api/v1/transcription" \
-  -F "audio_file=@audio.wav" \
-  -F "source_language=en" \
+  -F "target_language=es" \
+  -F "model_id=facebook/mbart-large-50-many-to-many-mmt" \
   -F "priority=normal"
 ```
 
-**Response:**
-```json
-{
-  "task_id": "uuid-string",
-  "status": "pending",
-  "message": "Transcription task submitted successfully",
-  "estimated_completion_time": 60,
-  "task_type": "transcription",
-  "source_language": "en"
-}
-```
-
-### 2. Text-to-Speech (TTS)
-```http
-POST /api/v1/tts
-Content-Type: application/json
-
-{
-  "text": "Text to convert to speech",
-  "source_language": "en",
-  "priority": "normal",
-  "callback_url": "https://your-webhook.com/callback"
-}
-```
-
-**Example with curl:**
+**Document Translation** (also requires both languages):
 ```bash
-curl -X POST "http://localhost:8000/api/v1/tts" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "Hello, this is a test for TTS conversion.",
-    "source_language": "en",
-    "priority": "normal"
-  }'
-```
-
-**Response:**
-```json
-{
-  "task_id": "uuid-string",
-  "status": "pending",
-  "message": "TTS task submitted successfully",
-  "estimated_completion_time": 45,
-  "task_type": "tts",
-  "source_language": "en"
-}
-```
-
-### 3. Text Summarization
-```http
-POST /api/v1/summarization
-Content-Type: application/json
-
-{
-  "text": "Long text to summarize",
-  "source_language": "en",
-  "priority": "normal",
-  "callback_url": "https://your-webhook.com/callback"
-}
-```
-
-**Example with curl:**
-```bash
-curl -X POST "http://localhost:8000/api/v1/summarization" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "Long article text here...",
-    "source_language": "en",
-    "priority": "normal"
-  }'
-```
-
-**Response:**
-```json
-{
-  "task_id": "uuid-string",
-  "status": "pending",
-  "message": "Summarization task submitted successfully",
-  "estimated_completion_time": 30,
-  "task_type": "summarization",
-  "source_language": "en"
-}
-```
-
-### 4. Task Status Check
-```http
-GET /api/v1/tasks/{task_id}
-```
-
-**Response:**
-```json
-{
-  "task_id": "uuid-string",
-  "status": "completed",
-  "task_type": "transcription",
-  "source_language": "en",
-  "result": {
-    "output_data": "base64_encoded_result",
-    "model_used": "openai/whisper-tiny",
-    "processing_time": 1.23,
-    "accuracy_score": 0.95,
-    "speed_score": 0.89,
-    "miner_uid": 48
-  },
-  "processing_time": 1.23,
-  "accuracy_score": 0.95,
-  "speed_score": 0.89,
-  "completed_at": "2024-01-01T12:00:00"
-}
-```
-
-### 5. List All Tasks
-```http
-GET /api/v1/tasks?status=pending&limit=10
-```
-
-### 6. Health Check
-```http
-GET /api/v1/health
-```
-
-## 🔧 Configuration
-
-The server configuration can be customized through environment variables or by modifying `config.py`:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `HOST` | `0.0.0.0` | Server host |
-| `PORT` | `8000` | Server port |
-| `REDIS_HOST` | `localhost` | Redis host |
-| `REDIS_PORT` | `6379` | Redis port |
-| `BT_NETUID` | `49` | Bittensor subnet UID |
-| `BT_NETWORK` | `finney` | Bittensor network |
-| `MAX_CONCURRENT_TASKS` | `10` | Maximum concurrent tasks |
-| `TASK_TIMEOUT` | `60` | Task timeout in seconds |
-
-## 📊 Task Processing Flow
-
-1. **Task Submission**: User submits task via service-specific endpoint
-2. **Input Validation**: Server validates input format and requirements
-3. **Queue Management**: Task is added to priority queue in Redis
-4. **Bittensor Processing**: Validator queries available miners
-5. **Response Evaluation**: Responses are scored for accuracy and speed
-6. **Result Selection**: Best response is selected based on combined score
-7. **Task Completion**: Result is returned to user and task is dequeued
-
-## 🎯 Scoring System
-
-Tasks are evaluated using a weighted scoring system:
-
-- **Accuracy Score (70%)**: Based on comparison with validator pipeline
-- **Speed Score (30%)**: Based on processing time
-- **Combined Score**: Weighted average of accuracy and speed
-
-## 🔄 Retry Mechanism
-
-Failed tasks are automatically retried up to 3 times before being marked as permanently failed.
-
-## 📈 Monitoring
-
-### Queue Statistics
-- Pending tasks count
-- Processing tasks count
-- Completed tasks count
-- Failed tasks count
-- Queue size
-
-### Network Statistics
-- Total miners
-- Available miners
-- Total stake
-- Network connectivity status
-
-## 🧪 Testing
-
-### Test with curl
-```bash
-# Health check
-curl http://localhost:8000/api/v1/health
-
-# Submit transcription task
-curl -X POST "http://localhost:8000/api/v1/transcription" \
-  -F "audio_file=@audio.wav" \
+curl -X POST "http://localhost:8000/api/v1/document-translation" \
+  -H "X-API-Key: your_api_key" \
+  -F "document_file=@document.pdf" \
   -F "source_language=en" \
+  -F "target_language=es" \
+  -F "model_id=facebook/mbart-large-50-many-to-many-mmt" \
   -F "priority=normal"
-
-# Submit TTS task
-curl -X POST "http://localhost:8000/api/v1/tts" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "Hello world",
-    "source_language": "en",
-    "priority": "normal"
-  }'
-
-# Submit summarization task
-curl -X POST "http://localhost:8000/api/v1/summarization" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "Long article text...",
-    "source_language": "en",
-    "priority": "normal"
-  }'
-
-# Check task status (replace {task_id} with actual ID)
-curl "http://localhost:8000/api/v1/tasks/{task_id}"
 ```
 
-### Test with Python
-```python
-import requests
+### Get Task Result
 
-# Test transcription
-with open('audio.wav', 'rb') as f:
-    files = {'audio_file': ('audio.wav', f, 'audio/wav')}
-    data = {'source_language': 'en', 'priority': 'normal'}
-    response = requests.post("http://localhost:8000/api/v1/transcription", 
-                           files=files, data=data)
-    task_id = response.json()["task_id"]
-
-# Test TTS
-tts_data = {
-    "text": "Hello, this is a test.",
-    "source_language": "en",
-    "priority": "normal"
-}
-response = requests.post("http://localhost:8000/api/v1/tts", json=tts_data)
-task_id = response.json()["task_id"]
-
-# Test summarization
-summarization_data = {
-    "text": "Long article text here...",
-    "source_language": "en",
-    "priority": "normal"
-}
-response = requests.post("http://localhost:8000/api/v1/summarization", 
-                       json=summarization_data)
-task_id = response.json()["task_id"]
-
-# Check status
-status_response = requests.get(f"http://localhost:8000/api/v1/tasks/{task_id}")
-print(f"Task status: {status_response.json()}")
-```
-
-### Run Test Suite
 ```bash
-python test_proxy.py
+curl -X GET "http://localhost:8000/api/v1/transcription/{task_id}/result" \
+  -H "X-API-Key: your_api_key"
 ```
 
-## 🚨 Troubleshooting
+## Architecture
 
-### Common Issues
+### Components
 
-1. **Redis Connection Error**
-   ```bash
-   # Check if Redis is running
-   redis-cli ping
-   
-   # Start Redis if needed
-   brew services start redis  # macOS
-   sudo systemctl start redis-server  # Linux
-   ```
+- **Main Server** (`main.py`): FastAPI application with all endpoints
+- **Database Layer**: PostgreSQL adapter for data persistence
+- **File Manager**: R2 storage integration with public URL fallback
+- **Task Distributor**: Intelligent task assignment to miners
+- **Workflow Orchestrator**: Task lifecycle management
+- **Miner Response Handler**: Processes and validates miner responses
+- **Multi-Validator Manager**: Consensus-based validation
+- **Auth Middleware**: API key and Bittensor credential verification
 
-2. **Bittensor Connection Error**
-   - Verify wallet configuration
-   - Check network connectivity
-   - Ensure metagraph sync
+### Database Schema
 
-3. **Task Processing Errors**
-   - Check miner availability
-   - Verify input data format
-   - Review server logs
+The system uses PostgreSQL with the following main tables:
+- `users` - User accounts and API keys
+- `tasks` - Task definitions and status (includes `source_language` and `target_language` columns - both are stored for translation tasks)
+- `files` - File metadata and storage information
+- `text_content` - Text content for text-based tasks
+- `miner_status` - Miner availability and capabilities
+- `task_assignments` - Task-to-miner assignments
+- `miner_responses` - Miner task responses
+- `validator_reports` - Validator evaluations
+- `miner_consensus` - Consensus results
 
-### Logs
-The server provides detailed logging for:
-- Task submission and processing
-- Bittensor network communication
-- Miner response evaluation
-- Error details and stack traces
+**Note**: For translation tasks, both `source_language` and `target_language` are stored in the `tasks` table. The `target_language` column is nullable for non-translation tasks but is required for translation task types.
 
-## 🔒 Security Considerations
+## Configuration
 
-- **Input Validation**: All inputs are validated using Pydantic models
-- **File Upload Limits**: Audio files limited to 50MB
-- **Text Length Limits**: TTS (10K chars), Summarization (50K chars)
-- **Language Validation**: Only supported languages accepted
-- **Rate Limiting**: Configurable rate limiting per endpoint
-- **CORS**: Configurable CORS policies
-- **Authentication**: Ready for JWT token integration
+### Environment Variables
 
-## 🚀 Production Deployment
+- `DATABASE_URL`: PostgreSQL connection string
+- `R2_ACCESS_KEY_ID`: Cloudflare R2 access key
+- `R2_SECRET_ACCESS_KEY`: Cloudflare R2 secret key
+- `R2_BUCKET_NAME`: R2 bucket name
+- `R2_ENDPOINT_URL`: R2 S3 endpoint URL
+- `R2_PUBLIC_URL`: R2 public URL for file access
+- `WANDB_API_KEY`: Weights & Biases API key (optional, for monitoring)
 
-1. **Use a production WSGI server** (Gunicorn, uWSGI)
-2. **Set up Redis persistence** and clustering
-3. **Configure monitoring** and alerting
-4. **Set up load balancing** for high availability
-5. **Use environment-specific configurations**
+### Task Distribution
 
-## 📝 License
+- Tasks are automatically assigned to available miners based on:
+  - Miner availability and load
+  - Task type specialization
+  - Miner performance history
+- Default: 3 miners per task (configurable per task)
+- Polling interval: 3 minutes
 
-This project is licensed under the MIT License.
+## Development
 
-## 🤝 Contributing
+### Project Structure
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Submit a pull request
+```
+proxy_server/
+├── main.py                 # FastAPI application
+├── database/              # Database adapters and schemas
+├── managers/              # Business logic managers
+├── orchestrators/         # Task orchestration
+├── middleware/            # Authentication middleware
+└── utils/                 # Utility functions
+```
 
-## 📞 Support
+### Running Tests
 
-For support and questions:
-- Create an issue in the repository
-- Check the documentation
-- Review the logs for error details
+The server includes comprehensive endpoint testing. Use the `/docs` interface to test endpoints interactively.
+
+## License
+
+See LICENSE file in the project root.
+
+## Support
+
+For issues and questions, please refer to the main project documentation.

@@ -5,108 +5,6 @@ Welcome to **Violet**, a cutting-edge Bittensor subnet dedicated to decentralize
 ## 🌟 Overview
 
 Violet subnet enables a decentralized ecosystem where miners provide computational power for audio processing tasks while validators ensure quality and distribute rewards. The network integrates with a hosted proxy server for seamless task management and real-time processing.
-## 🏗️ System Architecture
-
-### Network Overview
-
-Violet subnet operates as a decentralized network of miners and validators, coordinated through a centralized proxy server for task distribution and result aggregation.
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                                    VIOLET SUBNET ARCHITECTURE                      │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   USER CLIENT   │    │  PROXY SERVER    │    │  BITTENSOR      │    │  CLOUD STORAGE   │
-│                 │    │                 │    │  NETWORK        │    │                 │
-│ • Web App       │───▶│ • Task Queue    │───▶│ • Miners        │───▶│ • Firebase       │
-│ • API Client    │    │ • Distribution   │    │ • Validators    │    │ • Cloud Storage  │
-│ • Mobile App    │    │ • Aggregation    │    │ • Consensus     │    │ • Firestore DB   │
-└─────────────────┘    └─────────────────┘    └─────────────────┘    └─────────────────┘
-                                │                        │                        │
-                                ▼                        ▼                        ▼
-                       ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-                       │  TASK MANAGER   │    │  AI PROCESSING  │    │  FILE MANAGER   │
-                       │                 │    │                 │    │                 │
-                       │ • Task Creation │    │ • Transcription │    │ • Upload/Download│
-                       │ • Assignment    │    │ • TTS Synthesis │    │ • Metadata Mgmt  │
-                       │ • Status Track  │    │ • Audio Analysis│    │ • Cache Control  │
-                       └─────────────────┘    └─────────────────┘    └─────────────────┘
-                                │                        │                        │
-                                ▼                        ▼                        ▼
-                       ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-                       │  VALIDATOR      │    │  MINER NODES    │    │  MONITORING     │
-                       │  CONSENSUS      │    │                 │    │                 │
-                       │                 │    │ • GPU Processing│    │ • Weights & Biases│
-                       │ • Quality Check │    │ • Model Loading │    │ • Performance    │
-                       │ • Reward Calc   │    │ • Response Gen  │    │ • Analytics      │
-                       │ • Network Health│    │ • Result Submit │    │ • Logging        │
-                       └─────────────────┘    └─────────────────┘    └─────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                                    DATA FLOW DIAGRAM                                │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
-│   1. UPLOAD │  │  2. QUEUE   │  │  3. ASSIGN  │  │  4. PROCESS │  │  5. EVALUATE│
-│             │  │             │  │             │  │             │  │             │
-│ User uploads│──▶│ Task created │──▶│ Distributed │──▶│ Miners     │──▶│ Validators  │
-│ audio/text  │  │ in Firestore│  │ to miners  │  │ process    │  │ evaluate    │
-│ to proxy    │  │ & queued    │  │ based on   │  │ with AI    │  │ quality &   │
-│ server      │  │ for dist.   │  │ availability│  │ models     │  │ distribute  │
-└─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘
-       │                │                │                │                │
-       ▼                ▼                ▼                ▼                ▼
-┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
-│ File stored │  │ Task status │  │ Load       │  │ Results     │  │ Rewards     │
-│ in Firebase │  │ tracked in  │  │ balanced   │  │ uploaded to │  │ calculated  │
-│ Cloud       │  │ real-time   │  │ across     │  │ Cloud       │  │ & distributed│
-│ Storage     │  │             │  │ network    │  │ Storage     │  │ to miners   │
-└─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                                    COMPONENT DETAILS                                │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│  PROXY SERVER (https://violet-proxy.onrender.com)                                   │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│ • Task Distribution Engine    │ • Response Aggregation    │ • Quality Control      │
-│ • Load Balancing Algorithm     │ • Buffer Management       │ • Duplicate Protection │
-│ • Real-time Status Tracking    │ • Performance Monitoring  │ • Error Handling       │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│  MINER NODES (Computational Power)                                                 │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│ • GPU-Accelerated Processing   │ • AI Model Management     │ • Response Generation  │
-│ • Task Execution Engine        │ • Memory Optimization    │ • Result Submission   │
-│ • Performance Tracking         │ • Error Recovery          │ • Health Monitoring   │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│  VALIDATOR NODES (Quality Assurance)                                               │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│ • Multi-Validator Consensus     │ • Quality Scoring         │ • Reward Calculation   │
-│ • Response Evaluation           │ • Performance Metrics     │ • Network Health Check │
-│ • Fairness Assurance            │ • Load Distribution       │ • Consensus Building   │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│  CLOUD INFRASTRUCTURE (Scalable Storage & Analytics)                               │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│ • Firebase Cloud Storage       │ • Firestore Database      │ • Weights & Biases     │
-│ • File Metadata Management     │ • Task Status Tracking    │ • Performance Analytics│
-│ • Scalable File Operations     │ • Real-time Updates       │ • Network Monitoring   │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Key Features
-- **Decentralized Audio Processing** - Distributed transcription, TTS, and audio analysis
-- **Quality Assurance** - Multi-validator consensus for reliable results
-- **Real-time Processing** - Low-latency audio processing with response buffering
-- **Scalable Architecture** - Cloud-based storage and task distribution
-- **Performance Monitoring** - Comprehensive metrics and analytics
 
 ## 💻 System Requirements
 
@@ -119,7 +17,7 @@ Violet subnet operates as a decentralized network of miners and validators, coor
 #### For Miners
 - **RAM**: 12 GB minimum
 - **Storage**: 500 GB SSD
-- **GPU**: NVIDIA GPU with 12 GB VRAM minimum
+- **GPU**: NVIDIA GPU with 12 GB VRAM minimum (recommended for TTS tasks)
 - **Network**: Stable internet connection (100+ Mbps)
 
 #### For Validators
@@ -131,40 +29,170 @@ Violet subnet operates as a decentralized network of miners and validators, coor
 ### Software Dependencies
 - Python 3.12+
 - CUDA 11.8+ (for GPU acceleration)
-- Docker (for containerized deployment)
-- Firebase project with Cloud Storage enabled
-- Firebase service account credentials
 - Bittensor CLI (`pip install bittensor-cli`)
 
-## 🚀 Network Features
+## 🚀 Quick Start
 
-- **Decentralized Audio Processing** - Distributed transcription, TTS, and audio analysis across the network
-- **Multi-Validator Consensus** - Quality assurance through multiple validator evaluation
-- **Real-time Task Distribution** - Smart task assignment to available miners
-- **Performance Monitoring** - Comprehensive metrics and analytics tracking
-- **Cloud Storage Integration** - Firebase Cloud Storage for scalable file management
-- **Weights & Biases Integration** - Performance monitoring and logging
-- **Automatic Load Balancing** - Intelligent distribution of computational load
-- **Quality Scoring** - Fair evaluation and reward distribution system
-
-## 📋 Prerequisites
-
-- Python 3.12+
-- Docker (for containerized deployment)
-- Firebase project with Cloud Storage enabled
-- Firebase service account credentials
-- Bittensor CLI (`pip install bittensor-cli`)
-
-## 🏗️ Bittensor Network Setup
-
-### Environment Setup
+### Step 1: Clone the Repository
 
 ```bash
-# Set up environment variables
-export PYTHONPATH=$PYTHONPATH:$(pwd)
-export CUDA_VISIBLE_DEVICES=0  # Use first GPU
-export WANDB_MODE=online       # Enable Weights & Biases logging
+git clone https://github.com/hivetrainai/violet.git
+cd violet
 ```
+
+### Step 2: Create Virtual Environment
+
+**Important:** Always create and activate a virtual environment before installing dependencies:
+
+```bash
+# Create virtual environment
+python -m venv venv
+
+# Activate virtual environment
+# On Linux/macOS:
+source venv/bin/activate
+# On Windows:
+venv\Scripts\activate
+```
+
+### Step 3: Install Dependencies
+
+```bash
+# Install the Violet package in development mode
+pip install -e .
+
+# Install additional requirements
+pip install -r requirements.txt
+```
+
+### Step 4: Set Up Environment Variables
+
+Create a `.env` file in the project root directory with the following required variables:
+
+```bash
+# Required: Hugging Face Token for model downloads
+HF_TOKEN=your_huggingface_token_here
+
+# Required: API Key for miner (get from subnet admin)
+MINER_API_KEY=your_miner_api_key_here
+
+# Required: API Key for validator (get from subnet admin)
+VALIDATOR_API_KEY=your_validator_api_key_here
+
+# Optional: Proxy server URL (defaults to production)
+PROXY_SERVER_URL=https://violet-proxy-bl4w.onrender.com
+```
+
+#### Getting Your Tokens and API Keys
+
+1. **Hugging Face Token:**
+   - Go to https://huggingface.co/settings/tokens
+   - Create a new token with "read" permissions
+   - Copy the token and add it to your `.env` file as `HF_TOKEN`
+
+2. **Miner/Validator API Keys:**
+   - Contact the subnet administrator to obtain your API keys
+   - Add them to your `.env` file as `MINER_API_KEY` and/or `VALIDATOR_API_KEY`
+
+**Important:** Never commit your `.env` file to version control. It contains sensitive credentials.
+
+### Step 5: Create Wallets
+
+Create a coldkey and hotkey for your subnet wallet:
+
+```bash
+# Install bittensor CLI (if not already installed)
+pip install bittensor-cli
+
+# Create a coldkey for the validator/miner
+btcli wallet new_coldkey --wallet.name <your_wallet_name>
+
+# Create a hotkey for the validator/miner
+btcli wallet new_hotkey --wallet.name <your_wallet_name> --wallet.hotkey default
+```
+
+### Step 6: Register on the Subnet
+
+Register as a miner or validator on the subnet:
+
+**Mainnet (NetUID 49):**
+```bash
+btcli subnet register --netuid 49 --subtensor.network finney --wallet.name <your_wallet_name> --wallet.hotkey default
+```
+
+**Testnet (NetUID 292):**
+```bash
+btcli subnet register --netuid 292 --subtensor.network test --wallet.name <your_wallet_name> --wallet.hotkey default
+```
+
+**Note:** Registration requires 0.005 TAO for mainnet or test tokens for testnet.
+
+### Step 7: Run the Miner
+
+**Mainnet:**
+```bash
+python neurons/miner.py \
+  --netuid 49 \
+  --subtensor.network finney \
+  --wallet.name <your_wallet_name> \
+  --wallet.hotkey <your_hotkey> \
+  --logging.debug \
+  --axon.ip 0.0.0.0 \
+  --axon.port <PORT> \
+  --axon.external_ip <YOUR_PUBLIC_IP> \
+  --axon.external_port <PORT>
+```
+
+**Testnet:**
+```bash
+python neurons/miner.py \
+  --netuid 292 \
+  --subtensor.network test \
+  --wallet.name <your_wallet_name> \
+  --wallet.hotkey <your_hotkey> \
+  --logging.debug \
+  --axon.ip 0.0.0.0 \
+  --axon.port <PORT> \
+  --axon.external_ip <YOUR_PUBLIC_IP> \
+  --axon.external_port <PORT>
+```
+
+### Step 8: Run the Validator
+
+**Mainnet:**
+```bash
+python neurons/validator.py \
+  --netuid 49 \
+  --subtensor.network finney \
+  --wallet.name <your_wallet_name> \
+  --wallet.hotkey <your_hotkey> \
+  --logging.debug \
+  --axon.ip 0.0.0.0 \
+  --axon.port <PORT> \
+  --axon.external_ip <YOUR_PUBLIC_IP> \
+  --axon.external_port <PORT>
+```
+
+**Testnet:**
+```bash
+python neurons/validator.py \
+  --netuid 292 \
+  --subtensor.network test \
+  --wallet.name <your_wallet_name> \
+  --wallet.hotkey <your_hotkey> \
+  --logging.debug \
+  --axon.ip 0.0.0.0 \
+  --axon.port <PORT> \
+  --axon.external_ip <YOUR_PUBLIC_IP> \
+  --axon.external_port <PORT>
+```
+
+## 📋 Network Configuration
+
+| Network | NetUID | Network Name | Registration Cost |
+|---------|--------|--------------|-------------------|
+| Mainnet | 49     | finney       | 0.005 TAO         |
+| Testnet | 292    | test         | 0.005 test tokens |
 
 ## 🔧 Configuration
 
@@ -181,208 +209,47 @@ python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 python -c "import torch; print(f'CUDA version: {torch.version.cuda}')"
 ```
 
-### Step 1: Create Wallets
+### Environment Variables Summary
 
-Create a coldkey and hotkey for your subnet wallet:
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `HF_TOKEN` | ✅ Yes | Hugging Face token for downloading AI models |
+| `MINER_API_KEY` | ✅ Yes (for miners) | API key for miner authentication |
+| `VALIDATOR_API_KEY` | ✅ Yes (for validators) | API key for validator authentication |
+| `PROXY_SERVER_URL` | ❌ No | Proxy server URL (defaults to production) |
 
-```bash
-# Install bittensor CLI
-pip install bittensor-cli
+## 🏗️ System Architecture
 
-# Create a coldkey for the validator/miner
-btcli wallet new_coldkey --wallet.name <your_wallet_name>
+### Network Overview
 
-# Create a hotkey for the validator/miner
-btcli wallet new_hotkey --wallet.name <your_wallet_name> --wallet.hotkey default
-```
+Violet subnet operates as a decentralized network of miners and validators, coordinated through a centralized proxy server for task distribution and result aggregation.
 
-### Step 2: Register on the Subnet
+#### Key Components
 
-Register as a miner or validator on the subnet:
+1. **Miners** (Computational Nodes)
+   - Audio Processing: Transcription, TTS, and audio analysis
+   - Task Execution: Processes assigned tasks with AI models
+   - Response Submission: Sends results back to proxy server
+   - Performance Monitoring: Tracks processing times and accuracy
 
-**Mainnet (NetUID 49):**
-```bash
-btcli subnet register --netuid 49 --subtensor.network finney --wallet.name <your_wallet_name> --wallet.hotkey default
-```
+2. **Validators** (Quality Assurance)
+   - Response Evaluation: Assesses miner response quality
+   - Reward Distribution: Calculates and distributes TAO rewards
+   - Network Health: Monitors miner performance and availability
 
-**Testnet (NetUID 292):**
-```bash
-btcli subnet register --netuid 292 --subtensor.network test --wallet.name <your_wallet_name> --wallet.hotkey default
-```
+3. **Proxy Server** (Task Management)
+   - Task Distribution: Routes tasks to available miners
+   - Response Aggregation: Collects and buffers miner responses
+   - Quality Control: Validates responses before final delivery
+   - Load Balancing: Distributes computational load across miners
 
-**Note:** Registration requires 0.005 TAO for mainnet or test tokens for testnet.
+## 🔐 Security & Best Practices
 
-### Step 3: Clone and Install Violet Repository
-
-Clone the official Violet repository and install the dependencies:
-
-```bash
-# Clone the Violet repository
-git clone https://github.com/hivetrainai/violet.git
-cd violet
-
-# Install the Violet package in development mode
-pip install -e .
-
-# Install additional requirements
-pip install -r requirements.txt
-
-# Return to the main directory
-cd ..
-```
-
-### Step 4: Run the Miner
-### Network Configuration
-
-Configure your network settings for optimal performance:
-
-```bash
-# Set network parameters
-export BT_NETUID=49          # Mainnet subnet ID
-export BT_NETWORK=finney     # Mainnet network
-export BT_WALLET_NAME=your_wallet_name
-export BT_WALLET_HOTKEY=default
-
-# For testnet
-export BT_NETUID=292         # Testnet subnet ID
-export BT_NETWORK=test       # Testnet network
-```
-
-Start your miner node:
-
-**Mainnet:**
-```bash
-python neurons/miner.py \
-  --netuid 49 \
-  --subtensor.network finney \
-  --wallet.name <your_wallet_name> \
-  --wallet.hotkey <your_hotkey> \
-  --logging.debug \
-  --axon.ip 0.0.0.0 \
-  --axon.port <PORT> \
-  --axon.external_ip <YOUR_PUBLIC_IP> \
-  --axon.external_port <PORT>
-```
-
-**Testnet:**
-```bash
-python neurons/miner.py \
-  --netuid 292 \
-  --subtensor.network test \
-  --wallet.name <your_wallet_name> \
-  --wallet.hotkey <your_hotkey> \
-  --logging.debug \
-  --axon.ip 0.0.0.0 \
-  --axon.port <PORT> \
-  --axon.external_ip <YOUR_PUBLIC_IP> \
-  --axon.external_port <PORT>
-```
-
-### Step 5: Run the Validator
-
-Start your validator node:
-
-**Mainnet:**
-```bash
-python neurons/validator.py \
-  --netuid 49 \
-  --subtensor.network finney \
-  --wallet.name <your_wallet_name> \
-  --wallet.hotkey <your_hotkey> \
-  --logging.debug \
-  --axon.ip 0.0.0.0 \
-  --axon.port <PORT> \
-  --axon.external_ip <YOUR_PUBLIC_IP> \
-  --axon.external_port <PORT>
-```
-
-**Testnet:**
-```bash
-python neurons/validator.py \
-  --netuid 292 \
-  --subtensor.network test \
-  --wallet.name <your_wallet_name> \
-  --wallet.hotkey <your_hotkey> \
-  --logging.debug \
-  --axon.ip 0.0.0.0 \
-  --axon.port <PORT> \
-  --axon.external_ip <YOUR_PUBLIC_IP> \
-  --axon.external_port <PORT>
-```
-
-### Network Configuration Summary
-
-| Network | NetUID | Network Name | Registration Cost |
-|---------|--------|--------------|-------------------|
-| Mainnet | 49     | finney       | 0.005 TAO         |
-| Testnet | 292    | test         | 0.005 test tokens |
-
-
-
-
-### Component Architecture
-
-#### 1. **Proxy Server**
-- **Task Distribution**: Routes tasks to available miners
-- **Response Aggregation**: Collects and buffers miner responses
-- **Quality Control**: Validates responses before final delivery
-- **Load Balancing**: Distributes computational load across miners
-
-#### 2. **Miners** (Computational Nodes)
-- **Audio Processing**: Transcription, TTS, and audio analysis
-- **Task Execution**: Processes assigned tasks with AI models
-- **Response Submission**: Sends results back to proxy server
-- **Performance Monitoring**: Tracks processing times and accuracy
-
-#### 3. **Validators** (Quality Assurance)
-- **Response Evaluation**: Assesses miner response quality
-- **Consensus Building**: Multi-validator agreement on results
-- **Reward Distribution**: Calculates and distributes TAO rewards
-- **Network Health**: Monitors miner performance and availability
-
-#### 4. **Cloud Infrastructure**
-- **Firebase Cloud Storage**: Scalable file storage and retrieval
-- **Firestore Database**: Task metadata and result tracking
-- **Weights & Biases**: Performance monitoring and analytics
-
-### Data Flow
-
-```
-1. User Upload → Proxy Server
-   ├── File stored in Firebase Cloud Storage
-   ├── Task created in Firestore
-   └── Task queued for distribution
-
-2. Task Distribution → Miners
-   ├── Proxy server assigns tasks to available miners
-   ├── Miners download files from Cloud Storage
-   └── Miners process tasks using AI models
-
-3. Response Collection → Proxy Server
-   ├── Miners upload results to Cloud Storage
-   ├── Results aggregated by proxy server
-   └── Quality validation performed
-
-4. Validator Evaluation → Consensus
-   ├── Validators evaluate miner responses
-   ├── Multi-validator consensus reached
-   ├── Rewards calculated and distributed
-   └── Results delivered to user
-
-5. Performance Tracking → Analytics
-   ├── Metrics logged to Weights & Biases
-   ├── Network health monitored
-   └── Performance optimizations applied
-```
-
-### Security & Reliability
-
-- **Multi-Validator Consensus**: Ensures result accuracy through multiple validators
-- **Duplicate Protection**: Prevents double-processing of tasks
-- **Response Buffering**: Handles network latency and miner failures
-- **Quality Scoring**: Fair evaluation system for miner rewards
-- **Load Balancing**: Prevents network overload and ensures fair distribution
-
+- **Never commit `.env` files** - They contain sensitive credentials
+- **Use virtual environments** - Isolate dependencies for each project
+- **Keep API keys secure** - Rotate keys if compromised
+- **Monitor GPU usage** - Ensure adequate cooling and power supply
+- **Regular updates** - Keep dependencies and codebase up to date
 
 ## 📄 License
 

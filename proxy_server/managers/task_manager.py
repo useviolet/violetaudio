@@ -7,15 +7,21 @@ import uuid
 import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional, Any
-from firebase_admin import firestore
-from database.enhanced_schema import TaskStatus, TaskPriority
+from database.enhanced_schema import TaskStatus, TaskPriority, DatabaseOperations
+from database.postgresql_adapter import PostgreSQLAdapter
 
 class TaskManager:
     def __init__(self, db):
         self.db = db
-        self.tasks_collection = db.collection('tasks')
-        self.miner_responses_collection = db.collection('miner_responses')
-        self.task_metrics_collection = db.collection('task_metrics')
+        # Check if using PostgreSQL adapter
+        self.is_postgresql = isinstance(db, PostgreSQLAdapter)
+        
+        if not self.is_postgresql:
+            # Legacy Firestore support
+            from firebase_admin import firestore
+            self.tasks_collection = db.collection('tasks')
+            self.miner_responses_collection = db.collection('miner_responses')
+            self.task_metrics_collection = db.collection('task_metrics')
         
         # Miner assignment configuration
         self.min_miners_per_task = 1
@@ -24,8 +30,10 @@ class TaskManager:
         
         # Import and initialize batch database manager
         try:
-            from ..database.batch_manager import BatchDatabaseManager
-            self.batch_manager = BatchDatabaseManager(db)
+            # Batch manager removed - PostgreSQL doesn't need Firestore batch operations
+            # from database.batch_manager import BatchDatabaseManager
+            # self.batch_manager = BatchDatabaseManager(db)
+            self.batch_manager = None  # Not used with PostgreSQL
             print("✅ Batch database manager initialized")
         except ImportError as e:
             print(f"⚠️ Could not import batch database manager: {e}")
@@ -34,36 +42,28 @@ class TaskManager:
     async def create_task(self, task_data: Dict) -> str:
         """Create a new task"""
         try:
-            # Generate task ID
-            task_id = str(uuid.uuid4())
-            
-            # Create task document
+            # Prepare task data
             task_doc = {
-                'task_id': task_id,
                 'task_type': task_data['task_type'],
-                'input_file_id': task_data['input_file_id'],
+                'input_file_id': task_data.get('input_file_id'),
                 'source_language': task_data.get('source_language', 'en'),
-                'target_language': task_data.get('target_language', 'en'),
+                'target_language': task_data.get('target_language'),
                 'priority': task_data.get('priority', 'normal'),
                 'status': task_data.get('status', 'pending'),
-                'created_at': firestore.SERVER_TIMESTAMP,
-                'updated_at': firestore.SERVER_TIMESTAMP,
                 'assigned_miners': [],
                 'required_miner_count': self._calculate_required_miner_count(task_data),
-                'estimated_completion_time': task_data.get('estimated_completion_time', 60),
+                'min_miner_count': task_data.get('min_miner_count', 1),
+                'max_miner_count': task_data.get('max_miner_count', 5),
                 'callback_url': task_data.get('callback_url'),
-                'user_metadata': task_data.get('user_metadata', {})
+                'user_metadata': task_data.get('user_metadata', {}),
+                'model_id': task_data.get('model_id'),
+                'voice_name': task_data.get('voice_name'),
+                'speaker_wav_url': task_data.get('speaker_wav_url')
             }
             
-            # Use batch manager if available, otherwise save directly
-            if self.batch_manager:
-                # Use batch operation
-                await self.batch_manager.create_task(task_doc)
-                print(f"✅ Task queued for creation: {task_id} ({task_data['task_type']}) - Required miners: {task_doc['required_miner_count']}")
-            else:
-                # Fallback to direct save
-                self.tasks_collection.document(task_id).set(task_doc)
-                print(f"✅ Task created directly: {task_id} ({task_data['task_type']}) - Required miners: {task_doc['required_miner_count']}")
+            # Use DatabaseOperations for PostgreSQL compatibility
+            task_id = DatabaseOperations.create_task(self.db, task_doc)
+            print(f"✅ Task created: {task_id} ({task_data['task_type']}) - Required miners: {task_doc['required_miner_count']}")
             
             return task_id
             
@@ -99,29 +99,15 @@ class TaskManager:
             if len(miner_uids) > self.max_miners_per_task:
                 raise ValueError(f"Task cannot have more than {self.max_miners_per_task} miners, got {len(miner_uids)}")
             
-            # Update task with assigned miners
-            self.tasks_collection.document(task_id).update({
-                'assigned_miners': miner_uids,
-                'status': TaskStatus.ASSIGNED.value,
-                'distributed_at': firestore.SERVER_TIMESTAMP,
-                'actual_miner_count': len(miner_uids)
-            })
+            # Use DatabaseOperations for PostgreSQL compatibility
+            min_count = self.min_miners_per_task
+            max_count = self.max_miners_per_task
+            success = DatabaseOperations.assign_task_to_miners(self.db, task_id, miner_uids, min_count, max_count)
             
-            # Create miner response tracking documents
-            for miner_uid in miner_uids:
-                self.miner_responses_collection.document(f"{task_id}_{miner_uid}").set({
-                    'task_id': task_id,
-                    'miner_uid': miner_uid,
-                    'status': 'assigned',
-                    'assigned_at': firestore.SERVER_TIMESTAMP,
-                    'response_data': None,
-                    'metrics': {},
-                    'processing_time': None,
-                    'accuracy_score': None,
-                    'speed_score': None
-                })
-            
-            print(f"✅ Task {task_id} assigned to {len(miner_uids)} miners (UIDs: {miner_uids})")
+            if success:
+                print(f"✅ Task {task_id} assigned to {len(miner_uids)} miners (UIDs: {miner_uids})")
+            else:
+                raise Exception("Failed to assign miners to task")
             
         except Exception as e:
             print(f"❌ Failed to assign miners to task {task_id}: {e}")
@@ -163,14 +149,14 @@ class TaskManager:
     async def update_task_status(self, task_id: str, status: str, **kwargs):
         """Update task status and additional fields"""
         try:
-            update_data = {
-                'status': status,
-                'updated_at': firestore.SERVER_TIMESTAMP
-            }
-            update_data.update(kwargs)
+            # Convert status string to enum if needed
+            status_enum = TaskStatus(status) if isinstance(status, str) else status
+            success = DatabaseOperations.update_task_status(self.db, task_id, status_enum, **kwargs)
             
-            self.tasks_collection.document(task_id).update(update_data)
-            print(f"✅ Task {task_id} status updated to {status}")
+            if success:
+                print(f"✅ Task {task_id} status updated to {status}")
+            else:
+                raise Exception("Failed to update task status")
             
         except Exception as e:
             print(f"❌ Failed to update task {task_id}: {e}")
@@ -179,15 +165,8 @@ class TaskManager:
     async def get_tasks_by_status(self, status: str, limit: int = 100) -> List[Dict]:
         """Get tasks by status"""
         try:
-            query = self.tasks_collection.where('status', '==', status).limit(limit)
-            docs = query.stream()
-            
-            tasks = []
-            for doc in docs:
-                task_data = doc.to_dict()
-                task_data['id'] = doc.id
-                tasks.append(task_data)
-            
+            status_enum = TaskStatus(status) if isinstance(status, str) else status
+            tasks = DatabaseOperations.get_tasks_by_status(self.db, status_enum, limit)
             return tasks
             
         except Exception as e:
@@ -197,11 +176,7 @@ class TaskManager:
     def get_task(self, task_id: str) -> Optional[Dict]:
         """Get a specific task by ID"""
         try:
-            doc = self.tasks_collection.document(task_id).get()
-            if doc.exists:
-                return doc.to_dict()
-            return None
-            
+            return DatabaseOperations.get_task(self.db, task_id)
         except Exception as e:
             print(f"❌ Error getting task {task_id}: {e}")
             return None
@@ -209,17 +184,34 @@ class TaskManager:
     async def delete_task(self, task_id: str) -> bool:
         """Delete a task and all associated data"""
         try:
-            # Delete task
-            self.tasks_collection.document(task_id).delete()  # Remove await
-            
-            # Delete associated miner responses
-            query = self.miner_responses_collection.where('task_id', '==', task_id)
-            responses = query.stream()
-            for doc in responses:
-                doc.reference.delete()  # Remove await
-            
-            print(f"✅ Task {task_id} deleted successfully")
-            return True
+            if self.is_postgresql:
+                # PostgreSQL: Delete task (cascade will handle assignments)
+                from database.postgresql_schema import Task
+                session = self.db._get_session()
+                try:
+                    task = session.query(Task).filter(Task.task_id == task_id).first()
+                    if task:
+                        session.delete(task)
+                        session.commit()
+                        print(f"✅ Task {task_id} deleted successfully")
+                        return True
+                    else:
+                        print(f"⚠️ Task {task_id} not found")
+                        return False
+                finally:
+                    session.close()
+            else:
+                # Firestore (legacy)
+                self.tasks_collection.document(task_id).delete()
+                
+                # Delete associated miner responses
+                query = self.miner_responses_collection.where('task_id', '==', task_id)
+                responses = query.stream()
+                for doc in responses:
+                    doc.reference.delete()
+                
+                print(f"✅ Task {task_id} deleted successfully")
+                return True
             
         except Exception as e:
             print(f"❌ Failed to delete task {task_id}: {e}")

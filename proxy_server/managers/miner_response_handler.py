@@ -6,14 +6,19 @@ Manages miner responses, task completion tracking, and immediate user feedback
 import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional, Any
-from firebase_admin import firestore
-from database.enhanced_schema import TaskStatus, COLLECTIONS
+from database.enhanced_schema import TaskStatus, COLLECTIONS, DatabaseOperations
+from database.postgresql_adapter import PostgreSQLAdapter
 
 class MinerResponseHandler:
     def __init__(self, db, task_manager=None):
         self.db = db
         self.task_manager = task_manager
-        self.tasks_collection = db.collection('tasks')
+        self.is_postgresql = isinstance(db, PostgreSQLAdapter)
+        
+        if not self.is_postgresql:
+            # Legacy Firestore support
+            from firebase_admin import firestore
+            self.tasks_collection = db.collection('tasks')
         
         # Import and initialize response aggregator
         try:
@@ -30,12 +35,12 @@ class MinerResponseHandler:
             print(f"📥 Handling miner {miner_uid} response for task {task_id}")
             
             # 🔒 DUPLICATE PROTECTION: Check if miner already responded to this task
-            current_task = self.tasks_collection.document(task_id).get()
-            if not current_task.exists:
+            current_task = DatabaseOperations.get_task(self.db, task_id)
+            if not current_task:
                 print(f"❌ Task {task_id} not found in database")
                 return False
             
-            task_data = current_task.to_dict()
+            task_data = current_task
             miner_responses = task_data.get('miner_responses', [])
             
             # Check for duplicate responses from the same miner
@@ -84,15 +89,12 @@ class MinerResponseHandler:
                     print(f"⚠️  Failed to store TTS audio file: {e}")
             
             # Store response directly in task document (embedded approach)
-            task_ref = self.tasks_collection.document(task_id)
-            
             # Get current task data again (in case it changed)
-            current_task = task_ref.get()
-            if not current_task.exists:
+            current_task_data = DatabaseOperations.get_task(self.db, task_id)
+            if not current_task_data:
                 print(f"❌ Task {task_id} not found in database during response storage")
                 return False
             
-            current_task_data = current_task.to_dict()
             current_miner_responses = current_task_data.get('miner_responses', [])
             
             # 🔒 DUPLICATE PROTECTION: Double-check for duplicates before storing
@@ -108,22 +110,67 @@ class MinerResponseHandler:
                 # Fallback for old dictionary format
                 current_miner_responses = [response_doc]
             
-            # Update task with embedded response - use firestore.SERVER_TIMESTAMP for top-level fields
+            # Update task with embedded response
             update_data = {
                 'miner_responses': current_miner_responses,
-                'updated_at': firestore.SERVER_TIMESTAMP
+                'updated_at': datetime.utcnow()
             }
             
-            # Check if all miners completed
+            # Check if task should be marked as completed
+            # Use min_miner_count instead of all assigned miners to prevent tasks from getting stuck
             assigned_miners = current_task_data.get('assigned_miners', [])
-            if len(current_miner_responses) >= len(assigned_miners):
+            assigned_count = len(assigned_miners) if assigned_miners else 0
+            response_count = len(current_miner_responses)
+            min_miner_count = current_task_data.get('min_miner_count', 1)
+            required_miner_count = current_task_data.get('required_miner_count', 3)
+            
+            # Get task age to check for timeout
+            task_created_at = current_task_data.get('created_at')
+            if isinstance(task_created_at, str):
+                from dateutil import parser
+                task_created_at = parser.parse(task_created_at)
+            task_age_seconds = (datetime.utcnow() - task_created_at).total_seconds() if task_created_at else 0
+            task_age_hours = task_age_seconds / 3600
+            
+            # Task completion criteria:
+            # 1. Minimum miners responded (min_miner_count) OR
+            # 2. Task is old enough (1 hour) and has at least 1 response OR
+            # 3. All assigned miners responded (original behavior)
+            should_complete = False
+            completion_reason = ""
+            
+            if response_count >= min_miner_count:
+                should_complete = True
+                completion_reason = f"min_miner_count met ({response_count} >= {min_miner_count})"
+            elif task_age_hours >= 1.0 and response_count >= 1:
+                should_complete = True
+                completion_reason = f"timeout reached ({task_age_hours:.1f}h) with {response_count} response(s)"
+            elif assigned_count > 0 and response_count >= assigned_count:
+                should_complete = True
+                completion_reason = f"all assigned miners responded ({response_count}/{assigned_count})"
+            
+            if should_complete:
                 update_data['status'] = TaskStatus.COMPLETED.value
-                update_data['all_miners_completed_at'] = firestore.SERVER_TIMESTAMP
+                update_data['all_miners_completed_at'] = datetime.utcnow()
+                update_data['completed_at'] = datetime.utcnow()
+                update_data['completion_reason'] = completion_reason
+                update_data['actual_response_count'] = response_count
+                update_data['expected_response_count'] = assigned_count
                 
-                # Calculate best response
+                print(f"✅ Task {task_id} COMPLETED: {response_count}/{assigned_count} miners responded ({completion_reason})")
+                
+                # Calculate best response from available responses
                 best_response = self._calculate_best_response(current_miner_responses)
                 if best_response:
                     update_data['best_response'] = best_response
+                
+                # Decrement miner load only for miners who actually responded
+                responded_miner_uids = [r.get('miner_uid') for r in current_miner_responses if r.get('miner_uid')]
+                for miner_uid in responded_miner_uids:
+                    DatabaseOperations.update_miner_task_load(self.db, miner_uid, increment=False)
+                    print(f"📉 Decremented miner {miner_uid} load (task {task_id} completed)")
+                
+                # Note: Miners who didn't respond will have their load decremented by timeout cleanup
             
             # Use response aggregator if available, otherwise fall back to immediate update
             if self.response_aggregator:
@@ -131,8 +178,11 @@ class MinerResponseHandler:
                 await self.response_aggregator.buffer_miner_response(task_id, miner_uid, response_doc)
                 print(f"✅ Miner {miner_uid} response buffered for task {task_id}")
             else:
-                # Fallback to immediate update
-                task_ref.update(update_data)
+                # Fallback to immediate update using DatabaseOperations
+                DatabaseOperations.add_miner_response(self.db, task_id, miner_uid, response_doc)
+                # Also update status if needed
+                if 'status' in update_data:
+                    DatabaseOperations.update_task_status(self.db, task_id, TaskStatus(update_data['status']), **{k: v for k, v in update_data.items() if k != 'status'})
                 print(f"✅ Miner {miner_uid} response stored immediately in task {task_id}")
             
             return True
@@ -149,18 +199,39 @@ class MinerResponseHandler:
             total_responses = 0
             
             # Query all tasks to analyze response patterns
-            tasks = self.tasks_collection.stream()
-            for task_doc in tasks:
-                task_data = task_doc.to_dict()
-                miner_responses = task_data.get('miner_responses', [])
-                
-                if isinstance(miner_responses, list):
-                    total_responses += len(miner_responses)
+            if self.is_postgresql:
+                # PostgreSQL: Get all tasks
+                from database.postgresql_schema import Task
+                session = self.db._get_session()
+                try:
+                    tasks = session.query(Task).all()
+                    for task in tasks:
+                        task_data = self.db._task_to_dict(task)
+                        miner_responses = task_data.get('miner_responses', [])
+                        
+                        if isinstance(miner_responses, list):
+                            total_responses += len(miner_responses)
+                            
+                            # Check for duplicate miner UIDs
+                            miner_uids = [resp.get('miner_uid') for resp in miner_responses]
+                            if len(miner_uids) != len(set(miner_uids)):
+                                duplicate_count += 1
+                finally:
+                    session.close()
+            else:
+                # Firestore (legacy)
+                tasks = self.tasks_collection.stream()
+                for task_doc in tasks:
+                    task_data = task_doc.to_dict()
+                    miner_responses = task_data.get('miner_responses', [])
                     
-                    # Check for duplicate miner UIDs
-                    miner_uids = [resp.get('miner_uid') for resp in miner_responses]
-                    if len(miner_uids) != len(set(miner_uids)):
-                        duplicate_count += 1
+                    if isinstance(miner_responses, list):
+                        total_responses += len(miner_responses)
+                        
+                        # Check for duplicate miner UIDs
+                        miner_uids = [resp.get('miner_uid') for resp in miner_responses]
+                        if len(miner_uids) != len(set(miner_uids)):
+                            duplicate_count += 1
             
             return {
                 'duplicate_protection_active': True,
@@ -207,11 +278,9 @@ class MinerResponseHandler:
     async def get_task_completion_status(self, task_id: str) -> Dict[str, Any]:
         """Get task completion status and miner response summary"""
         try:
-            task_doc = self.tasks_collection.document(task_id).get()
-            if not task_doc.exists:
+            task_data = DatabaseOperations.get_task(self.db, task_id)
+            if not task_data:
                 return {'error': 'Task not found'}
-            
-            task_data = task_doc.to_dict()
             miner_responses = task_data.get('miner_responses', [])
             
             response_statuses = {}
@@ -267,11 +336,10 @@ class MinerResponseHandler:
     async def get_best_response(self, task_id: str) -> Optional[Dict]:
         """Get the best response for a completed task"""
         try:
-            task_doc = self.tasks_collection.document(task_id).get()
-            if not task_doc.exists:
+            task_data = DatabaseOperations.get_task(self.db, task_id)
+            if not task_data:
                 return None
             
-            task_data = task_doc.to_dict()
             return task_data.get('best_response')
             
         except Exception as e:
@@ -298,13 +366,8 @@ class MinerResponseHandler:
     async def _update_task_status(self, task_id: str, status: str, **kwargs):
         """Update task status with additional fields"""
         try:
-            update_data = {
-                'status': status,
-                'updated_at': firestore.SERVER_TIMESTAMP
-            }
-            update_data.update(kwargs)
-            
-            self.tasks_collection.document(task_id).update(update_data)
+            status_enum = TaskStatus(status) if isinstance(status, str) else status
+            DatabaseOperations.update_task_status(self.db, task_id, status_enum, **kwargs)
             
         except Exception as e:
             print(f"❌ Error updating task status: {e}")
@@ -323,11 +386,10 @@ class MinerResponseHandler:
     async def cleanup_failed_responses(self, task_id: str):
         """Clean up failed or invalid miner responses"""
         try:
-            task_doc = self.tasks_collection.document(task_id).get()
-            if not task_doc.exists:
+            task_data = DatabaseOperations.get_task(self.db, task_id)
+            if not task_data:
                 return
             
-            task_data = task_doc.to_dict()
             miner_responses = task_data.get('miner_responses', [])
             
             # Filter out failed responses
@@ -338,11 +400,8 @@ class MinerResponseHandler:
             
             # Update task with cleaned responses
             if len(valid_responses) != len(miner_responses):
-                self.tasks_collection.document(task_id).update({
-                    'miner_responses': valid_responses,
-                    'updated_at': firestore.SERVER_TIMESTAMP
-                })
-                
+                DatabaseOperations.update_task_status(self.db, task_id, TaskStatus(task_data.get('status', 'pending')), 
+                                                     miner_responses=valid_responses)
                 print(f"🧹 Cleaned up failed responses for task {task_id}")
             
         except Exception as e:

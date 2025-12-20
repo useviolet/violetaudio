@@ -21,6 +21,7 @@ import tempfile
 import os
 from typing import Optional, Tuple, Dict, List, Union
 import logging
+from template.utils.hf_token import get_hf_token_dict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -83,6 +84,9 @@ class TranslationPipeline:
             "vi": "vietnamese"
         }
         
+        # Get HF token if available
+        hf_token_kwargs = get_hf_token_dict()
+        
         # Model loading with multiple fallback options
         fallback_models = [
             "t5-small",  # Simple, reliable T5 model
@@ -93,8 +97,8 @@ class TranslationPipeline:
         for fallback_model in fallback_models:
             try:
                 logger.info(f"🔄 Loading translation model: {fallback_model}")
-                self.tokenizer = AutoTokenizer.from_pretrained(fallback_model)
-                self.model = AutoModelForSeq2SeqLM.from_pretrained(fallback_model)
+                self.tokenizer = AutoTokenizer.from_pretrained(fallback_model, **hf_token_kwargs)
+                self.model = AutoModelForSeq2SeqLM.from_pretrained(fallback_model, **hf_token_kwargs)
                 self.model.to(self.device)
                 self.model_name = fallback_model
                 logger.info(f"✅ Translation model loaded successfully on {self.device}: {fallback_model}")
@@ -104,7 +108,8 @@ class TranslationPipeline:
                     self.translation_pipeline = pipeline(
                         "translation", 
                         model=fallback_model, 
-                        device=0 if self.device == "cuda" else -1
+                        device=0 if self.device == "cuda" else -1,
+                        token=hf_token_kwargs.get("token") if hf_token_kwargs else None
                     )
                     logger.info("✅ Translation pipeline initialized successfully")
                     break
@@ -512,4 +517,16 @@ class TranslationPipeline:
         self._cleanup_memory()
 
 # Global instance
-translation_pipeline = TranslationPipeline()
+# Global instance for backward compatibility (lazy initialization)
+# Removed immediate instantiation to prevent model loading during import
+_translation_pipeline_instance = None
+
+def get_translation_pipeline_instance():
+    """Get or create the global translation pipeline instance (lazy)"""
+    global _translation_pipeline_instance
+    if _translation_pipeline_instance is None:
+        _translation_pipeline_instance = TranslationPipeline()
+    return _translation_pipeline_instance
+
+# For backward compatibility - but prefer creating new instances
+translation_pipeline = None

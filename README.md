@@ -115,7 +115,7 @@ btcli wallet new_hotkey --wallet.name <your_wallet_name> --wallet.hotkey default
 
 Register as a miner or validator on the subnet:
 
-**Mainnet (NetUID 49):**
+**Mainnet (NetUID TBC):**
 ```bash
 btcli subnet register --netuid 49 --subtensor.network finney --wallet.name <your_wallet_name> --wallet.hotkey default
 ```

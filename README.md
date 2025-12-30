@@ -132,7 +132,7 @@ btcli subnet register --netuid 292 --subtensor.network test --wallet.name <your_
 **Mainnet:**
 ```bash
 python neurons/miner.py \
-  --netuid 49 \
+  --netuid TBC \
   --subtensor.network finney \
   --wallet.name <your_wallet_name> \
   --wallet.hotkey <your_hotkey> \
@@ -162,7 +162,7 @@ python neurons/miner.py \
 **Mainnet:**
 ```bash
 python neurons/validator.py \
-  --netuid 49 \
+  --netuid TBC \
   --subtensor.network finney \
   --wallet.name <your_wallet_name> \
   --wallet.hotkey <your_hotkey> \
@@ -191,7 +191,7 @@ python neurons/validator.py \
 
 | Network | NetUID | Network Name | Registration Cost |
 |---------|--------|--------------|-------------------|
-| Mainnet | 49     | finney       | 0.005 TAO         |
+| Mainnet | TBC     | finney       | 0.005 TAO         |
 | Testnet | 292    | test         | 0.005 test tokens |
 
 ## 🔧 Configuration
@@ -237,11 +237,6 @@ Violet subnet operates as a decentralized network of miners and validators, coor
    - Reward Distribution: Calculates and distributes TAO rewards
    - Network Health: Monitors miner performance and availability
 
-3. **Proxy Server** (Task Management)
-   - Task Distribution: Routes tasks to available miners
-   - Response Aggregation: Collects and buffers miner responses
-   - Quality Control: Validates responses before final delivery
-   - Load Balancing: Distributes computational load across miners
 
 ## 🔐 Security & Best Practices
 

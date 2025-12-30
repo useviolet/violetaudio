@@ -6,6 +6,34 @@ Welcome to **Violet**, a cutting-edge Bittensor subnet dedicated to decentralize
 
 Violet subnet enables a decentralized ecosystem where miners provide computational power for audio processing tasks while validators ensure quality and distribute rewards. The network integrates with a hosted proxy server for seamless task management and real-time processing.
 
+## 🏗️ System Architecture
+
+### Network Overview
+
+Violet subnet operates as a decentralized network of miners and validators, coordinated through a centralized proxy server for task distribution and result aggregation.
+
+#### Key Components
+
+1. **Miners** (Computational Nodes)
+   - Audio Processing: Transcription, TTS, and audio analysis
+   - Task Execution: Processes assigned tasks with AI models
+   - Response Submission: Sends results back to proxy server
+   - Performance Monitoring: Tracks processing times and accuracy
+
+2. **Validators** (Quality Assurance)
+   - Response Evaluation: Assesses miner response quality
+   - Reward Distribution: Calculates and distributes TAO rewards
+   - Network Health: Monitors miner performance and availability
+
+
+## 🔐 Security & Best Practices
+
+- **Never commit `.env` files** - They contain sensitive credentials
+- **Use virtual environments** - Isolate dependencies for each project
+- **Keep API keys secure** - Rotate keys if compromised
+- **Monitor GPU usage** - Ensure adequate cooling and power supply
+- **Regular updates** - Keep dependencies and codebase up to date
+
 ## 💻 System Requirements
 
 ### Operating System
@@ -218,33 +246,6 @@ python -c "import torch; print(f'CUDA version: {torch.version.cuda}')"
 | `VALIDATOR_API_KEY` | ✅ Yes (for validators) | API key for validator authentication |
 | `PROXY_SERVER_URL` | ❌ No | Proxy server URL (defaults to production) |
 
-## 🏗️ System Architecture
-
-### Network Overview
-
-Violet subnet operates as a decentralized network of miners and validators, coordinated through a centralized proxy server for task distribution and result aggregation.
-
-#### Key Components
-
-1. **Miners** (Computational Nodes)
-   - Audio Processing: Transcription, TTS, and audio analysis
-   - Task Execution: Processes assigned tasks with AI models
-   - Response Submission: Sends results back to proxy server
-   - Performance Monitoring: Tracks processing times and accuracy
-
-2. **Validators** (Quality Assurance)
-   - Response Evaluation: Assesses miner response quality
-   - Reward Distribution: Calculates and distributes TAO rewards
-   - Network Health: Monitors miner performance and availability
-
-
-## 🔐 Security & Best Practices
-
-- **Never commit `.env` files** - They contain sensitive credentials
-- **Use virtual environments** - Isolate dependencies for each project
-- **Keep API keys secure** - Rotate keys if compromised
-- **Monitor GPU usage** - Ensure adequate cooling and power supply
-- **Regular updates** - Keep dependencies and codebase up to date
 
 ## 📄 License
 

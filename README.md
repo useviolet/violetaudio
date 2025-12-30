@@ -8,10 +8,6 @@ Violet subnet enables a decentralized ecosystem where miners provide computation
 
 ## 🏗️ System Architecture
 
-### Network Overview
-
-Violet subnet operates as a decentralized network of miners and validators, coordinated through a centralized proxy server for task distribution and result aggregation.
-
 #### Key Components
 
 1. **Miners** (Computational Nodes)

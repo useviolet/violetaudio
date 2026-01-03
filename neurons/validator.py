@@ -103,6 +103,8 @@ class Validator(BaseValidatorNeuron):
         
         # Weight setting optimization
         self.last_weight_setting_block = 0
+        self.last_weight_commit_timestamp = 0  # Track timestamp of last successful weight commit
+        self.min_weight_commit_interval = 600  # Minimum 10 minutes between weight commits (Bittensor cooldown)
         self.weight_setting_interval = 100  # Set weights every 100 blocks
         self.miner_weight_history = {}  # Track weight changes over time
         
@@ -260,7 +262,8 @@ class Validator(BaseValidatorNeuron):
     
     def should_set_weights(self) -> bool:
         """
-        Enhanced weight setting logic with better block monitoring and evaluation tracking
+        Enhanced weight setting logic with better block monitoring and evaluation tracking.
+        Includes time-based cooldown to respect Bittensor's commit-reveal mechanism.
         """
         if not hasattr(self, 'block'):
             return False
@@ -275,11 +278,29 @@ class Validator(BaseValidatorNeuron):
             bt.logging.info("🔄 Skipping weight setting - no reachable miners available")
             return False
         
+        # CRITICAL FIX: Check if new evaluation occurred since last weight setting
+        # Only set weights if we've evaluated new tasks
+        if hasattr(self, 'last_evaluation_block') and hasattr(self, 'last_weight_setting_block'):
+            if self.last_evaluation_block <= self.last_weight_setting_block:
+                bt.logging.info("🔄 Skipping weight setting - no new evaluation since last weight setting")
+                bt.logging.info(f"   Last evaluation block: {self.last_evaluation_block}, Last weight setting block: {self.last_weight_setting_block}")
+                return False
+        
+        # CRITICAL FIX: Check time-based cooldown (Bittensor commit-reveal cooldown)
+        if self.last_weight_commit_timestamp > 0:
+            time_since_last_commit = time.time() - self.last_weight_commit_timestamp
+            if time_since_last_commit < self.min_weight_commit_interval:
+                bt.logging.info(f"⏳ Too soon to commit weights ({time_since_last_commit:.0f}s < {self.min_weight_commit_interval}s cooldown)")
+                bt.logging.info(f"   Bittensor commit-reveal mechanism requires minimum {self.min_weight_commit_interval}s between commits")
+            return False
+        
         # Check if enough blocks have passed since last weight setting
         blocks_since_weight_setting = self.block - self.last_weight_setting_block
         
         if blocks_since_weight_setting >= self.weight_setting_interval:
             bt.logging.info(f"⚖️  Weight setting trigger: {blocks_since_weight_setting} blocks since last weight setting")
+            bt.logging.info(f"   Time since last commit: {time.time() - self.last_weight_commit_timestamp:.0f}s (cooldown: {self.min_weight_commit_interval}s)")
+            bt.logging.info(f"   New evaluation occurred: {self.last_evaluation_block > self.last_weight_setting_block}")
             
             # Reset the flag when we're about to set weights (new epoch)
             self.proxy_tasks_processed_this_epoch = False
@@ -349,8 +370,8 @@ class Validator(BaseValidatorNeuron):
                 if not is_serving:
                     continue  # Skip non-serving miners
                 
-                serving_miners += 1
-                
+                    serving_miners += 1
+                    
                 # Get IP and port information from CURRENT metagraph data
                 # IMPORTANT: Always use fresh data from metagraph - no caching, no hardcoding
                 # The metagraph is synced every step in the run loop, so this is always current
@@ -397,7 +418,7 @@ class Validator(BaseValidatorNeuron):
                         input_data=base64.b64encode(test_text.encode('utf-8')).decode('utf-8'),
                         language="en"
                     )
-                    
+                        
                     # Perform on-chain query using dendrite (this is the on-chain handshake)
                     # IMPORTANT: We pass the axon object directly from CURRENT metagraph
                     # Bittensor's dendrite will automatically use the correct IP/port from the axon
@@ -760,30 +781,77 @@ class Validator(BaseValidatorNeuron):
         """
         Get tasks ready for evaluation from proxy server.
         Returns ALL tasks - filtering by validators_seen happens in get_tasks_ready_for_evaluation.
+        Includes retry logic with exponential backoff for better reliability.
         """
-        try:
-            validator_uid = getattr(self, 'uid', None)
-            validator_identifier = f"validator_{validator_uid}" if validator_uid else f"validator_{self.wallet.hotkey.ss58_address}"
-            
-            bt.logging.info(f"🔍 Fetching ALL tasks from proxy server (Validator: {validator_identifier})...")
-            
-            # Get ALL tasks from proxy server (no filtering by validators_seen on server side)
-            headers = self._get_auth_headers()
-            response = requests.get(f"{self.proxy_server_url}/api/v1/validator/tasks", headers=headers, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                all_tasks = data.get('tasks', [])
+        validator_uid = getattr(self, 'uid', None)
+        validator_identifier = f"validator_{validator_uid}" if validator_uid else f"validator_{self.wallet.hotkey.ss58_address}"
+        
+        bt.logging.info(f"🔍 Fetching ALL tasks from proxy server (Validator: {validator_identifier})...")
+        
+        # Retry logic with exponential backoff
+        max_retries = 3
+        base_timeout = 60  # Increased from 10 to 60 seconds
+        headers = self._get_auth_headers()
+        
+        for attempt in range(max_retries):
+            try:
+                timeout = base_timeout * (attempt + 1)  # Increase timeout with each retry
+                bt.logging.debug(f"   Attempt {attempt + 1}/{max_retries} with {timeout}s timeout...")
                 
-                bt.logging.info(f"📋 Received {len(all_tasks)} total tasks from proxy server")
-                bt.logging.info(f"   ✅ Proxy server returns ALL tasks - validator will filter based on its own validators_seen")
+                response = requests.get(
+                    f"{self.proxy_server_url}/api/v1/validator/tasks", 
+                    headers=headers, 
+                    timeout=timeout
+                )
                 
-                return all_tasks
-            else:
-                bt.logging.warning(f"⚠️  Proxy server returned status {response.status_code}")
-                return []
-        except requests.exceptions.RequestException as e:
-            bt.logging.warning(f"⚠️  Could not connect to proxy server: {str(e)}")
-            return []
+                if response.status_code == 200:
+                    data = response.json()
+                    all_tasks = data.get('tasks', [])
+                    
+                    bt.logging.info(f"📋 Received {len(all_tasks)} total tasks from proxy server")
+                    bt.logging.info(f"   ✅ Proxy server returns ALL tasks - validator will filter based on its own validators_seen")
+                    
+                    return all_tasks
+                else:
+                    bt.logging.warning(f"⚠️  Proxy server returned status {response.status_code}")
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                        bt.logging.info(f"   Retrying in {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        return []
+                        
+            except requests.exceptions.Timeout as e:
+                timeout_seconds = base_timeout * (attempt + 1)
+                bt.logging.warning(f"⏰ Proxy server request timed out after {timeout_seconds}s (attempt {attempt + 1}/{max_retries})")
+                bt.logging.info(f"   The proxy server is taking longer than expected to respond. This may be due to high load or network issues.")
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    next_timeout = base_timeout * (attempt + 2)
+                    bt.logging.info(f"   ⏳ Retrying in {wait_time}s with increased timeout ({next_timeout}s)...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    bt.logging.error(f"❌ Connection failed: Proxy server did not respond within {timeout_seconds}s after {max_retries} attempts")
+                    bt.logging.info(f"   💡 Possible causes: Proxy server is down, network issues, or server overload")
+                    return []
+                    
+            except requests.exceptions.RequestException as e:
+                error_msg = str(e)
+                if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                    timeout_seconds = base_timeout * (attempt + 1)
+                    bt.logging.warning(f"⏰ Request timeout after {timeout_seconds}s (attempt {attempt + 1}/{max_retries})")
+                else:
+                    bt.logging.warning(f"⚠️  Network error (attempt {attempt + 1}/{max_retries}): {error_msg}")
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    bt.logging.info(f"   ⏳ Retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    bt.logging.error(f"❌ Failed to connect to proxy server after {max_retries} attempts")
+                    bt.logging.info(f"   💡 Check your network connection and verify the proxy server URL is correct")
+                    return []
+        
+        return []
     
     async def process_proxy_tasks(self, pending_tasks):
         """Process pending tasks from proxy server"""
@@ -1257,6 +1325,10 @@ class Validator(BaseValidatorNeuron):
                     
         except httpx.TimeoutException:
             bt.logging.error("⏰ Timeout connecting to proxy server (30s timeout)")
+            bt.logging.info("   💡 The proxy server did not respond in time. This may be due to:")
+            bt.logging.info("      - High server load")
+            bt.logging.info("      - Network connectivity issues")
+            bt.logging.info("      - Proxy server temporarily unavailable")
             return False
         except httpx.ConnectError as e:
             bt.logging.error(f"🔌 Connection error to proxy server: {e}")
@@ -1780,7 +1852,7 @@ class Validator(BaseValidatorNeuron):
                                 'hotkey': hotkey,
                                 'miner_identity': miner_identity,
                                 'uid': miner_uid
-                            }
+                        }
                     
                     miner_performance[miner_uid]['total_score'] += score
                     miner_performance[miner_uid]['task_count'] += 1
@@ -1855,6 +1927,14 @@ class Validator(BaseValidatorNeuron):
                 for task_id in validator_performance.keys():
                     bt.logging.info(f"🏷️ Marking task {task_id} as evaluated (weights were set)...")
                     await self.mark_task_as_validator_evaluated(task_id, validator_performance[task_id])
+                    # Add to in-memory cache to prevent re-evaluation
+                    if hasattr(self, 'evaluated_tasks_cache'):
+                        self.evaluated_tasks_cache.add(task_id)
+                
+                # Update last evaluation block to track that evaluation occurred
+                if hasattr(self, 'block'):
+                    self.last_evaluation_block = self.block
+                    bt.logging.info(f"📊 Updated last_evaluation_block to {self.last_evaluation_block}")
             else:
                 bt.logging.warning("⚠️ Weights were NOT set - tasks will NOT be marked as seen")
                 bt.logging.warning("   Tasks will be re-evaluated in next iteration to ensure miners are rewarded")
@@ -2269,11 +2349,11 @@ class Validator(BaseValidatorNeuron):
             else:
                 # For unknown task types, check if output_data has any content
                 has_valid_output = len(output_data) > 0
-            
+                
             if not has_valid_output:
                 bt.logging.warning(f"   ⚠️ Output data missing required fields for {task_type}")
-                return 0.0
-            
+            return 0.0
+
             # Base score for having valid output
             base_score = 0.7
             
@@ -2922,11 +3002,14 @@ class Validator(BaseValidatorNeuron):
 
     async def test_proxy_server_connection(self):
         """Test connection to proxy server and show data structure"""
+        max_retries = 3
+        base_timeout = 60
+        
         try:
             bt.logging.info(f"🔍 Testing proxy server connection: {self.proxy_server_url}")
             
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                # Test basic connectivity
+            async with httpx.AsyncClient(timeout=base_timeout) as client:
+                # Test basic connectivity (non-critical, don't retry)
                 try:
                     response = await client.get(f"{self.proxy_server_url}/health", timeout=5.0)
                     if response.status_code == 200:
@@ -2936,52 +3019,100 @@ class Validator(BaseValidatorNeuron):
                 except:
                     bt.logging.warning("⚠️ Proxy server health endpoint not available, continuing with main test")
                 
-                # Test completed tasks endpoint
+                # Test completed tasks endpoint with retry logic
                 bt.logging.info("🔍 Testing completed tasks endpoint...")
                 headers = self._get_auth_headers()
-                response = await client.get(
-                    f"{self.proxy_server_url}/api/v1/tasks/completed",
-                    headers=headers,
-                    timeout=10.0
-                )
                 
-                if response.status_code == 200:
-                    tasks = response.json()
-                    bt.logging.info(f"✅ Successfully connected to proxy server")
-                    bt.logging.info(f"📊 Found {len(tasks)} completed tasks")
-                    
-                    if tasks:
-                        # Show sample task structure
-                        sample_task = tasks[0]
-                        bt.logging.info("📋 Sample task structure:")
-                        bt.logging.info(f"   Task ID: {sample_task.get('task_id', 'N/A')}")
-                        bt.logging.info(f"   Task Type: {sample_task.get('task_type', 'N/A')}")
-                        bt.logging.info(f"   Status: {sample_task.get('status', 'N/A')}")
-                        bt.logging.info(f"   Miner Responses: {len(sample_task.get('miner_responses', []))}")
+                for attempt in range(max_retries):
+                    try:
+                        timeout = base_timeout * (attempt + 1)
+                        bt.logging.debug(f"   Attempt {attempt + 1}/{max_retries} with {timeout}s timeout...")
                         
-                        # Show sample miner response structure
-                        miner_responses = sample_task.get('miner_responses', [])
-                        if miner_responses:
-                            sample_response = miner_responses[0]
-                            bt.logging.info("📊 Sample miner response structure:")
-                            bt.logging.info(f"   Miner UID: {sample_response.get('miner_uid', 'N/A')}")
-                            bt.logging.info(f"   Processing Time: {sample_response.get('processing_time', 'N/A')}")
-                            bt.logging.info(f"   Accuracy Score: {sample_response.get('accuracy_score', 'N/A')}")
-                            bt.logging.info(f"   Response Data Keys: {list(sample_response.get('response_data', {}).keys())}")
-                    else:
-                        bt.logging.info("📭 No completed tasks found in proxy server")
+                        response = await client.get(
+                            f"{self.proxy_server_url}/api/v1/tasks/completed",
+                            headers=headers,
+                            timeout=timeout
+                        )
                         
-                    return True
-                    
-                else:
-                    bt.logging.error(f"❌ Proxy server returned status {response.status_code}")
-                    bt.logging.debug(f"Response content: {response.text}")
-                    return False
+                        if response.status_code == 200:
+                            tasks = response.json()
+                            bt.logging.info(f"✅ Successfully connected to proxy server")
+                            bt.logging.info(f"📊 Found {len(tasks)} completed tasks")
+                            
+                            if tasks:
+                                # Show sample task structure
+                                sample_task = tasks[0]
+                                bt.logging.info("📋 Sample task structure:")
+                                bt.logging.info(f"   Task ID: {sample_task.get('task_id', 'N/A')}")
+                                bt.logging.info(f"   Task Type: {sample_task.get('task_type', 'N/A')}")
+                                bt.logging.info(f"   Status: {sample_task.get('status', 'N/A')}")
+                                bt.logging.info(f"   Miner Responses: {len(sample_task.get('miner_responses', []))}")
+                                
+                                # Show sample miner response structure
+                                miner_responses = sample_task.get('miner_responses', [])
+                                if miner_responses:
+                                    sample_response = miner_responses[0]
+                                    bt.logging.info("📊 Sample miner response structure:")
+                                    bt.logging.info(f"   Miner UID: {sample_response.get('miner_uid', 'N/A')}")
+                                    bt.logging.info(f"   Processing Time: {sample_response.get('processing_time', 'N/A')}")
+                                    bt.logging.info(f"   Accuracy Score: {sample_response.get('accuracy_score', 'N/A')}")
+                                    bt.logging.info(f"   Response Data Keys: {list(sample_response.get('response_data', {}).keys())}")
+                            else:
+                                bt.logging.info("📭 No completed tasks found in proxy server")
+                                
+                            return True
+                            
+                        else:
+                            bt.logging.warning(f"⚠️ Proxy server returned status {response.status_code}")
+                            if attempt < max_retries - 1:
+                                wait_time = 2 ** attempt
+                                bt.logging.info(f"   Retrying in {wait_time}s...")
+                                await asyncio.sleep(wait_time)
+                            else:
+                                bt.logging.error(f"❌ Proxy server returned status {response.status_code} after {max_retries} attempts")
+                                bt.logging.debug(f"Response content: {response.text}")
+                                return False
+                                
+                    except httpx.ReadTimeout as e:
+                        timeout_seconds = base_timeout * (attempt + 1)
+                        bt.logging.warning(f"⏰ Proxy server request timed out after {timeout_seconds}s (attempt {attempt + 1}/{max_retries})")
+                        bt.logging.info(f"   The proxy server is taking longer than expected to respond. This may be due to high load or network issues.")
+                        if attempt < max_retries - 1:
+                            wait_time = 2 ** attempt
+                            next_timeout = base_timeout * (attempt + 2)
+                            bt.logging.info(f"   ⏳ Retrying in {wait_time}s with increased timeout ({next_timeout}s)...")
+                            await asyncio.sleep(wait_time)
+                        else:
+                            bt.logging.error(f"❌ Connection failed: Proxy server did not respond within {timeout_seconds}s after {max_retries} attempts")
+                            bt.logging.info(f"   💡 Possible causes: Proxy server is down, network issues, or server overload")
+                            return False
+                            
+                    except httpx.RequestException as e:
+                        error_msg = str(e)
+                        if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                            timeout_seconds = base_timeout * (attempt + 1)
+                            bt.logging.warning(f"⏰ Request timeout after {timeout_seconds}s (attempt {attempt + 1}/{max_retries})")
+                        else:
+                            bt.logging.warning(f"⚠️  Network error (attempt {attempt + 1}/{max_retries}): {error_msg}")
+                        if attempt < max_retries - 1:
+                            wait_time = 2 ** attempt
+                            bt.logging.info(f"   ⏳ Retrying in {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                        else:
+                            bt.logging.error(f"❌ Failed to connect to proxy server after {max_retries} attempts")
+                            bt.logging.info(f"   💡 Check your network connection and verify the proxy server URL is correct")
+                            return False
+                            
+                return False
                     
         except Exception as e:
-            bt.logging.error(f"❌ Error testing proxy server connection: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            error_msg = str(e)
+            if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                bt.logging.error(f"⏰ Connection timeout: Proxy server did not respond in time")
+                bt.logging.info(f"   💡 Possible causes: Server overload, network issues, or incorrect proxy URL")
+            else:
+                bt.logging.error(f"❌ Unexpected error testing proxy server connection: {error_msg}")
+                bt.logging.debug(f"   Full error details: {error_msg}")
             return False
 
     def _get_pipeline_name(self, task_type: str) -> str:
@@ -3157,47 +3288,79 @@ class Validator(BaseValidatorNeuron):
         except Exception as e:
             bt.logging.warning(f"⚠️  Could not post evaluation data to proxy server: {str(e)}")
     
-    async def get_validator_evaluated_tasks(self) -> List[str]:
-        """Get list of task IDs already evaluated by this validator"""
+    async def get_validator_evaluated_tasks(self) -> set:
+        """Get set of task IDs already evaluated by this validator"""
         try:
             # First check in-memory cache
             if self.evaluated_tasks_cache:
                 bt.logging.debug(f"📚 Found {len(self.evaluated_tasks_cache)} tasks in memory cache")
-                return list(self.evaluated_tasks_cache)
+                return self.evaluated_tasks_cache.copy()
             
-            # Try to get from proxy server
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                headers = self._get_auth_headers()
-                response = await client.get(
-                    f"{self.proxy_server_url}/api/v1/validator/{getattr(self, 'uid', 'unknown')}/evaluated_tasks",
-                    headers=headers,
-                    timeout=30.0
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    evaluated_tasks = data.get('evaluated_tasks', [])
-                    
-                    # Update in-memory cache
-                    self.evaluated_tasks_cache.update(evaluated_tasks)
-                    
-                    bt.logging.info(f"📚 Retrieved {len(evaluated_tasks)} evaluated tasks from proxy server")
-                    return evaluated_tasks
-                else:
-                    bt.logging.warning(f"⚠️  Proxy server returned status {response.status_code} for evaluated tasks")
-                    return []
+            # Try to get from proxy server with retry logic
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    timeout = 60.0 * (attempt + 1)  # Increase timeout with each retry
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        headers = self._get_auth_headers()
+                        response = await client.get(
+                            f"{self.proxy_server_url}/api/v1/validator/{getattr(self, 'uid', 'unknown')}/evaluated_tasks",
+                            headers=headers,
+                            timeout=timeout
+                        )
+                        
+                        if response.status_code == 200:
+                            data = response.json()
+                            evaluated_tasks = data.get('evaluated_tasks', [])
+                            
+                            # Convert to set and update in-memory cache
+                            evaluated_tasks_set = set(evaluated_tasks)
+                            self.evaluated_tasks_cache.update(evaluated_tasks_set)
+                            
+                            bt.logging.info(f"📚 Retrieved {len(evaluated_tasks_set)} evaluated tasks from proxy server")
+                            return evaluated_tasks_set
+                        else:
+                            bt.logging.warning(f"⚠️  Proxy server returned status {response.status_code} for evaluated tasks")
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(2 ** attempt)
+                            else:
+                                return set()
+                except (httpx.TimeoutException, httpx.RequestError) as e:
+                    error_msg = str(e)
+                    if isinstance(e, httpx.TimeoutException) or "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                        timeout_seconds = 60 * (attempt + 1)  # Assuming similar timeout structure
+                        bt.logging.warning(f"⏰ Request timed out after {timeout_seconds}s (attempt {attempt + 1}/{max_retries})")
+                        bt.logging.info(f"   The proxy server is taking longer than expected to respond.")
+                    else:
+                        bt.logging.warning(f"⚠️  Network error (attempt {attempt + 1}/{max_retries}): {error_msg}")
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        bt.logging.info(f"   ⏳ Retrying in {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        bt.logging.error(f"❌ Failed to retrieve evaluated tasks after {max_retries} attempts")
+                        bt.logging.info(f"   💡 Continuing without evaluated tasks cache - validator will use in-memory tracking")
+                        return set()
                     
         except Exception as e:
             bt.logging.warning(f"⚠️  Could not retrieve evaluated tasks from proxy server: {str(e)}")
-            return []
+            return set()
     
     async def filter_already_evaluated_tasks(self, completed_tasks: List[Dict]) -> List[Dict]:
-        """Filter out tasks that have already been evaluated by this validator"""
+        """
+        Filter out tasks that have already been evaluated by this validator.
+        Checks both in-memory cache and database to prevent duplicate evaluation.
+        """
         try:
             bt.logging.info(f"🔍 Filtering {len(completed_tasks)} completed tasks for already evaluated ones...")
             
-            # Get list of already evaluated tasks
-            evaluated_task_ids = await self.get_validator_evaluated_tasks()
+            # Get list of already evaluated tasks from database
+            evaluated_task_ids = set(await self.get_validator_evaluated_tasks())
+            
+            # Also check in-memory cache
+            if hasattr(self, 'evaluated_tasks_cache') and self.evaluated_tasks_cache:
+                evaluated_task_ids.update(self.evaluated_tasks_cache)
+                bt.logging.debug(f"   Found {len(self.evaluated_tasks_cache)} tasks in memory cache")
             
             if not evaluated_task_ids:
                 bt.logging.info("📋 No previously evaluated tasks found, proceeding with all tasks")
@@ -3209,10 +3372,16 @@ class Validator(BaseValidatorNeuron):
             
             for task in completed_tasks:
                 task_id = task.get('task_id')
-                if task_id and task_id not in evaluated_task_ids:
+                if not task_id:
+                    bt.logging.warning(f"⚠️  Task missing task_id, skipping: {task}")
+                    continue
+                    
+                # Check both database and cache
+                if task_id not in evaluated_task_ids and task_id not in self.evaluated_tasks_cache:
                     new_tasks.append(task)
                 else:
                     skipped_tasks.append(task_id)
+                    bt.logging.debug(f"⏭️  Skipping task {task_id} - already evaluated by this validator")
             
             bt.logging.info(f"📋 Filtering complete:")
             bt.logging.info(f"   Total tasks: {len(completed_tasks)}")
@@ -3226,6 +3395,8 @@ class Validator(BaseValidatorNeuron):
             
         except Exception as e:
             bt.logging.error(f"❌ Error filtering already evaluated tasks: {str(e)}")
+            import traceback
+            bt.logging.error(traceback.format_exc())
             # Return all tasks if filtering fails to prevent data loss
             return completed_tasks
     
@@ -3553,6 +3724,11 @@ class Validator(BaseValidatorNeuron):
                 bt.logging.info(f"   Active miners: {len(active_uids)}")
                 bt.logging.info(f"   Total miners in network: {self.metagraph.n}")
                 bt.logging.info(f"   Efficiency: {len(active_uids)}/{len(active_uids)}/{self.metagraph.n} miners rewarded")
+                
+                # CRITICAL FIX: Update timestamp of last successful weight commit
+                self.last_weight_commit_timestamp = time.time()
+                bt.logging.info(f"   ⏰ Weight commit timestamp updated: {self.last_weight_commit_timestamp:.0f}")
+                
                 return True
             else:
                 bt.logging.error(f"❌ set_weights failed: {msg}")

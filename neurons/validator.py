@@ -357,7 +357,7 @@ class Validator(BaseValidatorNeuron):
             serving_miners = 0
             active_miners = []  # Only miners that respond to on-chain queries
             
-            bt.logging.info(f"🔍 Performing on-chain handshake with serving miners (checking {total_miners} total miners)...")
+            bt.logging.debug(f"🔍 Performing on-chain handshake with serving miners (checking {total_miners} total miners)...")
             
             # Check EACH miner in the metagraph - this ensures we catch new miners
             for uid in range(total_miners):
@@ -370,7 +370,7 @@ class Validator(BaseValidatorNeuron):
                 if not is_serving:
                     continue  # Skip non-serving miners
                 
-                    serving_miners += 1
+                serving_miners += 1
                     
                 # Get IP and port information from CURRENT metagraph data
                 # IMPORTANT: Always use fresh data from metagraph - no caching, no hardcoding
@@ -438,7 +438,7 @@ class Validator(BaseValidatorNeuron):
                             timeout=20  # Outer timeout to prevent hanging
                         )
                     except asyncio.TimeoutError:
-                        # Timeout occurred - miner not responding (silently skip, no logging)
+                        # Timeout occurred - miner not responding (silently skip)
                         continue  # Skip to next miner
                     
                     # Check if miner responded successfully
@@ -456,25 +456,24 @@ class Validator(BaseValidatorNeuron):
                         # 200 = success, 400/500 = error but miner is online and responding
                         if status_code in [200, 400, 500]:
                             active_miners.append(uid)
-                            # ONLY log successful handshakes - this reduces log noise
+                            # Log successful handshakes
                             bt.logging.info(
                                 f"✅ UID {uid:3d} | {ip}:{port} | "
                                 f"Stake: {stake:,.0f} TAO | "
                                 f"On-chain handshake: SUCCESS (Status: {status_code})"
                             )
-                        # Failed handshakes are silently skipped (no logging to reduce noise)
-                    # No response is silently skipped (no logging to reduce noise)
+                        else:
+                            # Unexpected status code (silently skip)
+                            pass
+                    else:
+                        # No response received (silently skip)
+                        pass
                         
                 except asyncio.TimeoutError:
                     # Already handled above, but catch here too for safety (silently skip)
                     continue  # Skip to next miner
                 except Exception as e:
                     # Miner did not respond to on-chain query - not active (silently skip)
-                    # Only log unexpected errors (not timeouts or connection errors)
-                    error_msg = str(e)
-                    if "Timeout" not in error_msg and "408" not in error_msg and "Connect" not in error_msg:
-                        # Only log unexpected errors, not common connection failures
-                        bt.logging.debug(f"⚠️ Unexpected error handshaking with UID {uid:3d}: {error_msg[:50]}...")
                     continue  # Skip to next miner
             
             # Summary of on-chain handshake results
@@ -482,12 +481,11 @@ class Validator(BaseValidatorNeuron):
             if active_miners:
                 # Sort by stake for display
                 top_miners = sorted(active_miners, key=lambda x: self.metagraph.S[x], reverse=True)[:5]
-                bt.logging.info(
-                    f"🎯 On-Chain Handshake Results: "
-                    f"{len(active_miners)}/{serving_miners} miners active "
-                    f"({(len(active_miners)/serving_miners*100):.1f}% success rate)"
-                )
-                bt.logging.info(f"   Top active miners by stake: {top_miners}")
+                # Only log if we found miners or if it's a significant change
+                if len(active_miners) > 0:
+                    bt.logging.info(f"🎯 Handshake: {len(active_miners)}/{serving_miners} miners active")
+                else:
+                    bt.logging.debug(f"🎯 Handshake: {len(active_miners)}/{serving_miners} miners active")
                 
                 # Store active miners (only those that passed on-chain handshake)
                 self.reachable_miners = active_miners
@@ -743,24 +741,57 @@ class Validator(BaseValidatorNeuron):
             done_tasks = [task for task in all_tasks if task.get('status') in ['done', 'completed']]
             bt.logging.info(f"   Found {len(done_tasks)} tasks with status 'done' or 'completed'")
             
-            # Filter out tasks already seen by THIS validator only (not other validators)
+            # Filter out tasks already seen by THIS validator and filter by age/importance
             new_tasks = []
+            skipped_old = 0
+            skipped_seen = 0
+            max_task_age_hours = 48  # Skip tasks older than 48 hours
+            
             for task in done_tasks:
                 task_id = task.get('task_id')
                 validators_seen = task.get('validators_seen', [])
                 
                 # Check if THIS validator has already seen this task
                 if validator_identifier in validators_seen or (validator_uid and str(validator_uid) in validators_seen):
-                    bt.logging.debug(f"⏭️  Skipping task {task_id} - already seen by this validator ({validator_identifier})")
+                    skipped_seen += 1
                     continue
+                
+                # Filter out very old tasks (zombie tasks)
+                try:
+                    from dateutil import parser
+                    from datetime import timezone
+                    created_at_str = task.get('created_at')
+                    if created_at_str:
+                        if isinstance(created_at_str, str):
+                            created_at = parser.parse(created_at_str)
+                        else:
+                            created_at = created_at_str
+                        
+                        if created_at.tzinfo is None:
+                            created_at = created_at.replace(tzinfo=timezone.utc)
+                        
+                        now = datetime.now(timezone.utc)
+                        age_hours = (now - created_at).total_seconds() / 3600
+                        
+                        if age_hours > max_task_age_hours:
+                            skipped_old += 1
+                            # Mark as seen to prevent future re-evaluation (silently)
+                            try:
+                                await self.mark_task_as_validator_evaluated(task_id, {})
+                            except:
+                                pass  # Don't fail if marking fails
+                            continue
+                except Exception as e:
+                    pass  # Silently allow task if age check fails
                 
                 new_tasks.append(task)
             
             if new_tasks:
                 bt.logging.info(f"✅ Found {len(new_tasks)} new tasks for this validator to evaluate")
-                bt.logging.info(f"   Filtered out {len(done_tasks) - len(new_tasks)} tasks already seen by this validator")
+                if skipped_seen > 0 or skipped_old > 0:
+                    bt.logging.info(f"   Filtered: {skipped_seen} already seen, {skipped_old} too old (>48h)")
             else:
-                bt.logging.info(f"📭 No new tasks for this validator - all {len(done_tasks)} done tasks have been seen by this validator")
+                bt.logging.info(f"📭 No new tasks for this validator - filtered: {skipped_seen} seen, {skipped_old} too old")
             
             return new_tasks
             
@@ -1199,10 +1230,7 @@ class Validator(BaseValidatorNeuron):
             
             active_miners = self.reachable_miners  # These are miners that passed on-chain handshake
             
-            bt.logging.info(
-                f"📊 Reporting {len(active_miners)} active miner(s) to proxy server "
-                f"(passed on-chain handshake)..."
-            )
+            bt.logging.debug(f"📊 Reporting {len(active_miners)} active miner(s) to proxy server")
             
             miner_statuses = []
             
@@ -1550,16 +1578,11 @@ class Validator(BaseValidatorNeuron):
                 except Exception as e:
                     bt.logging.warning(f"⚠️ Error checking task age: {e} - allowing task to proceed")
                 
-                # Enhanced task logging with progress tracking
-                bt.logging.info("=" * 80)
-                bt.logging.info(f"🔍 EVALUATING TASK {task_index}/{len(new_tasks)}: {task_id}")
-                bt.logging.info(f"📋 Task Details:")
-                bt.logging.info(f"   Type: {task_type}")
-                bt.logging.info(f"   Status: {task_status} ✅ (Confirmed done/completed)")
-                bt.logging.info(f"   Language: {task.get('language', 'en')}")
-                bt.logging.info(f"   Created: {task.get('created_at', 'N/A')}")
-                bt.logging.info(f"   Completed: {task.get('completed_at', 'N/A')}")
-                bt.logging.info(f"   Miner Responses: {len(miner_responses)}")
+                # Reduced task logging (only summary for most tasks)
+                if task_index == 1 or task_index % 5 == 0 or task_index == len(new_tasks):
+                    bt.logging.info(f"🔍 EVALUATING TASK {task_index}/{len(new_tasks)}: {task_id} ({task_type}, {len(miner_responses)} responses)")
+                else:
+                    bt.logging.debug(f"🔍 EVALUATING TASK {task_index}/{len(new_tasks)}: {task_id} ({task_type})")
                 
                 # Validate that responses are actually valid (have required fields)
                 valid_responses = []
@@ -1632,7 +1655,7 @@ class Validator(BaseValidatorNeuron):
                 
                 # Update miner_responses to only include valid ones
                 miner_responses = valid_responses
-                bt.logging.info(f"   ✅ Validated {len(miner_responses)} valid responses out of {len(task.get('miner_responses', []))} total")
+                bt.logging.debug(f"   ✅ Validated {len(miner_responses)} valid responses out of {len(task.get('miner_responses', []))} total")
                 
                 # Log input data summary
                 input_data = task.get('input_data')
@@ -1646,8 +1669,7 @@ class Validator(BaseValidatorNeuron):
                     else:
                         bt.logging.info(f"   Input: {type(input_data).__name__} data")
                 
-                # Log miner response summary for this task
-                bt.logging.info(f"📊 Miner Response Summary:")
+                # Log miner response summary for this task (reduced verbosity)
                 miner_summary = []
                 for i, response in enumerate(miner_responses):
                     miner_uid = response.get('miner_uid')
@@ -1667,16 +1689,15 @@ class Validator(BaseValidatorNeuron):
                     speed_score = nested_response.get('speed_score') or response.get('speed_score', 0)
                     
                     miner_summary.append(f"UID{miner_uid}({processing_time:.2f}s,{accuracy_score:.3f},{speed_score:.3f})")
-                    bt.logging.info(f"      Miner {i+1}: UID {miner_uid}")
-                    bt.logging.info(f"         Processing Time: {processing_time:.3f}s")
-                    bt.logging.info(f"         Accuracy Score: {accuracy_score:.3f}")
-                    bt.logging.info(f"         Speed Score: {speed_score:.3f}")
-                    bt.logging.info(f"         Submitted: {response.get('submitted_at', 'N/A')}")
+                    bt.logging.debug(f"      Miner {i+1}: UID {miner_uid} | Time: {processing_time:.3f}s | Acc: {accuracy_score:.3f} | Speed: {speed_score:.3f}")
                 
-                bt.logging.info(f"   Summary: {', '.join(miner_summary)}")
+                if len(miner_summary) <= 3:
+                    bt.logging.debug(f"   Summary: {', '.join(miner_summary)}")
+                else:
+                    bt.logging.debug(f"   Summary: {len(miner_summary)} miners")
                 
                 # Additional validation for completed task structure
-                bt.logging.info(f"🔍 Validating completed task structure...")
+                bt.logging.debug(f"🔍 Validating completed task structure...")
                 validation_passed = True
                 
                 # Check if all miner responses have required fields
@@ -1722,10 +1743,10 @@ class Validator(BaseValidatorNeuron):
                     bt.logging.info("=" * 80)
                     continue
                 
-                bt.logging.info(f"✅ Task structure validation passed")
+                bt.logging.debug(f"✅ Task structure validation passed")
 
                 # Additional validation: Check if task has the required input data
-                bt.logging.info(f"🔍 VALIDATING TASK INPUT DATA:")
+                bt.logging.debug(f"🔍 VALIDATING TASK INPUT DATA:")
                 input_data_available = False
                 
                 # Check multiple possible sources for input data
@@ -1734,10 +1755,10 @@ class Validator(BaseValidatorNeuron):
                     input_data_available = True
                 elif task.get('input_text') and isinstance(task.get('input_text'), dict):
                     if task['input_text'].get('text'):
-                        bt.logging.info(f"   ✅ input_text.text field found")
+                        bt.logging.debug(f"   ✅ input_text.text field found")
                         input_data_available = True
                 elif task.get('input_file_id'):
-                    bt.logging.info(f"   ✅ input_file_id field found")
+                    bt.logging.debug(f"   ✅ input_file_id field found")
                     input_data_available = True
                 elif task.get('input_file'):
                     input_file = task.get('input_file', {})
@@ -1748,7 +1769,7 @@ class Validator(BaseValidatorNeuron):
                         else:
                             bt.logging.warning(f"   ⚠️ input_file object found but no content/file_id")
                     else:
-                        bt.logging.info(f"   ✅ input_file as direct data found")
+                        bt.logging.debug(f"   ✅ input_file as direct data found")
                         input_data_available = True
                 
                 if not input_data_available:
@@ -1758,11 +1779,11 @@ class Validator(BaseValidatorNeuron):
                     bt.logging.info("=" * 80)
                     continue
                 
-                bt.logging.info(f"✅ Task input data validation passed")
+                bt.logging.debug(f"✅ Task input data validation passed")
 
                 # Validator does not execute tasks - only evaluates miner responses
                 # Calculate scores based on miner response quality and metrics
-                bt.logging.info(f"📊 CALCULATING MINER SCORES:")
+                bt.logging.debug(f"📊 CALCULATING MINER SCORES:")
                 task_scores = await self.calculate_task_scores(
                     task_id, task_type, None, miner_responses
                 )
@@ -1793,13 +1814,11 @@ class Validator(BaseValidatorNeuron):
                 
                 # Select top 10 VALID miners for this task based on performance
                 top_miners = await self.select_top_miners_for_task(valid_miner_scores, max_miners=10)
-                bt.logging.info(f"🏆 TOP VALID MINERS SELECTED FOR TASK {task_id}:")
-                for rank, (miner_uid, score) in enumerate(top_miners, 1):
-                    bt.logging.info(f"   #{rank:2d} | UID {miner_uid:3d} | Score: {score:.2f}")
+                bt.logging.debug(f"🏆 TOP MINERS FOR TASK {task_id}: {[(uid, f'{score:.2f}') for uid, score in top_miners[:3]]}")
                 
                 # Update miner performance tracking with only top miners
                 # CRITICAL: Track hotkey+uid to handle UID reuse scenarios
-                bt.logging.info(f"📈 UPDATING MINER PERFORMANCE (TOP {len(top_miners)} ONLY):")
+                bt.logging.debug(f"📈 UPDATING MINER PERFORMANCE (TOP {len(top_miners)} ONLY):")
                 for miner_uid, score in top_miners:
                     # Get hotkey from metagraph for miner identity tracking (use cache if available)
                     try:
@@ -1862,19 +1881,13 @@ class Validator(BaseValidatorNeuron):
                     ranking_position = next(i for i, (uid, _) in enumerate(top_miners, 1) if uid == miner_uid)
                     miner_performance[miner_uid]['top_rankings'][task_id] = ranking_position
                     
-                    bt.logging.info(f"   Miner {miner_uid} ({miner_identity}):")
-                    bt.logging.info(f"      Task Score: {score:.2f}")
-                    bt.logging.info(f"      Ranking: #{ranking_position}")
-                    bt.logging.info(f"      Running Total: {miner_performance[miner_uid]['total_score']:.2f}")
-                    bt.logging.info(f"      Tasks Completed: {miner_performance[miner_uid]['task_count']}")
+                    bt.logging.debug(f"   Miner {miner_uid}: Score={score:.2f}, Rank=#{ranking_position}, Total={miner_performance[miner_uid]['total_score']:.2f}, Tasks={miner_performance[miner_uid]['task_count']}")
                 
-                bt.logging.info(f"✅ TASK {task_id} EVALUATION COMPLETED SUCCESSFULLY")
+                bt.logging.debug(f"✅ TASK {task_id} EVALUATION COMPLETED")
                 
                 # NOTE: Task will be marked as seen ONLY after weights are successfully set
                 # This ensures miners are rewarded before task is marked as seen
-                bt.logging.info(f"📝 Task {task_id} evaluation complete - will mark as seen after weights are set")
-                
-                bt.logging.info("=" * 80)
+                bt.logging.debug(f"📝 Task {task_id} evaluation complete - will mark as seen after weights are set")
             
             # Generate performance rankings
             miner_rankings = await self.rank_miners_by_performance(miner_performance)
@@ -1920,12 +1933,23 @@ class Validator(BaseValidatorNeuron):
             # Set weights on chain
             weights_set_successfully = await self.set_miner_weights(final_weights)
             
-            # CRITICAL: Only mark tasks as seen if weights were successfully set
-            # This ensures miners are rewarded before tasks are marked as seen
-            if weights_set_successfully:
-                bt.logging.info("✅ Weights set successfully - marking tasks as seen")
+            # Mark tasks as seen - if weights can't be set due to cooldown, mark anyway to prevent zombie re-evaluation
+            # Only skip marking if weights failed for a real error (not cooldown)
+            weights_failed_due_to_cooldown = False
+            if not weights_set_successfully:
+                # Check if failure was due to cooldown
+                if hasattr(self, 'last_weight_commit_timestamp'):
+                    time_since_last = time.time() - self.last_weight_commit_timestamp
+                    if time_since_last < self.min_weight_commit_interval:
+                        weights_failed_due_to_cooldown = True
+            
+            if weights_set_successfully or weights_failed_due_to_cooldown:
+                if weights_failed_due_to_cooldown:
+                    bt.logging.debug("✅ Marking tasks as seen (weights on cooldown, but evaluation complete)")
+                else:
+                    bt.logging.debug("✅ Weights set successfully - marking tasks as seen")
+                
                 for task_id in validator_performance.keys():
-                    bt.logging.info(f"🏷️ Marking task {task_id} as evaluated (weights were set)...")
                     await self.mark_task_as_validator_evaluated(task_id, validator_performance[task_id])
                     # Add to in-memory cache to prevent re-evaluation
                     if hasattr(self, 'evaluated_tasks_cache'):
@@ -1934,19 +1958,12 @@ class Validator(BaseValidatorNeuron):
                 # Update last evaluation block to track that evaluation occurred
                 if hasattr(self, 'block'):
                     self.last_evaluation_block = self.block
-                    bt.logging.info(f"📊 Updated last_evaluation_block to {self.last_evaluation_block}")
             else:
-                bt.logging.warning("⚠️ Weights were NOT set - tasks will NOT be marked as seen")
-                bt.logging.warning("   Tasks will be re-evaluated in next iteration to ensure miners are rewarded")
+                bt.logging.warning("⚠️ Weights failed (not cooldown) - tasks will be re-evaluated to ensure miners are rewarded")
             
-            # Calculate and log evaluation performance
+            # Calculate and log evaluation performance (summary only)
             evaluation_time = time.time() - start_time
-            bt.logging.info(f"⏱️  Total evaluation time: {evaluation_time:.2f} seconds")
-            bt.logging.info(f"📊 Average time per task: {evaluation_time / len(new_tasks):.2f} seconds")
-            
-            # Log completion
-            bt.logging.info("🎯 Task evaluation and weight setting completed successfully!")
-            bt.logging.info(f"📊 Processed {len(new_tasks)} tasks for {len(miner_performance)} miners")
+            bt.logging.info(f"✅ Evaluated {len(new_tasks)} tasks for {len(miner_performance)} miners in {evaluation_time:.1f}s ({evaluation_time/len(new_tasks):.2f}s/task)")
             
             # Log comprehensive evaluation summary
             current_epoch = getattr(self, 'current_epoch', 0)
@@ -2194,9 +2211,7 @@ class Validator(BaseValidatorNeuron):
         Validator does not execute tasks - scores are based on miner response quality only.
         """
         try:
-            bt.logging.info(f"📊 CALCULATING SCORES FOR TASK {task_id}")
-            bt.logging.info(f"   Task Type: {task_type}")
-            bt.logging.info(f"   Miner Responses: {len(miner_responses)}")
+            bt.logging.debug(f"📊 CALCULATING SCORES FOR TASK {task_id} ({task_type}, {len(miner_responses)} responses)")
             
             miner_scores = {}
             score_breakdown = {}
@@ -2207,7 +2222,7 @@ class Validator(BaseValidatorNeuron):
                     bt.logging.warning(f"⚠️ Miner response {i} missing miner_uid, skipping")
                     continue
                 
-                bt.logging.info(f"   🔍 Evaluating Miner {miner_uid} (Response {i}/{len(miner_responses)}):")
+                bt.logging.debug(f"   🔍 Evaluating Miner {miner_uid} (Response {i}/{len(miner_responses)}):")
                 
                 # Calculate accuracy score based on response quality (no validator execution)
                 accuracy_score = await self.calculate_accuracy_score_from_response(
@@ -2277,33 +2292,20 @@ class Validator(BaseValidatorNeuron):
                     'processing_time': miner_processing_time
                 }
                 
-                bt.logging.info(f"      Accuracy Score: {accuracy_score:.4f} (Weight: {weights['accuracy']:.2f})")
-                bt.logging.info(f"      Speed Score: {speed_score:.4f} (Weight: {weights['speed']:.2f})")
-                bt.logging.info(f"      Quality Score: {quality_score:.4f} (Weight: {weights['quality']:.2f})")
-                bt.logging.info(f"      Combined Score: {combined_score:.4f}")
-                bt.logging.info(f"      Final Score: {final_score:.2f}/500")
-                bt.logging.info(f"      Processing Time: {miner_processing_time:.3f}s")
+                bt.logging.debug(f"      Accuracy: {accuracy_score:.4f}, Speed: {speed_score:.4f}, Quality: {quality_score:.4f}, Final: {final_score:.2f}/500")
             
-            # Log score summary
+            # Log score summary (reduced verbosity)
             if miner_scores:
                 scores_list = list(miner_scores.values())
                 avg_score = sum(scores_list) / len(scores_list)
                 max_score = max(scores_list)
-                min_score = min(scores_list)
                 
-                bt.logging.info(f"   📊 Score Summary for Task {task_id}:")
-                bt.logging.info(f"      Miners Evaluated: {len(miner_scores)}")
-                bt.logging.info(f"      Average Score: {avg_score:.2f}")
-                bt.logging.info(f"      Highest Score: {max_score:.2f}")
-                bt.logging.info(f"      Lowest Score: {min_score:.2f}")
-                bt.logging.info(f"      Score Range: {max_score - min_score:.2f}")
+                # Only log summary, details at DEBUG level
+                bt.logging.debug(f"   📊 Score Summary: {len(miner_scores)} miners, Avg: {avg_score:.2f}, Max: {max_score:.2f}")
                 
-                # Show top 3 miners for this task
-                top_miners = sorted(miner_scores.items(), key=lambda x: x[1], reverse=True)[:3]
-                bt.logging.info(f"      🏆 Top Miners for Task {task_id}:")
-                for rank, (uid, score) in enumerate(top_miners, 1):
-                    breakdown = score_breakdown.get(uid, {})
-                    bt.logging.info(f"         #{rank} | UID {uid:3d} | Score: {score:6.2f} | Accuracy: {breakdown.get('accuracy_score', 0):.3f} | Speed: {breakdown.get('speed_score', 0):.3f}")
+                # Show top miner only
+                top_miner = max(miner_scores.items(), key=lambda x: x[1])
+                bt.logging.debug(f"      🏆 Top: UID {top_miner[0]:3d} | Score: {top_miner[1]:6.2f}")
             
             return miner_scores
             
@@ -3189,25 +3191,28 @@ class Validator(BaseValidatorNeuron):
             validator_uid = getattr(self, 'uid', None)
             validator_identifier = f"validator_{validator_uid}" if validator_uid else f"validator_{self.wallet.hotkey.ss58_address}"
             
-            bt.logging.info(f"🏷️ Marking task {task_id} as evaluated by validator {validator_identifier}...")
+            bt.logging.debug(f"🏷️ Marking task {task_id} as evaluated")
             
             # Add to in-memory cache
             self.evaluated_tasks_cache.add(task_id)
             
             # Mark task in database via proxy server API
+            # Note: Endpoint expects Form data, not JSON
             try:
+                headers = self._get_auth_headers()
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     response = await client.post(
                         f"{self.proxy_server_url}/api/v1/validators/mark-task-seen",
-                        json={
+                        headers=headers,
+                        data={
                             'task_id': task_id,
-                            'validator_uid': validator_uid,
+                            'validator_uid': validator_uid or 0,
                             'validator_identifier': validator_identifier,
                             'evaluated_at': datetime.now().isoformat()
                         }
                     )
                     if response.status_code == 200:
-                        bt.logging.info(f"✅ Task {task_id} marked as seen in database")
+                        bt.logging.debug(f"✅ Task {task_id} marked as seen in database")
                     else:
                         bt.logging.warning(f"⚠️ Failed to mark task in database: {response.status_code}")
             except Exception as e:
@@ -3401,52 +3406,19 @@ class Validator(BaseValidatorNeuron):
             return completed_tasks
     
     def log_evaluation_summary(self, epoch: int, tasks_evaluated: int, miner_performance: Dict):
-        """Log comprehensive evaluation summary for the current epoch"""
+        """Log concise evaluation summary for the current epoch"""
         try:
-            bt.logging.info("=" * 80)
-            bt.logging.info(f"📊 EVALUATION SUMMARY - EPOCH {epoch}")
-            bt.logging.info("=" * 80)
-            
-            # Epoch statistics
-            bt.logging.info(f"📈 Epoch Statistics:")
-            bt.logging.info(f"   Epoch Number: {epoch}")
-            bt.logging.info(f"   Tasks Evaluated: {tasks_evaluated}")
-            bt.logging.info(f"   Miners Participating: {len(miner_performance)}")
-            bt.logging.info(f"   Evaluation Timestamp: {datetime.now().isoformat()}")
-            
-            # Miner performance summary
+            # Concise summary only
             if miner_performance:
                 total_scores = [perf['total_score'] for perf in miner_performance.values()]
                 avg_score = sum(total_scores) / len(total_scores)
                 max_score = max(total_scores)
-                min_score = min(total_scores)
                 
-                bt.logging.info(f"\n🏆 Miner Performance Summary:")
-                bt.logging.info(f"   Average Total Score: {avg_score:.2f}")
-                bt.logging.info(f"   Highest Score: {max_score:.2f}")
-                bt.logging.info(f"   Lowest Score: {min_score:.2f}")
-                bt.logging.info(f"   Score Range: {max_score - min_score:.2f}")
-                
-                # Top performers
-                top_miners = sorted(miner_performance.items(), key=lambda x: x[1]['total_score'], reverse=True)[:5]
-                bt.logging.info(f"\n🥇 Top 5 Performers:")
-                for i, (miner_uid, performance) in enumerate(top_miners, 1):
-                    bt.logging.info(f"   #{i} | UID {miner_uid:3d} | Score: {performance['total_score']:6.2f} | Tasks: {performance['task_count']:2d}")
-            
-            # Performance metrics summary
-            performance_summary = self.get_performance_summary()
-            bt.logging.info(f"\n📊 Overall Performance Metrics:")
-            bt.logging.info(f"   Total Operations: {performance_summary.get('total_operations', 0)}")
-            bt.logging.info(f"   Success Rate: {performance_summary.get('overall_success_rate', 0):.1f}%")
-            
-            # Recent errors
-            recent_errors = performance_summary.get('recent_errors', [])
-            if recent_errors:
-                bt.logging.info(f"\n⚠️  Recent Errors ({len(recent_errors)}):")
-                for error in recent_errors[-3:]:  # Last 3 errors
-                    bt.logging.info(f"   {error.get('timestamp', 'Unknown')}: {error.get('error', 'Unknown error')}")
-            
-            bt.logging.info("=" * 80)
+                # Top performer only
+                top_miner = max(miner_performance.items(), key=lambda x: x[1]['total_score'])
+                bt.logging.info(f"📊 Epoch {epoch}: {tasks_evaluated} tasks, {len(miner_performance)} miners | Top: UID {top_miner[0]} ({top_miner[1]['total_score']:.1f}) | Avg: {avg_score:.1f}")
+            else:
+                bt.logging.info(f"📊 Epoch {epoch}: {tasks_evaluated} tasks evaluated")
             
         except Exception as e:
             bt.logging.error(f"❌ Error logging evaluation summary: {str(e)}")

@@ -77,7 +77,7 @@ class Miner(BaseMinerNeuron):
         # Miner will query proxy server for tasks instead of running its own API server
         self.proxy_server_url = "https://violet-proxy-bl4w.onrender.com"  # Production proxy server URL
         self.last_task_query = 0
-        self.task_query_interval = 10  # Query every 10 seconds
+        self.task_query_interval = 60  # Query every 60 seconds (reduced frequency to prevent spam)
         
         # Load miner API key from environment variable (like HF_TOKEN)
         self.miner_api_key = os.getenv('MINER_API_KEY')
@@ -132,8 +132,12 @@ class Miner(BaseMinerNeuron):
         # Initialize duplicate protection
         self.processed_tasks = set()  # Track processed task IDs
         self.processing_tasks = set()  # Track currently processing tasks
+        self.processing_tasks_timestamps = {}  # Track when tasks started processing (for timeout)
         self.max_processed_tasks = 1000  # Maximum tasks to keep in memory
         self.task_processing_lock = threading.Lock()  # Thread safety for task processing
+        self.task_processing_timeout = 600  # 10 minutes timeout for stuck tasks
+        self.max_task_retries = 3  # Maximum retries for failed tasks
+        self.task_retry_count = {}  # Track retry count per task
 
     def setup_enhanced_logging(self):
         """Setup enhanced logging with structured logging and response tracking"""
@@ -658,23 +662,81 @@ Report generated automatically by Bittensor Miner
                 if response.status_code == 200:
                     tasks = response.json()
                     if tasks and len(tasks) > 0:
-                        bt.logging.info(f"🎯 Found {len(tasks)} assigned tasks for miner {miner_uid}")
-                        
                         # 🔒 DUPLICATE PROTECTION: Additional filtering before processing
                         eligible_tasks = []
+                        current_time = time.time()
+                        max_task_age_hours = 24  # Skip tasks older than 24 hours
+                        max_task_age_seconds = max_task_age_hours * 60 * 60
+                        
+                        # Count how many will be filtered
+                        skipped_processed = 0
+                        skipped_old = 0
+                        
                         for task in tasks:
                             task_id = task.get("task_id")
                             task_status = task.get("status")
                             
                             # Skip if already processed
                             if task_id in self.processed_tasks:
-                                bt.logging.debug(f"🔄 Skipping already processed task: {task_id}")
-                                continue
+                                skipped_processed += 1
+                                continue  # Silently skip - no logging to reduce noise
                             
-                            # Skip if currently being processed
+                            # Skip if currently being processed (but check for timeout)
                             if task_id in self.processing_tasks:
+                                # Check if task is stuck (processing too long)
+                                if task_id in self.processing_tasks_timestamps:
+                                    elapsed = time.time() - self.processing_tasks_timestamps[task_id]
+                                    if elapsed > self.task_processing_timeout:
+                                        bt.logging.warning(f"⚠️ Task {task_id} stuck in processing for {elapsed:.0f}s - cleaning up")
+                                        with self.task_processing_lock:
+                                            self.processing_tasks.discard(task_id)
+                                            self.processing_tasks_timestamps.pop(task_id, None)
+                                            # Mark as processed to prevent infinite retry
+                                            self.processed_tasks.add(task_id)
+                                        continue
                                 bt.logging.debug(f"⏳ Skipping currently processing task: {task_id}")
                                 continue
+                            
+                            # Skip if task has exceeded max retries
+                            if task_id in self.task_retry_count and self.task_retry_count[task_id] >= self.max_task_retries:
+                                bt.logging.debug(f"🔄 Skipping task {task_id} - exceeded max retries ({self.task_retry_count[task_id]})")
+                                # Mark as processed to prevent further retries
+                                self.processed_tasks.add(task_id)
+                                continue
+                            
+                            # Skip tasks that are too old (stuck tasks)
+                            created_at = task.get("created_at")
+                            if created_at:
+                                try:
+                                    # Parse ISO format datetime
+                                    if isinstance(created_at, str):
+                                        if created_at.endswith('Z'):
+                                            created_at = created_at[:-1] + '+00:00'
+                                        created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                                    else:
+                                        created_dt = created_at
+                                    
+                                    # Calculate age
+                                    if hasattr(created_dt, 'timestamp'):
+                                        created_timestamp = created_dt.timestamp()
+                                    else:
+                                        # Fallback for timezone-aware datetime
+                                        from datetime import timezone
+                                        if created_dt.tzinfo is None:
+                                            created_dt = created_dt.replace(tzinfo=timezone.utc)
+                                        created_timestamp = created_dt.timestamp()
+                                    
+                                    task_age_seconds = current_time - created_timestamp
+                                    task_age_hours = task_age_seconds / (60 * 60)
+                                    
+                                    if task_age_seconds > max_task_age_seconds:
+                                        skipped_old += 1
+                                        # Mark as processed to prevent reprocessing
+                                        self.processed_tasks.add(task_id)
+                                        continue
+                                except Exception as e:
+                                    bt.logging.debug(f"⚠️ Could not parse task age for {task_id}: {e}")
+                                    # Continue processing if we can't parse the date
                             
                             # Only accept assigned or pending tasks (exclude processing to reduce logging)
                             if task_status not in ['assigned', 'pending']:
@@ -685,13 +747,18 @@ Report generated automatically by Bittensor Miner
                         
                         # Process eligible tasks after filtering (fixed indentation)
                         if len(eligible_tasks) > 0:
-                            bt.logging.info(f"✅ {len(eligible_tasks)} assigned tasks eligible for processing")
+                            bt.logging.info(f"✅ Found {len(eligible_tasks)} eligible task(s) for processing (skipped {skipped_processed} processed, {skipped_old} old)")
                             
                             # Process each eligible task
                             for task in eligible_tasks:
                                 await self.process_proxy_task(task)
                         else:
-                            bt.logging.debug(f"🔄 No eligible tasks after filtering")
+                            # Only log if we actually found tasks but filtered them all
+                            if len(tasks) > 0:
+                                total_skipped = skipped_processed + skipped_old
+                                bt.logging.debug(f"🔄 Found {len(tasks)} task(s) but all filtered (processed: {skipped_processed}, old: {skipped_old}, other: {len(tasks) - total_skipped})")
+                            else:
+                                bt.logging.debug(f"🔄 No assigned tasks for miner {miner_uid}")
                     else:
                         bt.logging.debug(f"🔄 No assigned tasks for miner {miner_uid}")
                 else:
@@ -729,8 +796,9 @@ Report generated automatically by Bittensor Miner
                         # Query for tasks
                         loop.run_until_complete(self.query_proxy_for_tasks())
                         
-                        # 🔒 DUPLICATE PROTECTION: Clean up old processed tasks
+                        # 🔒 DUPLICATE PROTECTION: Clean up old processed tasks and stuck tasks
                         self.cleanup_processed_tasks()
+                        self.cleanup_stuck_tasks()
                         
                     finally:
                         loop.close()
@@ -909,6 +977,7 @@ Report generated automatically by Bittensor Miner
                 
                 # Mark task as currently being processed (atomic operation)
                 self.processing_tasks.add(task_id)
+                self.processing_tasks_timestamps[task_id] = time.time()  # Track start time
             
             # Log task start with professional formatting
             self.log_task_start(task_id, task_type, miner_uid, task_data)
@@ -1299,6 +1368,7 @@ Report generated automatically by Bittensor Miner
                     # Mark task as processed only after successful submission
                     with self.task_processing_lock:
                         self.processed_tasks.add(task_id)
+                        self.task_retry_count.pop(task_id, None)  # Clear retry count on success
                         bt.logging.info(f"✅ Task {task_id} marked as processed")
                     
                 except Exception as e:
@@ -1318,13 +1388,22 @@ Report generated automatically by Bittensor Miner
                 # Always unlock task, even if processing failed
                 with self.task_processing_lock:
                     self.processing_tasks.discard(task_id)
+                    self.processing_tasks_timestamps.pop(task_id, None)  # Remove timestamp
+                    
                     # Only mark as processed if we actually completed (not if we failed)
-                    # This allows retry on failure
+                    # This allows retry on failure, but with a limit
                     if task_id not in self.processed_tasks:
-                        # Check if we should mark as processed (only if we got a result)
-                        # For now, we'll mark failed tasks as processed to prevent infinite retries
-                        # but log it clearly
-                        bt.logging.info(f"🔓 Task {task_id} unlocked from processing")
+                        # Increment retry count for failed tasks
+                        if task_id not in self.task_retry_count:
+                            self.task_retry_count[task_id] = 0
+                        self.task_retry_count[task_id] += 1
+                        
+                        # Mark as processed if exceeded max retries
+                        if self.task_retry_count[task_id] >= self.max_task_retries:
+                            self.processed_tasks.add(task_id)
+                            bt.logging.warning(f"⚠️ Task {task_id} marked as processed after {self.task_retry_count[task_id]} failed attempts")
+                        else:
+                            bt.logging.info(f"🔓 Task {task_id} unlocked from processing (retry {self.task_retry_count[task_id]}/{self.max_task_retries})")
                     else:
                         bt.logging.info(f"✅ Task {task_id} already marked as processed")
                 
@@ -1334,6 +1413,15 @@ Report generated automatically by Bittensor Miner
             if task_id:
                 with self.task_processing_lock:
                     self.processing_tasks.discard(task_id)
+                    self.processing_tasks_timestamps.pop(task_id, None)
+                    # Increment retry count
+                    if task_id not in self.task_retry_count:
+                        self.task_retry_count[task_id] = 0
+                    self.task_retry_count[task_id] += 1
+                    # Mark as processed if exceeded max retries
+                    if self.task_retry_count[task_id] >= self.max_task_retries:
+                        self.processed_tasks.add(task_id)
+                        bt.logging.warning(f"⚠️ Task {task_id} marked as processed after {self.task_retry_count[task_id]} failed attempts")
                 bt.logging.error(f"❌ Error processing task {task_id}: {e}")
             else:
                 bt.logging.error(f"❌ Error processing task: {e}")
@@ -3304,6 +3392,28 @@ Report generated automatically by Bittensor Miner
                 bt.logging.info(f"🧹 Cleaned up processed tasks: {current_count} -> {len(self.processed_tasks)}")
         except Exception as e:
             bt.logging.warning(f"⚠️ Error cleaning up processed tasks: {e}")
+    
+    def cleanup_stuck_tasks(self):
+        """Clean up tasks that are stuck in processing state"""
+        try:
+            current_time = time.time()
+            stuck_tasks = []
+            
+            with self.task_processing_lock:
+                for task_id, start_time in list(self.processing_tasks_timestamps.items()):
+                    elapsed = current_time - start_time
+                    if elapsed > self.task_processing_timeout:
+                        stuck_tasks.append((task_id, elapsed))
+                        self.processing_tasks.discard(task_id)
+                        self.processing_tasks_timestamps.pop(task_id, None)
+                        # Mark as processed to prevent retry
+                        self.processed_tasks.add(task_id)
+                        bt.logging.warning(f"🧹 Cleaned up stuck task {task_id} (stuck for {elapsed:.0f}s)")
+            
+            if stuck_tasks:
+                bt.logging.info(f"🧹 Cleaned up {len(stuck_tasks)} stuck task(s)")
+        except Exception as e:
+            bt.logging.warning(f"⚠️ Error cleaning up stuck tasks: {e}")
     
     def get_duplicate_protection_stats(self):
         """Get statistics about duplicate protection"""

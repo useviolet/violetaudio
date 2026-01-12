@@ -468,23 +468,29 @@ class Validator(BaseValidatorNeuron):
                                     status_code = 200
                                 
                                 # Professional status code handling:
-                                # CRITICAL: Only 200 means miner is ACTIVE and READY to process tasks
+                                # Accept 200 and 408 as ACTIVE and USABLE miners
                                 # 200 = success (miner is ready and active) ✅
+                                # 408 = request timeout (miner is REACHABLE and usable, just slow) ✅
                                 # 400 = bad request (miner responding but misconfigured) ❌ NOT ACTIVE
-                                # 408 = request timeout (miner is reachable but NOT responding properly) ❌ NOT ACTIVE
                                 # 500 = server error (miner has internal error) ❌ NOT ACTIVE
                                 # 503 = service unavailable (miner is busy/down) ❌ NOT ACTIVE
                                 # 
-                                # Key insight: Only 200 means the miner is actually running and ready.
-                                # Other status codes mean the miner is reachable but NOT ready for tasks.
-                                if status_code == 200:
+                                # Key insight: 200 and 408 mean the miner is reachable and can be used.
+                                # 408 indicates the miner is slow but still functional and usable.
+                                if status_code in [200, 408]:
                                     active_miners.append(uid)
+                                    
+                                    # Different logging based on status code
+                                    if status_code == 200:
+                                        status_msg = "SUCCESS"
+                                    elif status_code == 408:
+                                        status_msg = "ACTIVE (slow response but usable)"
                                     
                                     # Log successful handshakes
                                     bt.logging.info(
                                         f"✅ UID {uid:3d} | {ip}:{port} | "
                                         f"Stake: {stake:,.0f} TAO | "
-                                        f"On-chain handshake: SUCCESS (Status: 200)"
+                                        f"On-chain handshake: {status_msg} (Status: {status_code})"
                                         + (f" (attempt {attempt + 1})" if attempt > 0 else "")
                                     )
                                     break  # Success, exit retry loop
@@ -492,12 +498,7 @@ class Validator(BaseValidatorNeuron):
                                     # Miner responded but is NOT active/ready
                                     # Log at debug level to show why miner was rejected
                                     if attempt == max_retries - 1:  # Only log on last attempt
-                                        if status_code == 408:
-                                            bt.logging.debug(
-                                                f"⏱️  UID {uid:3d} | {ip}:{port} | "
-                                                f"REACHABLE but NOT ACTIVE: Timeout (Status: 408) - Miner too slow"
-                                            )
-                                        elif status_code == 503:
+                                        if status_code == 503:
                                             bt.logging.debug(
                                                 f"🔌 UID {uid:3d} | {ip}:{port} | "
                                                 f"REACHABLE but NOT ACTIVE: Service Unavailable (Status: 503) - Miner busy/down"
@@ -639,8 +640,27 @@ class Validator(BaseValidatorNeuron):
                 bt.logging.info(f"🔍 Evaluation trigger activated at block {self.block}")
                 await self.trigger_task_evaluation()
             
+            # Sync metagraph BEFORE checking connectivity to ensure we have latest miner data
+            # This ensures we discover new miners that joined the network
+            # Sync more frequently (every forward pass) to catch new miners immediately
+            # The metagraph sync is lightweight and ensures we always have current network state
+            if self.should_sync_metagraph():
+                bt.logging.info(f"🔄 Syncing metagraph at block {self.block} to discover new miners...")
+                self.resync_metagraph()
+            else:
+                # Even if not a full sync, do a lightweight metagraph update to catch new miners
+                # This ensures we discover new miners without waiting for full epoch sync
+                try:
+                    # Quick sync to update metagraph with latest network state
+                    # This is faster than full resync but still gets new miners
+                    self.metagraph.sync(subtensor=self.subtensor)
+                    bt.logging.debug(f"🔄 Lightweight metagraph sync at block {self.block} (total miners: {len(self.metagraph.hotkeys)})")
+                except Exception as e:
+                    bt.logging.debug(f"⚠️  Lightweight metagraph sync failed (will use cached data): {e}")
+            
             # ALWAYS check miner connectivity and report status to proxy (regardless of proxy tasks)
             # This ensures proxy server always has current miner status
+            # IMPORTANT: This now uses freshly synced metagraph data, so new miners will be discovered
             await self.check_miner_connectivity()
             
             # Report miner status to proxy server EVERY forward pass

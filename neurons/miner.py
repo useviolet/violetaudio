@@ -3045,6 +3045,36 @@ Report generated automatically by Bittensor Miner
                 submit_time = time.time() - submit_start_time
                 
                 if response.status_code == 200:
+                    # Try to parse response body to verify success
+                    try:
+                        response_json = response.json()
+                        # Check if response indicates success
+                        if isinstance(response_json, dict) and response_json.get("success") is False:
+                            error_msg = f"Failed to submit result for task {task_id}: {response_json.get('message', 'Unknown error')}"
+                            bt.logging.warning(f"⚠️ {error_msg}")
+                            bt.logging.warning(f"   Response body: {response.text}")
+                            
+                            # Log submission failure
+                            submission_log = {
+                                "timestamp": datetime.now().isoformat(),
+                                "event": "result_submission_failure",
+                                "task_id": task_id,
+                                "miner_uid": miner_uid,
+                                "submission_time": submit_time,
+                                "response_status": response.status_code,
+                                "response_body": response.text,
+                                "error": error_msg
+                            }
+                            
+                            submission_log_file = self.response_logs_dir / f"{task_id}_{miner_uid}_submission_failure.json"
+                            with open(submission_log_file, 'w') as f:
+                                json.dump(submission_log, f, indent=2, default=str)
+                            
+                            return False
+                    except (json.JSONDecodeError, ValueError):
+                        # If response is not JSON or can't be parsed, assume success for 200 status
+                        pass
+                    
                     bt.logging.info(f"✅ Result submitted successfully for task {task_id}")
                     bt.logging.info(f"   Submission time: {submit_time:.2f}s")
                     bt.logging.info(f"   Response status: {response.status_code}")
@@ -3063,12 +3093,14 @@ Report generated automatically by Bittensor Miner
                     submission_log_file = self.response_logs_dir / f"{task_id}_{miner_uid}_submission_success.json"
                     with open(submission_log_file, 'w') as f:
                         json.dump(submission_log, f, indent=2, default=str)
+                    
+                    # Return True to indicate successful submission
+                    return True
                         
                 else:
                     error_msg = f"Failed to submit result for task {task_id}: HTTP {response.status_code}"
                     bt.logging.warning(f"⚠️ {error_msg}")
                     bt.logging.warning(f"   Response body: {response.text}")
-                    return False
                     
                     # Log submission failure
                     submission_log = {
@@ -3085,6 +3117,8 @@ Report generated automatically by Bittensor Miner
                     submission_log_file = self.response_logs_dir / f"{task_id}_{miner_uid}_submission_failure.json"
                     with open(submission_log_file, 'w') as f:
                         json.dump(submission_log, f, indent=2, default=str)
+                    
+                    return False
                     
         except Exception as e:
             error_msg = f"Error submitting result: {str(e)}"

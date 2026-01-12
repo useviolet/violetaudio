@@ -301,6 +301,61 @@ class Miner(BaseMinerNeuron):
         except Exception as e:
             bt.logging.error(f"❌ Error summarizing result: {e}")
             return {"error": str(e)}
+    
+    def _print_task_result(self, task_id: str, task_type: str, result: dict):
+        """Print task result/response in a clear, readable format"""
+        try:
+            if task_type == "transcription" or task_type == "video_transcription":
+                transcript = result.get("transcript", "")
+                confidence = result.get("confidence", 0.0)
+                bt.logging.info(f"   Task ID:     {task_id}")
+                bt.logging.info(f"   Type:        {task_type.upper()}")
+                bt.logging.info(f"   Transcript:  {transcript[:200]}{'...' if len(transcript) > 200 else ''}")
+                bt.logging.info(f"   Length:      {len(transcript)} characters")
+                if confidence > 0:
+                    bt.logging.info(f"   Confidence:  {confidence:.2%}")
+                    
+            elif task_type == "tts":
+                output_data = result.get("output_data", {})
+                audio_file = output_data.get("audio_file", {}) if isinstance(output_data, dict) else {}
+                bt.logging.info(f"   Task ID:     {task_id}")
+                bt.logging.info(f"   Type:        {task_type.upper()}")
+                if audio_file:
+                    bt.logging.info(f"   Audio File:  {audio_file.get('file_name', 'N/A')}")
+                    bt.logging.info(f"   File Size:   {audio_file.get('file_size', 0):,} bytes")
+                    bt.logging.info(f"   Storage:     {audio_file.get('storage_location', 'N/A')}")
+                else:
+                    bt.logging.info(f"   Output:      {str(output_data)[:200]}{'...' if len(str(output_data)) > 200 else ''}")
+                    
+            elif task_type == "summarization":
+                summary = result.get("summary", "")
+                text_length = result.get("text_length", 0)
+                bt.logging.info(f"   Task ID:     {task_id}")
+                bt.logging.info(f"   Type:        {task_type.upper()}")
+                bt.logging.info(f"   Summary:     {summary[:200]}{'...' if len(summary) > 200 else ''}")
+                bt.logging.info(f"   Summary Len: {len(summary)} characters")
+                if text_length > 0:
+                    bt.logging.info(f"   Original:    {text_length} characters")
+                    
+            elif task_type == "text_translation" or task_type == "document_translation":
+                translated_text = result.get("translated_text", "")
+                source_lang = result.get("source_language", "unknown")
+                target_lang = result.get("target_language", "unknown")
+                bt.logging.info(f"   Task ID:     {task_id}")
+                bt.logging.info(f"   Type:        {task_type.upper()}")
+                bt.logging.info(f"   Languages:   {source_lang} → {target_lang}")
+                bt.logging.info(f"   Translated:  {translated_text[:200]}{'...' if len(translated_text) > 200 else ''}")
+                bt.logging.info(f"   Length:      {len(translated_text)} characters")
+            else:
+                # Generic result printing
+                bt.logging.info(f"   Task ID:     {task_id}")
+                bt.logging.info(f"   Type:        {task_type.upper()}")
+                bt.logging.info(f"   Result:      {str(result)[:300]}{'...' if len(str(result)) > 300 else ''}")
+                
+        except Exception as e:
+            bt.logging.error(f"❌ Error printing task result: {e}")
+            bt.logging.info(f"   Task ID:     {task_id}")
+            bt.logging.info(f"   Result:      {str(result)[:300]}")
 
     def _log_metrics_summary(self):
         """Log current metrics summary"""
@@ -492,7 +547,10 @@ Report generated automatically by Bittensor Miner
             with open(start_log_file, 'w') as f:
                 json.dump(start_log, f, indent=2)
             
-            # Professional console output
+            # Professional console output with clear task boundary markers
+            bt.logging.info("")
+            bt.logging.info("=" * 80)
+            bt.logging.info(f"*********** TASK ID: {task_id} ******")
             bt.logging.info("=" * 80)
             bt.logging.info(f"🚀 TASK STARTED - Processing Task")
             bt.logging.info("=" * 80)
@@ -598,6 +656,9 @@ Report generated automatically by Bittensor Miner
                 bt.logging.error(f"   ERROR: {error}")
             
             bt.logging.info("=" * 80)
+            bt.logging.info(f"******* TASK END: {task_id} ******")
+            bt.logging.info("=" * 80)
+            bt.logging.info("")
             
         except Exception as e:
             bt.logging.error(f"❌ Error logging task completion: {e}")
@@ -1350,6 +1411,15 @@ Report generated automatically by Bittensor Miner
                     self.log_task_completion(task_id, task_type, miner_uid, processing_time, True, result)
                     
                     bt.logging.info(f"✅ Task {task_id} processed successfully by {task_type} pipeline in {processing_time:.2f}s")
+                    
+                    # Print response/results clearly between task start and end
+                    bt.logging.info("")
+                    bt.logging.info("─" * 80)
+                    bt.logging.info("📊 TASK RESULT / RESPONSE:")
+                    bt.logging.info("─" * 80)
+                    self._print_task_result(task_id, task_type, result)
+                    bt.logging.info("─" * 80)
+                    bt.logging.info("")
                     
                     # Submit result back to proxy and wait for completion
                     submission_success = await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, result)

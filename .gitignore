@@ -90,10 +90,8 @@ proxy_server/db/*.json
 *.tmp.txt
 *.log.txt
 
-# Ignore proxy server generated directories
-proxy_server/db/
-proxy_server/local_storage/
-proxy_server/proxy_server/
+# Ignore proxy server directory and all its contents
+proxy_server/
 
 # File processing and storage directories
 uploads/

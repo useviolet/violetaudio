@@ -321,9 +321,19 @@ class TranscriptionPipeline:
     
     def preprocess_audio(self, audio_bytes: bytes) -> Tuple[np.ndarray, int]:
         """Preprocess audio data for transcription"""
+        import tempfile
+        import os
+        
+        temp_audio_file = None
         try:
-            # Load audio using librosa
-            audio_array, sample_rate = librosa.load(io.BytesIO(audio_bytes), sr=16000)
+            # librosa.load() may not recognize format from BytesIO for WAV files
+            # Save to temporary file first for reliable format detection
+            temp_audio_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            temp_audio_file.write(audio_bytes)
+            temp_audio_file.close()
+            
+            # Load audio using librosa from file path (more reliable)
+            audio_array, sample_rate = librosa.load(temp_audio_file.name, sr=16000)
             
             # Convert to mono if stereo
             if len(audio_array.shape) > 1:
@@ -338,7 +348,37 @@ class TranscriptionPipeline:
             
         except Exception as e:
             logger.error(f"❌ Audio preprocessing failed: {e}")
-            raise
+            # Try alternative method using soundfile directly
+            try:
+                logger.info("🔄 Trying alternative audio loading method...")
+                # Use soundfile to read WAV bytes directly
+                audio_array, sample_rate = sf.read(io.BytesIO(audio_bytes))
+                
+                # Resample to 16kHz if needed
+                if sample_rate != 16000:
+                    audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
+                    sample_rate = 16000
+                
+                # Convert to mono if stereo
+                if len(audio_array.shape) > 1:
+                    audio_array = np.mean(audio_array, axis=1)
+                
+                # Normalize audio
+                if np.max(np.abs(audio_array)) > 0:
+                    audio_array = audio_array / np.max(np.abs(audio_array))
+                
+                logger.info(f"✅ Audio preprocessed (alternative method): {len(audio_array)} samples, {sample_rate}Hz")
+                return audio_array, sample_rate
+            except Exception as e2:
+                logger.error(f"❌ Alternative audio loading also failed: {e2}")
+                raise e  # Raise original error
+        finally:
+            # Clean up temporary file
+            if temp_audio_file and os.path.exists(temp_audio_file.name):
+                try:
+                    os.unlink(temp_audio_file.name)
+                except Exception:
+                    pass
     
     def format_timed_transcript(self, result: TranscriptionResult, format_type: str = "plain") -> str:
         """

@@ -3410,7 +3410,6 @@ Report generated automatically by Bittensor Miner
                 # Try to get from Firebase Cloud Storage first
                 try:
                     import sys
-                    import os
                     sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
                     
                     from proxy_server.managers.file_manager import FileManager

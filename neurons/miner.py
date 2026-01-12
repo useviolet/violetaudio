@@ -2400,111 +2400,39 @@ Report generated automatically by Bittensor Miner
             import uuid
             audio_filename = f"{uuid.uuid4().hex[:8]}.wav"
             
-            # Store audio in R2 Storage via proxy server API
-            # Instead of initializing FileManager directly, upload via proxy API
-            try:
-                bt.logging.info(f"📤 Uploading TTS audio to proxy server...")
-                
-                # Upload audio file via proxy server API
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    headers = self._get_auth_headers()
-                    headers["Content-Type"] = "multipart/form-data"
-                    
-                    # Prepare multipart form data
-                    files = {
-                        'file': (audio_filename, audio_data, 'audio/wav')
-                    }
-                    data = {
-                        'file_type': 'tts',
-                        'task_id': task_data.get('task_id', 'unknown') if 'task_data' in locals() else 'unknown'
-                    }
-                    
-                    response = await client.post(
-                        f"{self.proxy_server_url}/api/v1/files/upload",
-                        headers=headers,
-                        files=files,
-                        data=data
-                    )
-                    response.raise_for_status()
-                    upload_result = response.json()
-                    
-                    if upload_result.get("success"):
-                        file_id = upload_result.get("file_id")
-                        public_url = upload_result.get("public_url")
-                        
-                        bt.logging.info(f"✅ Audio file uploaded to R2 via proxy: {file_id}")
-                        bt.logging.info(f"   File size: {len(audio_data)} bytes")
-                        if public_url:
-                            bt.logging.info(f"   Public URL: {public_url[:80]}...")
-                    else:
-                        raise Exception(f"Upload failed: {upload_result.get('error', 'Unknown error')}")
-                
-                # Return result in format expected by submit_tts_result_to_proxy
-                return {
-                    "audio_file": {
-                        "file_id": file_id,
-                        "filename": audio_filename,
-                        "file_size": len(audio_data),
-                        "file_type": "audio/wav",
-                        "public_url": public_url,  # R2 public URL
-                        "storage_location": "r2"
-                    },
-                    "output_data": {
-                        "audio_file": {
-                            "file_id": file_id,
-                            "filename": audio_filename,
-                            "file_size": len(audio_data),
-                            "file_type": "audio/wav",
-                            "public_url": public_url,
-                            "storage_location": "r2"
-                        }
-                    },
-                    "processing_time": processing_time + init_time,  # Include initialization time
-                    "text_length": len(text),
-                    "source_language": source_language,
-                    "detected_language": detected_language,
-                    "language_confidence": language_confidence,
-                    "processing_language": source_language,
-                    "word_count": len(text.split()),
-                    "model_id": tts_model_id,
-                    "voice_name": voice_info.get("voice_name"),
-                    "audio_duration": 0.0,  # Will be calculated by validator
-                    "sample_rate": 22050,   # Default, will be verified by validator
-                    "bit_depth": 16,        # Default, will be verified by validator
-                    "channels": 1           # Default, will be verified by validator
-                }
-                
-            except Exception as storage_error:
-                bt.logging.error(f"❌ Failed to upload to Firebase Cloud Storage: {storage_error}")
-                # Fallback to local storage if Firebase fails
-                audio_path = f"proxy_server/local_storage/tts_audio/{audio_filename}"
-                os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-                
-                with open(audio_path, "wb") as f:
-                    f.write(audio_data)
-                
-                bt.logging.info(f"✅ Audio file saved locally (fallback): {audio_path}")
-                bt.logging.info(f"   File size: {len(audio_data)} bytes")
-                
-                return {
-                    "audio_file": {
-                        "filename": audio_filename,
-                        "local_path": audio_path,
-                        "file_size": len(audio_data),
-                        "file_type": "audio/wav"
-                    },
-                    "processing_time": processing_time,
-                    "text_length": len(text),
-                    "source_language": source_language,
-                    "detected_language": detected_language,
-                    "language_confidence": language_confidence,
-                    "processing_language": processing_language,
-                    "word_count": len(text.split()),
-                    "audio_duration": 0.0,  # Will be calculated by validator
-                    "sample_rate": 22050,   # Default, will be verified by validator
-                    "bit_depth": 16,        # Default, will be verified by validator
-                    "channels": 1           # Default, will be verified by validator
-                }
+            # Save audio to local storage - submit_tts_result_to_proxy will handle upload
+            # This avoids trying to use non-existent /api/v1/files/upload endpoint
+            audio_path = f"proxy_server/local_storage/tts_audio/{audio_filename}"
+            os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+            
+            with open(audio_path, "wb") as f:
+                f.write(audio_data)
+            
+            bt.logging.info(f"✅ Audio file saved locally: {audio_path}")
+            bt.logging.info(f"   File size: {len(audio_data)} bytes")
+            bt.logging.info(f"   Will be uploaded by submit_tts_result_to_proxy")
+            
+            return {
+                "audio_file": {
+                    "filename": audio_filename,
+                    "local_path": audio_path,
+                    "file_size": len(audio_data),
+                    "file_type": "audio/wav"
+                },
+                "processing_time": processing_time + init_time,  # Include initialization time
+                "text_length": len(text),
+                "source_language": source_language,
+                "detected_language": detected_language,
+                "language_confidence": language_confidence,
+                "processing_language": source_language,
+                "word_count": len(text.split()),
+                "model_id": tts_model_id,
+                "voice_name": voice_info.get("voice_name"),
+                "audio_duration": 0.0,  # Will be calculated by validator
+                "sample_rate": 22050,   # Default, will be verified by validator
+                "bit_depth": 16,        # Default, will be verified by validator
+                "channels": 1           # Default, will be verified by validator
+            }
             
         except Exception as e:
             error_msg = str(e)

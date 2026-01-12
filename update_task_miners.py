@@ -108,12 +108,14 @@ def update_task_miners(task_id: str, new_miners: list):
         return False
 
 def main():
-    task_id = "14de05cd-323b-4d2f-a3ae-53f60d1bd1c6"
+    # Get task ID from command line or use default
+    if len(sys.argv) > 1:
+        task_id = sys.argv[1]
+    else:
+        task_id = "b68db350-80ad-4979-97f5-7f6e386c3612"
     
-    # Ensure miners 6 and 16 are assigned, plus a few others for good distribution
-    # Current assignment: [5, 9, 14]
-    # New assignment: [6, 16, 2, 4, 7] - includes 6 and 16 as requested
-    new_miners = [6, 16, 2, 4, 7]
+    # Assign to miners 6 and 16 as requested
+    new_miners = [6, 16]
     
     print_section("Update Task Miners Script")
     print(f"Task ID: {task_id}")

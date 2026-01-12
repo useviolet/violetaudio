@@ -1212,30 +1212,53 @@ class Validator(BaseValidatorNeuron):
             return 0.0
     
     def calculate_speed_score(self, processing_time: float, task_type: str) -> float:
-        """Calculate speed score based on processing time and task type"""
+        """
+        Calculate speed score based on processing time and task type.
+        HIGHER processing time = HIGHER score (rewards miners who spend more time/effort).
+        """
         try:
-            # Define optimal processing times for different task types
-            optimal_times = {
-                'transcription': 2.0,  # 2 seconds optimal
-                'tts': 3.0,            # 3 seconds optimal  
-                'summarization': 5.0   # 5 seconds optimal
+            # Define baseline processing times for different task types
+            baseline_times = {
+                'transcription': 2.0,      # 2 seconds baseline
+                'video_transcription': 5.0, # 5 seconds baseline
+                'tts': 3.0,                # 3 seconds baseline  
+                'summarization': 5.0,      # 5 seconds baseline
+                'text_translation': 3.0,   # 3 seconds baseline
+                'document_translation': 5.0 # 5 seconds baseline
             }
             
-            optimal_time = optimal_times.get(task_type, 5.0)
+            baseline_time = baseline_times.get(task_type, 5.0)
             
-            # Score based on how close to optimal time
-            if processing_time <= optimal_time:
-                # Faster than optimal = perfect score
+            # Normalize processing time relative to baseline
+            # Higher processing time = higher score (up to a reasonable maximum)
+            # Cap at 10x baseline to prevent abuse
+            max_time = baseline_time * 10
+            
+            if processing_time <= 0:
+                return 0.0
+            
+            # Score increases with processing time (inverse of old logic)
+            # Miners who spend more time get higher scores
+            if processing_time >= max_time:
+                # Maximum score for very long processing times
                 return 1.0
-            elif processing_time <= optimal_time * 2:
-                # Within 2x optimal = good score
-                return 0.8
-            elif processing_time <= optimal_time * 5:
-                # Within 5x optimal = acceptable score
+            elif processing_time >= baseline_time * 5:
+                # High score for 5x+ baseline
+                return 0.9
+            elif processing_time >= baseline_time * 3:
+                # Good score for 3x+ baseline
+                return 0.75
+            elif processing_time >= baseline_time * 2:
+                # Moderate score for 2x+ baseline
                 return 0.6
+            elif processing_time >= baseline_time:
+                # Base score for baseline time
+                return 0.5
             else:
-                # Too slow = poor score
-                return 0.3
+                # Lower score for very fast processing (less effort)
+                # Scale from 0.3 to 0.5 based on how close to baseline
+                ratio = processing_time / baseline_time
+                return 0.3 + (ratio * 0.2)  # Linear interpolation
                 
         except Exception as e:
             bt.logging.error(f"❌ Error calculating speed score: {str(e)}")
@@ -1820,6 +1843,56 @@ class Validator(BaseValidatorNeuron):
                 miner_responses = valid_responses
                 bt.logging.debug(f"   ✅ Validated {len(miner_responses)} valid responses out of {len(task.get('miner_responses', []))} total")
                 
+                # 🔒 DUPLICATE FILTERING: Remove duplicate responses from the same miner, keep only the best one
+                miner_responses_by_uid = {}
+                for response in miner_responses:
+                    miner_uid = response.get('miner_uid')
+                    if miner_uid is None:
+                        continue
+                    
+                    # Extract nested response for score calculation
+                    nested_response = response.get('response', {})
+                    if isinstance(nested_response, str):
+                        try:
+                            import json
+                            nested_response = json.loads(nested_response)
+                        except:
+                            nested_response = {}
+                    
+                    # Calculate a simple score to determine the "best" response
+                    processing_time = nested_response.get('processing_time') or response.get('processing_time', 10.0)
+                    accuracy_score = nested_response.get('accuracy_score') or response.get('accuracy_score', 0.0)
+                    speed_score = nested_response.get('speed_score') or response.get('speed_score', 0.0)
+                    combined_score = (accuracy_score * 0.7) + (speed_score * 0.3)
+                    
+                    # Keep the response with the highest score (or first one if no score)
+                    if miner_uid not in miner_responses_by_uid:
+                        miner_responses_by_uid[miner_uid] = {
+                            'response': response,
+                            'score': combined_score,
+                            'processing_time': processing_time
+                        }
+                    else:
+                        # Replace if this response has a better score
+                        existing = miner_responses_by_uid[miner_uid]
+                        if combined_score > existing['score'] or (combined_score == existing['score'] and processing_time < existing['processing_time']):
+                            miner_responses_by_uid[miner_uid] = {
+                                'response': response,
+                                'score': combined_score,
+                                'processing_time': processing_time
+                            }
+                
+                # Convert back to list, keeping only one response per miner
+                deduplicated_responses = [item['response'] for item in miner_responses_by_uid.values()]
+                
+                if len(deduplicated_responses) < len(miner_responses):
+                    duplicate_count = len(miner_responses) - len(deduplicated_responses)
+                    bt.logging.warning(f"   ⚠️ Filtered out {duplicate_count} duplicate response(s) from same miners (kept best response per miner)")
+                    bt.logging.debug(f"   📊 Before deduplication: {len(miner_responses)} responses, After: {len(deduplicated_responses)} responses")
+                    bt.logging.debug(f"   📊 Unique miners: {list(miner_responses_by_uid.keys())}")
+                
+                miner_responses = deduplicated_responses
+                
                 # Log input data summary
                 input_data = task.get('input_data')
                 if input_data:
@@ -1956,8 +2029,8 @@ class Validator(BaseValidatorNeuron):
                     bt.logging.info("=" * 80)
                     continue
                 
-                # CRITICAL: Filter out invalid miners before selecting top miners
-                # Only reward miners with valid responses
+                # CRITICAL: Filter out invalid miners - but reward ALL participating miners
+                # Only reward miners with valid responses (score > 0)
                 valid_miner_scores = {}
                 for miner_uid, score in task_scores.items():
                     # Verify miner is in valid_responses (has valid output)
@@ -1975,13 +2048,15 @@ class Validator(BaseValidatorNeuron):
                     bt.logging.info("=" * 80)
                     continue
                 
-                # Select top 10 VALID miners for this task based on performance
+                # Select top 10 miners based on score (higher processing time = higher score)
+                # Sort by score (descending) - miners with higher processing times will rank higher
                 top_miners = await self.select_top_miners_for_task(valid_miner_scores, max_miners=10)
-                bt.logging.debug(f"🏆 TOP MINERS FOR TASK {task_id}: {[(uid, f'{score:.2f}') for uid, score in top_miners[:3]]}")
+                bt.logging.debug(f"🏆 TOP {len(top_miners)} MINERS FOR TASK {task_id}: {[(uid, f'{score:.2f}') for uid, score in top_miners[:3]]}")
+                bt.logging.info(f"   📊 Rewarding top {len(top_miners)} miner(s) for task {task_id} (based on score including processing time)")
                 
-                # Update miner performance tracking with only top miners
+                # Update miner performance tracking for top miners only
                 # CRITICAL: Track hotkey+uid to handle UID reuse scenarios
-                bt.logging.debug(f"📈 UPDATING MINER PERFORMANCE (TOP {len(top_miners)} ONLY):")
+                bt.logging.debug(f"📈 UPDATING MINER PERFORMANCE (TOP {len(top_miners)} MINERS):")
                 for miner_uid, score in top_miners:
                     # Get hotkey from metagraph for miner identity tracking (use cache if available)
                     try:
@@ -2040,8 +2115,8 @@ class Validator(BaseValidatorNeuron):
                     miner_performance[miner_uid]['task_count'] += 1
                     miner_performance[miner_uid]['task_scores'][task_id] = score
                     
-                    # Record ranking position for this task
-                    ranking_position = next(i for i, (uid, _) in enumerate(top_miners, 1) if uid == miner_uid)
+                    # Record ranking position for this task (based on score, higher = better)
+                    ranking_position = next((i for i, (uid, _) in enumerate(top_miners, 1) if uid == miner_uid), len(top_miners) + 1)
                     miner_performance[miner_uid]['top_rankings'][task_id] = ranking_position
                     
                     bt.logging.debug(f"   Miner {miner_uid}: Score={score:.2f}, Rank=#{ranking_position}, Total={miner_performance[miner_uid]['total_score']:.2f}, Tasks={miner_performance[miner_uid]['task_count']}")
@@ -2410,24 +2485,26 @@ class Validator(BaseValidatorNeuron):
                 quality_score = self.calculate_quality_score(miner_response, task_type)
                 
                 # Task type-specific scoring weights
+                # Processing time (speed_score) now rewards HIGHER processing time
+                # Higher weight for processing time to reward miners who spend more effort
                 if task_type == 'transcription':
-                    # Transcription: accuracy is most important
-                    weights = {'accuracy': 0.65, 'speed': 0.25, 'quality': 0.10}
+                    # Transcription: processing time and accuracy are important
+                    weights = {'accuracy': 0.50, 'speed': 0.40, 'quality': 0.10}
                 elif task_type == 'video_transcription':
-                    # Video transcription: accuracy is most important
-                    weights = {'accuracy': 0.65, 'speed': 0.25, 'quality': 0.10}
+                    # Video transcription: processing time and accuracy are important
+                    weights = {'accuracy': 0.50, 'speed': 0.40, 'quality': 0.10}
                 elif task_type == 'tts':
-                    # TTS: quality and accuracy are important
-                    weights = {'accuracy': 0.50, 'speed': 0.20, 'quality': 0.30}
+                    # TTS: quality, processing time, and accuracy are important
+                    weights = {'accuracy': 0.40, 'speed': 0.40, 'quality': 0.20}
                 elif task_type == 'summarization':
-                    # Summarization: accuracy and quality are important
-                    weights = {'accuracy': 0.60, 'speed': 0.20, 'quality': 0.20}
+                    # Summarization: processing time, accuracy and quality are important
+                    weights = {'accuracy': 0.45, 'speed': 0.35, 'quality': 0.20}
                 elif task_type in ['text_translation', 'document_translation']:
-                    # Translation: accuracy is most important
-                    weights = {'accuracy': 0.70, 'speed': 0.20, 'quality': 0.10}
+                    # Translation: processing time and accuracy are important
+                    weights = {'accuracy': 0.55, 'speed': 0.35, 'quality': 0.10}
                 else:
-                    # Default weights
-                    weights = {'accuracy': 0.60, 'speed': 0.25, 'quality': 0.15}
+                    # Default weights: emphasize processing time
+                    weights = {'accuracy': 0.50, 'speed': 0.35, 'quality': 0.15}
                 
                 # Combined score with task type-specific weights
                 combined_score = (

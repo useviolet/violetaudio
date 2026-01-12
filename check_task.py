@@ -229,7 +229,11 @@ def check_task(task_id: str):
         traceback.print_exc()
 
 def main():
-    task_id = "14de05cd-323b-4d2f-a3ae-53f60d1bd1c6"
+    # Get task ID from command line or use default
+    if len(sys.argv) > 1:
+        task_id = sys.argv[1]
+    else:
+        task_id = "ff532918-8f38-41bb-870a-011deea5c185"
     
     print_section("Task Check Script")
     print(f"Checking task ID: {task_id}")

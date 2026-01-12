@@ -108,15 +108,16 @@ def update_task_miners(task_id: str, new_miners: list):
         return False
 
 def main():
-    task_id = "8551ecf8-4729-4ea2-84ee-b6e91d8eb876"
+    task_id = "14de05cd-323b-4d2f-a3ae-53f60d1bd1c6"
     
-    # Current miners: [2, 4, 7, 16]
-    # Add miner 6: [2, 4, 6, 7, 16]
-    new_miners = [2, 4, 6, 7, 16]
+    # Ensure miners 6 and 16 are assigned, plus a few others for good distribution
+    # Current assignment: [5, 9, 14]
+    # New assignment: [6, 16, 2, 4, 7] - includes 6 and 16 as requested
+    new_miners = [6, 16, 2, 4, 7]
     
     print_section("Update Task Miners Script")
     print(f"Task ID: {task_id}")
-    print(f"Adding miner UID 6 to existing assignment")
+    print(f"Updating assignment to include miners 6 and 16 (and others)")
     print(f"Started at: {datetime.now().isoformat()}")
     
     success = update_task_miners(task_id, new_miners)

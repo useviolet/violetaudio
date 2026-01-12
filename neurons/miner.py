@@ -1287,12 +1287,15 @@ Report generated automatically by Bittensor Miner
                             "status": "completed_broken_file"
                         }
                         
-                        # Log the broken file completion
-                        miner_uid = self.uid if hasattr(self, 'uid') else 0
-                        self.log_task_completion(task_id, task_type, miner_uid, 0.0, True, broken_file_result, "File marked as completed due to being broken/empty")
-                        
                         # Submit the broken file result to proxy
-                        await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, broken_file_result)
+                        miner_uid = self.uid if hasattr(self, 'uid') else 0
+                        submission_success = await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, broken_file_result)
+                        
+                        # Log the broken file completion AFTER submission
+                        if submission_success:
+                            self.log_task_completion(task_id, task_type, miner_uid, 0.0, True, broken_file_result, "File marked as completed due to being broken/empty")
+                        else:
+                            self.log_task_completion(task_id, task_type, miner_uid, 0.0, False, broken_file_result, "Failed to submit broken file result")
                         
                         # Log the response
                         self.log_response(task_id, task_type, miner_uid, broken_file_result, 0.0, 0, True, "Broken file handled gracefully")
@@ -1316,12 +1319,15 @@ Report generated automatically by Bittensor Miner
                                 "status": "completed_broken_file"
                             }
                             
-                            # Log the suspicious file completion
-                            miner_uid = self.uid if hasattr(self, 'uid') else 0
-                            self.log_task_completion(task_id, task_type, miner_uid, 0.0, True, suspicious_file_result, "File marked as completed due to being suspiciously small")
-                            
                             # Submit the suspicious file result to proxy
-                            await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, suspicious_file_result)
+                            miner_uid = self.uid if hasattr(self, 'uid') else 0
+                            submission_success = await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, suspicious_file_result)
+                            
+                            # Log the suspicious file completion AFTER submission
+                            if submission_success:
+                                self.log_task_completion(task_id, task_type, miner_uid, 0.0, True, suspicious_file_result, "File marked as completed due to being suspiciously small")
+                            else:
+                                self.log_task_completion(task_id, task_type, miner_uid, 0.0, False, suspicious_file_result, "Failed to submit suspicious file result")
                             
                             # Log the response
                             self.log_response(task_id, task_type, miner_uid, suspicious_file_result, 0.0, input_size, True, "Suspiciously small file handled gracefully")
@@ -1407,9 +1413,6 @@ Report generated automatically by Bittensor Miner
                         self.log_task_completion(task_id, task_type, miner_uid, processing_time, False, result, error_msg)
                         return
                     
-                    # Log successful task completion
-                    self.log_task_completion(task_id, task_type, miner_uid, processing_time, True, result)
-                    
                     bt.logging.info(f"✅ Task {task_id} processed successfully by {task_type} pipeline in {processing_time:.2f}s")
                     
                     # Print response/results clearly between task start and end
@@ -1429,6 +1432,9 @@ Report generated automatically by Bittensor Miner
                         bt.logging.error(f"❌ {error_msg}")
                         self.log_task_completion(task_id, task_type, miner_uid, processing_time, False, result, error_msg)
                         return
+                    
+                    # Log successful task completion AFTER successful submission
+                    self.log_task_completion(task_id, task_type, miner_uid, processing_time, True, result)
                     
                     # Log final response
                     self.log_response(task_id, task_type, miner_uid, result, processing_time, input_size, True)
@@ -1886,14 +1892,29 @@ Report generated automatically by Bittensor Miner
                 self.log_task_completion(task_id, "summarization", miner_uid, processing_time, False, result, error_msg)
                 return
             
-            # Log successful task completion
-            miner_uid = self.uid if hasattr(self, 'uid') else 0
-            self.log_task_completion(task_id, "summarization", miner_uid, processing_time, True, result)
-            
             bt.logging.info(f"✅ Task {task_id} processed successfully by summarization pipeline in {processing_time:.2f}s")
             
+            # Print response/results clearly
+            bt.logging.info("")
+            bt.logging.info("─" * 80)
+            bt.logging.info("📊 TASK RESULT / RESPONSE:")
+            bt.logging.info("─" * 80)
+            self._print_task_result(task_id, "summarization", result)
+            bt.logging.info("─" * 80)
+            bt.logging.info("")
+            
             # Submit result back to proxy
-            await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, result)
+            miner_uid = self.uid if hasattr(self, 'uid') else 0
+            submission_success = await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, result)
+            
+            if not submission_success:
+                error_msg = f"Failed to submit result for task {task_id}"
+                bt.logging.error(f"❌ {error_msg}")
+                self.log_task_completion(task_id, "summarization", miner_uid, processing_time, False, result, error_msg)
+                return
+            
+            # Log successful task completion AFTER successful submission
+            self.log_task_completion(task_id, "summarization", miner_uid, processing_time, True, result)
             
             # Log final response
             self.log_response(task_id, "summarization", miner_uid, result, processing_time, 0, True)
@@ -1984,14 +2005,29 @@ Report generated automatically by Bittensor Miner
                 self.log_task_completion(task_id, "tts", miner_uid, processing_time, False, result, error_msg)
                 return
             
-            # Log successful task completion
-            miner_uid = self.uid if hasattr(self, 'uid') else 0
-            self.log_task_completion(task_id, "tts", miner_uid, processing_time, True, result)
-            
             bt.logging.info(f"✅ Task {task_id} processed successfully by TTS pipeline in {processing_time:.2f}s")
             
+            # Print response/results clearly
+            bt.logging.info("")
+            bt.logging.info("─" * 80)
+            bt.logging.info("📊 TASK RESULT / RESPONSE:")
+            bt.logging.info("─" * 80)
+            self._print_task_result(task_id, "tts", result)
+            bt.logging.info("─" * 80)
+            bt.logging.info("")
+            
             # Submit result back to proxy using TTS-specific endpoint
-            await self.submit_tts_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/tts/upload-audio", task_id, result)
+            miner_uid = self.uid if hasattr(self, 'uid') else 0
+            submission_success = await self.submit_tts_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/tts/upload-audio", task_id, result)
+            
+            if not submission_success:
+                error_msg = f"Failed to submit TTS result for task {task_id}"
+                bt.logging.error(f"❌ {error_msg}")
+                self.log_task_completion(task_id, "tts", miner_uid, processing_time, False, result, error_msg)
+                return
+            
+            # Log successful task completion AFTER successful submission
+            self.log_task_completion(task_id, "tts", miner_uid, processing_time, True, result)
             
             # Log final response
             self.log_response(task_id, "tts", miner_uid, result, processing_time, 0, True)
@@ -2630,14 +2666,29 @@ Report generated automatically by Bittensor Miner
                 self.log_task_completion(task_id, "text_translation", miner_uid, processing_time, False, result, error_msg)
                 return
             
-            # Log successful task completion
-            miner_uid = self.uid if hasattr(self, 'uid') else 0
-            self.log_task_completion(task_id, "text_translation", miner_uid, processing_time, True, result)
-            
             bt.logging.info(f"✅ Task {task_id} processed successfully by text translation pipeline in {processing_time:.2f}s")
             
+            # Print response/results clearly
+            bt.logging.info("")
+            bt.logging.info("─" * 80)
+            bt.logging.info("📊 TASK RESULT / RESPONSE:")
+            bt.logging.info("─" * 80)
+            self._print_task_result(task_id, "text_translation", result)
+            bt.logging.info("─" * 80)
+            bt.logging.info("")
+            
             # Submit result back to proxy using text translation-specific endpoint
-            await self.submit_text_translation_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/text-translation/upload-result", task_id, result)
+            miner_uid = self.uid if hasattr(self, 'uid') else 0
+            submission_success = await self.submit_text_translation_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/text-translation/upload-result", task_id, result)
+            
+            if not submission_success:
+                error_msg = f"Failed to submit text translation result for task {task_id}"
+                bt.logging.error(f"❌ {error_msg}")
+                self.log_task_completion(task_id, "text_translation", miner_uid, processing_time, False, result, error_msg)
+                return
+            
+            # Log successful task completion AFTER successful submission
+            self.log_task_completion(task_id, "text_translation", miner_uid, processing_time, True, result)
             
             # Log final response
             self.log_response(task_id, "text_translation", miner_uid, result, processing_time, 0, True)
@@ -2716,14 +2767,29 @@ Report generated automatically by Bittensor Miner
                 self.log_task_completion(task_id, "document_translation", miner_uid, processing_time, False, result, error_msg)
                 return
             
-            # Log successful task completion
-            miner_uid = self.uid if hasattr(self, 'uid') else 0
-            self.log_task_completion(task_id, "document_translation", miner_uid, processing_time, True, result)
-            
             bt.logging.info(f"✅ Task {task_id} processed successfully by document translation pipeline in {processing_time:.2f}s")
             
+            # Print response/results clearly
+            bt.logging.info("")
+            bt.logging.info("─" * 80)
+            bt.logging.info("📊 TASK RESULT / RESPONSE:")
+            bt.logging.info("─" * 80)
+            self._print_task_result(task_id, "document_translation", result)
+            bt.logging.info("─" * 80)
+            bt.logging.info("")
+            
             # Submit result back to proxy using document translation-specific endpoint
-            await self.submit_document_translation_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/document-translation/upload-result", task_id, result)
+            miner_uid = self.uid if hasattr(self, 'uid') else 0
+            submission_success = await self.submit_document_translation_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/document-translation/upload-result", task_id, result)
+            
+            if not submission_success:
+                error_msg = f"Failed to submit document translation result for task {task_id}"
+                bt.logging.error(f"❌ {error_msg}")
+                self.log_task_completion(task_id, "document_translation", miner_uid, processing_time, False, result, error_msg)
+                return
+            
+            # Log successful task completion AFTER successful submission
+            self.log_task_completion(task_id, "document_translation", miner_uid, processing_time, True, result)
             
             # Log final response
             self.log_response(task_id, "document_translation", miner_uid, result, processing_time, len(document_data), True)
@@ -2925,8 +2991,12 @@ Report generated automatically by Bittensor Miner
                 "error": str(e)
             }
     
-    async def submit_text_translation_result_to_proxy(self, callback_url: str, task_id: str, result: dict):
-        """Submit text translation result to proxy server"""
+    async def submit_text_translation_result_to_proxy(self, callback_url: str, task_id: str, result: dict) -> bool:
+        """Submit text translation result to proxy server
+        
+        Returns:
+            bool: True if submission was successful, False otherwise
+        """
         try:
             # Get miner UID from Bittensor
             miner_uid = self.uid if hasattr(self, 'uid') else 0
@@ -2951,14 +3021,21 @@ Report generated automatically by Bittensor Miner
                 
                 if response.status_code == 200:
                     bt.logging.info(f"✅ Text translation result submitted successfully for task {task_id}")
+                    return True
                 else:
                     bt.logging.warning(f"⚠️ Failed to submit text translation result: {response.status_code}")
+                    return False
                     
         except Exception as e:
             bt.logging.error(f"❌ Error submitting text translation result: {e}")
+            return False
     
-    async def submit_document_translation_result_to_proxy(self, callback_url: str, task_id: str, result: dict):
-        """Submit document translation result to proxy server"""
+    async def submit_document_translation_result_to_proxy(self, callback_url: str, task_id: str, result: dict) -> bool:
+        """Submit document translation result to proxy server
+        
+        Returns:
+            bool: True if submission was successful, False otherwise
+        """
         try:
             # Get miner UID from Bittensor
             miner_uid = self.uid if hasattr(self, 'uid') else 0
@@ -2984,11 +3061,14 @@ Report generated automatically by Bittensor Miner
                 
                 if response.status_code == 200:
                     bt.logging.info(f"✅ Document translation result submitted successfully for task {task_id}")
+                    return True
                 else:
                     bt.logging.warning(f"⚠️ Failed to submit document translation result: {response.status_code}")
+                    return False
                     
         except Exception as e:
             bt.logging.error(f"❌ Error submitting document translation result: {e}")
+            return False
     
     async def submit_result_to_proxy(self, callback_url: str, task_id: str, result: dict) -> bool:
         """Submit task result back to proxy server
@@ -3378,8 +3458,12 @@ Report generated automatically by Bittensor Miner
             bt.logging.warning("⚠️ No language specified - using default 'en'")
             synapse.language = "en"
 
-    async def submit_tts_result_to_proxy(self, callback_url: str, task_id: str, result: dict):
-        """Submit TTS result to proxy server with audio file upload"""
+    async def submit_tts_result_to_proxy(self, callback_url: str, task_id: str, result: dict) -> bool:
+        """Submit TTS result to proxy server with audio file upload
+        
+        Returns:
+            bool: True if submission was successful, False otherwise
+        """
         try:
             # Get miner UID from Bittensor
             miner_uid = self.uid if hasattr(self, 'uid') else 0

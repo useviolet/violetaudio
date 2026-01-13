@@ -233,7 +233,7 @@ def main():
     if len(sys.argv) > 1:
         task_id = sys.argv[1]
     else:
-        task_id = "ff532918-8f38-41bb-870a-011deea5c185"
+        task_id = "24d88821-2893-4f4d-aae3-4f4d44ee0f7d"
     
     print_section("Task Check Script")
     print(f"Checking task ID: {task_id}")

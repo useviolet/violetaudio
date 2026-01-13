@@ -2349,8 +2349,54 @@ Report generated automatically by Bittensor Miner
                     bt.logging.info(f"✅ TTS synthesis completed in {processing_time:.2f}s")
                 except Exception as synthesis_error:
                     processing_time = time.time() - synthesis_start
-                    bt.logging.error(f"❌ TTS synthesis failed after {processing_time:.2f}s: {synthesis_error}")
-                    raise
+                    error_msg = str(synthesis_error)
+                    
+                    # Handle einops compatibility issue with torch.nn.parameter.Parameter
+                    if "einops" in error_msg.lower() or ("Parameter" in error_msg and "einops" in error_msg.lower()):
+                        bt.logging.warning(f"⚠️ TTS synthesis failed due to einops compatibility issue: {synthesis_error}")
+                        bt.logging.info(f"   Attempting alternative synthesis method (tts() instead of tts_to_file())...")
+                        
+                        # Try alternative: use tts() method directly and save manually
+                        # This avoids the einops issue in tts_to_file()
+                        try:
+                            import torch
+                            import numpy as np
+                            import soundfile as sf
+                            
+                            # Use tts() method directly (may avoid einops issue)
+                            audio_array = tts.tts(
+                                text=text,
+                                speaker_wav=speaker_wav_path,
+                                language=source_language
+                            )
+                            
+                            # Convert to numpy array if needed
+                            if isinstance(audio_array, torch.Tensor):
+                                audio_array = audio_array.detach().cpu().numpy()
+                            elif not isinstance(audio_array, np.ndarray):
+                                audio_array = np.array(audio_array)
+                            
+                            # Ensure it's 1D array
+                            if len(audio_array.shape) > 1:
+                                audio_array = audio_array.flatten()
+                            
+                            # Get sample rate from synthesizer
+                            sample_rate = getattr(tts.synthesizer, 'output_sample_rate', 22050)
+                            
+                            # Save audio file manually
+                            sf.write(output_path, audio_array, sample_rate)
+                            
+                            processing_time = time.time() - synthesis_start
+                            bt.logging.info(f"✅ TTS synthesis completed using alternative method in {processing_time:.2f}s")
+                        except Exception as alt_error:
+                            bt.logging.error(f"❌ Alternative synthesis method also failed: {alt_error}")
+                            bt.logging.error(f"   Original error: {synthesis_error}")
+                            bt.logging.error(f"   This may be an einops version incompatibility issue")
+                            bt.logging.error(f"   Try: pip install --upgrade einops")
+                            raise synthesis_error
+                    else:
+                        bt.logging.error(f"❌ TTS synthesis failed after {processing_time:.2f}s: {synthesis_error}")
+                        raise
                 
                 # Read generated audio
                 if not os.path.exists(output_path):
@@ -3456,12 +3502,42 @@ Report generated automatically by Bittensor Miner
                     'audio_file': (audio_file.get('filename'), audio_content, 'audio/wav')
                 }
                 
+                # Build response_data as JSON string (as expected by proxy server)
+                # The proxy expects response_data to contain the full response structure
+                response_data_dict = {
+                    "output_data": {
+                        "audio_file": {
+                            "file_name": audio_file.get('filename'),
+                            "file_size": len(audio_content),
+                            "file_type": audio_file.get('file_type', 'audio/wav'),
+                            "storage_location": "local",  # Will be updated by proxy after upload
+                            "local_path": audio_file.get('local_path')
+                        }
+                    },
+                    "processing_time": result.get('processing_time', 0.0),
+                    "model_id": result.get('model_id', 'unknown'),
+                    "text_length": result.get('text_length', 0),
+                    "source_language": result.get('source_language', 'en'),
+                    "detected_language": result.get('detected_language', 'en'),
+                    "language_confidence": result.get('language_confidence', 0.0),
+                    "word_count": result.get('word_count', 0),
+                    "audio_duration": result.get('audio_duration', 0.0),
+                    "sample_rate": result.get('sample_rate', 22050),
+                    "bit_depth": result.get('bit_depth', 16),
+                    "channels": result.get('channels', 1),
+                    "voice_name": result.get('voice_name')
+                }
+                
+                # Remove None values from response_data
+                response_data_dict = {k: v for k, v in response_data_dict.items() if v is not None}
+                
                 data = {
                     'task_id': task_id,
-                    'miner_uid': miner_uid,
-                    'processing_time': result.get('processing_time', 0.0),
-                    'accuracy_score': 0.90,  # Mock confidence for TTS
-                    'speed_score': self.calculate_speed_score(result.get('processing_time', 0.0))
+                    'miner_uid': str(miner_uid),  # Ensure string type
+                    'response_data': json.dumps(response_data_dict),  # JSON string as expected
+                    'processing_time': str(result.get('processing_time', 0.0)),  # String for form-data
+                    'accuracy_score': str(0.90),  # Mock confidence for TTS, string for form-data
+                    'speed_score': str(self.calculate_speed_score(result.get('processing_time', 0.0)))  # String for form-data
                 }
                 
                 submit_start_time = time.time()

@@ -406,16 +406,17 @@ class Validator(BaseValidatorNeuron):
                 # including external_ip/external_port if the miner registered with those flags
                 # We don't need to manually select IP/port - Bittensor handles it
                 
-                # Perform on-chain handshake query using summarization task
+                # Perform on-chain handshake query - optimized for speed and reliability
                 try:
-                    # Create a simple handshake/test task - use summarization for consistency
+                    # Create lightweight handshake task - miner detects and responds quickly (<1s)
                     from template.protocol import AudioTask
-                    # Use a small text for summarization handshake
-                    test_text = "This is a test for handshake verification."
                     import base64
+                    
+                    # Use minimal handshake: empty or very small input for fastest response
+                    # Miner detects handshake and responds immediately without processing
                     handshake_task = AudioTask(
                         task_type="summarization",
-                        input_data=base64.b64encode(test_text.encode('utf-8')).decode('utf-8'),
+                        input_data="",  # Empty input for fastest handshake detection
                         language="en"
                     )
                         
@@ -423,57 +424,158 @@ class Validator(BaseValidatorNeuron):
                     # IMPORTANT: We pass the axon object directly from CURRENT metagraph
                     # Bittensor's dendrite will automatically use the correct IP/port from the axon
                     # The axon object contains all on-chain registered information (including external_ip/external_port)
-                    # NOTE: Only log successful handshakes to reduce log noise
                     
-                    # Use asyncio.wait_for to ensure we don't hang indefinitely
-                    # This matches the pattern used in working Bittensor subnets
-                    try:
-                        responses = await asyncio.wait_for(
-                            self.dendrite(
-                                axons=[axon],  # Use CURRENT metagraph axon - Bittensor handles IP/port automatically
-                                synapse=handshake_task,
-                                deserialize=False,  # Don't deserialize for handshake
-                                timeout=15  # Increased to 15 seconds for handshake (was 10)
-                            ),
-                            timeout=20  # Outer timeout to prevent hanging
-                        )
-                    except asyncio.TimeoutError:
-                        # Timeout occurred - miner not responding (silently skip)
-                        continue  # Skip to next miner
+                    # Professional handshake strategy:
+                    # 1. Short timeout (miner should respond in <1s for handshake)
+                    # 2. Exponential backoff retries for network issues
+                    # 3. Accept 408 as "reachable but slow" - miner is online
+                    max_retries = 3  # More retries for reliability
+                    last_error = None
                     
-                    # Check if miner responded successfully
-                    if responses and len(responses) > 0:
-                        response = responses[0]
-                        
-                        # Get status code from dendrite response
-                        if hasattr(response, 'dendrite') and hasattr(response.dendrite, 'status_code'):
-                            status_code = response.dendrite.status_code
-                        else:
-                            # If response exists, consider it successful (miner is online)
-                            status_code = 200
-                        
-                        # Only consider miner active if we get a valid response (200, 400, or 500)
-                        # 200 = success, 400/500 = error but miner is online and responding
-                        if status_code in [200, 400, 500]:
-                            active_miners.append(uid)
-                            # Log successful handshakes
-                            bt.logging.info(
-                                f"✅ UID {uid:3d} | {ip}:{port} | "
-                                f"Stake: {stake:,.0f} TAO | "
-                                f"On-chain handshake: SUCCESS (Status: {status_code})"
+                    for attempt in range(max_retries):
+                        try:
+                            # Calculate exponential backoff delay (2s, 4s, 8s)
+                            retry_delay = 2 ** attempt if attempt > 0 else 0
+                            
+                            # Shorter timeout for handshake (miner responds quickly, but allow for network latency)
+                            # First attempt: 10s (should be enough for handshake)
+                            # Retries: slightly longer to account for network issues
+                            handshake_timeout = 10 + (attempt * 5)  # 10s, 15s, 20s
+                            outer_timeout = handshake_timeout + 5  # Buffer for asyncio overhead
+                            
+                            if attempt > 0:
+                                await asyncio.sleep(retry_delay)
+                            
+                            responses = await asyncio.wait_for(
+                                self.dendrite(
+                                    axons=[axon],  # Use CURRENT metagraph axon - Bittensor handles IP/port automatically
+                                    synapse=handshake_task,
+                                    deserialize=False,  # Don't deserialize for handshake
+                                    timeout=handshake_timeout
+                                ),
+                                timeout=outer_timeout
                             )
-                        else:
-                            # Unexpected status code (silently skip)
-                            pass
-                    else:
-                        # No response received (silently skip)
-                        pass
+                            
+                            # Check if miner responded successfully
+                            if responses and len(responses) > 0:
+                                response = responses[0]
+                                
+                                # Get status code from dendrite response
+                                if hasattr(response, 'dendrite') and hasattr(response.dendrite, 'status_code'):
+                                    status_code = response.dendrite.status_code
+                                else:
+                                    # If response exists, consider it successful (miner is online)
+                                    status_code = 200
+                                
+                                # Professional status code handling:
+                                # Accept 200 and 408 as ACTIVE and USABLE miners
+                                # 200 = success (miner is ready and active) ✅
+                                # 408 = request timeout (miner is REACHABLE and usable, just slow) ✅
+                                # 400 = bad request (miner responding but misconfigured) ❌ NOT ACTIVE
+                                # 500 = server error (miner has internal error) ❌ NOT ACTIVE
+                                # 503 = service unavailable (miner is busy/down) ❌ NOT ACTIVE
+                                # 
+                                # Key insight: 200 and 408 mean the miner is reachable and can be used.
+                                # 408 indicates the miner is slow but still functional and usable.
+                                if status_code in [200, 408]:
+                                    active_miners.append(uid)
+                                    
+                                    # Different logging based on status code
+                                    if status_code == 200:
+                                        status_msg = "SUCCESS"
+                                    elif status_code == 408:
+                                        status_msg = "ACTIVE (slow response but usable)"
+                                    
+                                    # Log successful handshakes
+                                    bt.logging.info(
+                                        f"✅ UID {uid:3d} | {ip}:{port} | "
+                                        f"Stake: {stake:,.0f} TAO | "
+                                        f"On-chain handshake: {status_msg} (Status: {status_code})"
+                                        + (f" (attempt {attempt + 1})" if attempt > 0 else "")
+                                    )
+                                    break  # Success, exit retry loop
+                                else:
+                                    # Miner responded but is NOT active/ready
+                                    # Log at debug level to show why miner was rejected
+                                    if attempt == max_retries - 1:  # Only log on last attempt
+                                        if status_code == 503:
+                                            bt.logging.debug(
+                                                f"🔌 UID {uid:3d} | {ip}:{port} | "
+                                                f"REACHABLE but NOT ACTIVE: Service Unavailable (Status: 503) - Miner busy/down"
+                                            )
+                                        elif status_code == 400:
+                                            bt.logging.debug(
+                                                f"⚠️  UID {uid:3d} | {ip}:{port} | "
+                                                f"REACHABLE but NOT ACTIVE: Bad Request (Status: 400) - Configuration issue"
+                                            )
+                                        elif status_code == 500:
+                                            bt.logging.debug(
+                                                f"❌ UID {uid:3d} | {ip}:{port} | "
+                                                f"REACHABLE but NOT ACTIVE: Server Error (Status: 500) - Internal error"
+                                            )
+                                        else:
+                                            bt.logging.debug(
+                                                f"⚠️  UID {uid:3d} | {ip}:{port} | "
+                                                f"REACHABLE but NOT ACTIVE: Unexpected status (Status: {status_code})"
+                                            )
+                            else:
+                                # No response received
+                                if attempt == max_retries - 1:  # Only log on last attempt
+                                    bt.logging.debug(
+                                        f"⚠️  UID {uid:3d} | {ip}:{port} | "
+                                        f"No response received (attempt {attempt + 1}/{max_retries})"
+                                    )
+                            
+                        except asyncio.TimeoutError:
+                            last_error = "Timeout"
+                            if attempt < max_retries - 1:
+                                bt.logging.debug(
+                                    f"🔄 UID {uid:3d} | {ip}:{port} | "
+                                    f"Handshake timeout (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s..."
+                                )
+                                await asyncio.sleep(retry_delay)
+                            else:
+                                bt.logging.debug(
+                                    f"⏱️  UID {uid:3d} | {ip}:{port} | "
+                                    f"Handshake timeout after {max_retries} attempts"
+                                )
+                        except Exception as e:
+                            last_error = str(e)
+                            error_type = type(e).__name__
+                            
+                            # Log connection errors for debugging (but don't spam)
+                            if attempt == max_retries - 1:  # Only log on last attempt
+                                # Check for specific connection errors
+                                error_str = str(e).lower()
+                                if "connect" in error_str or "connection" in error_str:
+                                    bt.logging.debug(
+                                        f"🔌 UID {uid:3d} | {ip}:{port} | "
+                                        f"Connection error: {error_type} - {str(e)[:100]}"
+                                    )
+                                elif "timeout" in error_str:
+                                    bt.logging.debug(
+                                        f"⏱️  UID {uid:3d} | {ip}:{port} | "
+                                        f"Timeout error: {error_type}"
+                                    )
+                                else:
+                                    bt.logging.debug(
+                                        f"⚠️  UID {uid:3d} | {ip}:{port} | "
+                                        f"Handshake error: {error_type} - {str(e)[:100]}"
+                                    )
+                            
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(retry_delay)
                         
-                except asyncio.TimeoutError:
-                    # Already handled above, but catch here too for safety (silently skip)
-                    continue  # Skip to next miner
+                    # If we exhausted all retries, skip this miner
+                    if last_error:
+                        continue  # Skip to next miner
+                        
                 except Exception as e:
-                    # Miner did not respond to on-chain query - not active (silently skip)
+                    # Outer try block - catch any errors during handshake setup (task creation, etc.)
+                    bt.logging.debug(
+                        f"⚠️  UID {uid:3d} | {ip}:{port} | "
+                        f"Handshake setup error: {type(e).__name__} - {str(e)[:100]}"
+                    )
                     continue  # Skip to next miner
             
             # Summary of on-chain handshake results
@@ -538,8 +640,27 @@ class Validator(BaseValidatorNeuron):
                 bt.logging.info(f"🔍 Evaluation trigger activated at block {self.block}")
                 await self.trigger_task_evaluation()
             
+            # Sync metagraph BEFORE checking connectivity to ensure we have latest miner data
+            # This ensures we discover new miners that joined the network
+            # Sync more frequently (every forward pass) to catch new miners immediately
+            # The metagraph sync is lightweight and ensures we always have current network state
+            if self.should_sync_metagraph():
+                bt.logging.info(f"🔄 Syncing metagraph at block {self.block} to discover new miners...")
+                self.resync_metagraph()
+            else:
+                # Even if not a full sync, do a lightweight metagraph update to catch new miners
+                # This ensures we discover new miners without waiting for full epoch sync
+                try:
+                    # Quick sync to update metagraph with latest network state
+                    # This is faster than full resync but still gets new miners
+                    self.metagraph.sync(subtensor=self.subtensor)
+                    bt.logging.debug(f"🔄 Lightweight metagraph sync at block {self.block} (total miners: {len(self.metagraph.hotkeys)})")
+                except Exception as e:
+                    bt.logging.debug(f"⚠️  Lightweight metagraph sync failed (will use cached data): {e}")
+            
             # ALWAYS check miner connectivity and report status to proxy (regardless of proxy tasks)
             # This ensures proxy server always has current miner status
+            # IMPORTANT: This now uses freshly synced metagraph data, so new miners will be discovered
             await self.check_miner_connectivity()
             
             # Report miner status to proxy server EVERY forward pass
@@ -937,16 +1058,54 @@ class Validator(BaseValidatorNeuron):
             
             # Use miner tracker for intelligent miner selection with load balancing
             if self.miner_tracker:
-                # Register miners if not already done
-                for uid in self.get_available_miners():
+                # CRITICAL FIX: Only register and select from reachable_miners (those that passed handshake)
+                # This ensures we only select miners that can actually be reached
+                reachable_uids = self.reachable_miners if hasattr(self, 'reachable_miners') and self.reachable_miners else []
+                
+                if not reachable_uids:
+                    bt.logging.warning("⚠️  No reachable miners available (handshake failed for all)")
+                    return None
+                
+                # Register only reachable miners if not already done
+                for uid in reachable_uids:
                     if uid < len(self.metagraph.hotkeys):
                         hotkey = self.metagraph.hotkeys[uid]
                         stake = self.metagraph.S[uid]
                         self.miner_tracker.register_miner(uid, hotkey, stake)
                 
-                # Select 3 miners using intelligent load balancing
-                miner_uids = self.miner_tracker.select_miners_for_task(task_type, required_count=3)
-                bt.logging.info(f"🎯 Intelligent miner selection: {miner_uids}")
+                # Filter miner tracker to only include reachable miners
+                # Get available miners from tracker, but filter by reachable_uids
+                available_from_tracker = self.miner_tracker.get_available_miners(task_type, required_count=3)
+                # Only keep miners that are in reachable_uids
+                available_miners = [uid for uid in available_from_tracker if uid in reachable_uids]
+                
+                if len(available_miners) < 3:
+                    bt.logging.warning(f"⚠️  Only {len(available_miners)} reachable miners available, need 3")
+                    # Use whatever we have
+                    miner_uids = available_miners if available_miners else reachable_uids[:3]
+                else:
+                    # Select 3 miners using intelligent load balancing from reachable miners only
+                    miner_scores = []
+                    for uid in available_miners:
+                        if uid in self.miner_tracker.miners:
+                            miner = self.miner_tracker.miners[uid]
+                            # Calculate composite score
+                            stake_score = miner.stake / max(m.stake for m in self.miner_tracker.miners.values()) if self.miner_tracker.miners else 0
+                            performance_score = miner.get_performance_score(task_type)
+                            availability_score = miner.get_availability_score()
+                            composite_score = (stake_score * 0.3 + performance_score * 0.4 + availability_score * 0.2)
+                            miner_scores.append((uid, composite_score))
+                    
+                    # Sort by score and select top 3
+                    miner_scores.sort(key=lambda x: x[1], reverse=True)
+                    miner_uids = [uid for uid, score in miner_scores[:3]]
+                    
+                    # Assign tasks to selected miners
+                    for uid in miner_uids:
+                        if uid in self.miner_tracker.miners:
+                            self.miner_tracker.miners[uid].assign_task(task_type)
+                
+                bt.logging.info(f"🎯 Intelligent miner selection (from {len(reachable_uids)} reachable): {miner_uids}")
             else:
                 # Fallback to stake-based selection
                 available_uids = self.get_available_miners()
@@ -1053,30 +1212,53 @@ class Validator(BaseValidatorNeuron):
             return 0.0
     
     def calculate_speed_score(self, processing_time: float, task_type: str) -> float:
-        """Calculate speed score based on processing time and task type"""
+        """
+        Calculate speed score based on processing time and task type.
+        HIGHER processing time = HIGHER score (rewards miners who spend more time/effort).
+        """
         try:
-            # Define optimal processing times for different task types
-            optimal_times = {
-                'transcription': 2.0,  # 2 seconds optimal
-                'tts': 3.0,            # 3 seconds optimal  
-                'summarization': 5.0   # 5 seconds optimal
+            # Define baseline processing times for different task types
+            baseline_times = {
+                'transcription': 2.0,      # 2 seconds baseline
+                'video_transcription': 5.0, # 5 seconds baseline
+                'tts': 3.0,                # 3 seconds baseline  
+                'summarization': 5.0,      # 5 seconds baseline
+                'text_translation': 3.0,   # 3 seconds baseline
+                'document_translation': 5.0 # 5 seconds baseline
             }
             
-            optimal_time = optimal_times.get(task_type, 5.0)
+            baseline_time = baseline_times.get(task_type, 5.0)
             
-            # Score based on how close to optimal time
-            if processing_time <= optimal_time:
-                # Faster than optimal = perfect score
+            # Normalize processing time relative to baseline
+            # Higher processing time = higher score (up to a reasonable maximum)
+            # Cap at 10x baseline to prevent abuse
+            max_time = baseline_time * 10
+            
+            if processing_time <= 0:
+                return 0.0
+            
+            # Score increases with processing time (inverse of old logic)
+            # Miners who spend more time get higher scores
+            if processing_time >= max_time:
+                # Maximum score for very long processing times
                 return 1.0
-            elif processing_time <= optimal_time * 2:
-                # Within 2x optimal = good score
-                return 0.8
-            elif processing_time <= optimal_time * 5:
-                # Within 5x optimal = acceptable score
+            elif processing_time >= baseline_time * 5:
+                # High score for 5x+ baseline
+                return 0.9
+            elif processing_time >= baseline_time * 3:
+                # Good score for 3x+ baseline
+                return 0.75
+            elif processing_time >= baseline_time * 2:
+                # Moderate score for 2x+ baseline
                 return 0.6
+            elif processing_time >= baseline_time:
+                # Base score for baseline time
+                return 0.5
             else:
-                # Too slow = poor score
-                return 0.3
+                # Lower score for very fast processing (less effort)
+                # Scale from 0.3 to 0.5 based on how close to baseline
+                ratio = processing_time / baseline_time
+                return 0.3 + (ratio * 0.2)  # Linear interpolation
                 
         except Exception as e:
             bt.logging.error(f"❌ Error calculating speed score: {str(e)}")
@@ -1169,13 +1351,17 @@ class Validator(BaseValidatorNeuron):
             return 0.5
     
     def get_available_miners(self):
-        """Get list of available miners"""
+        """Get list of available miners - CRITICAL FIX: Only return reachable_miners (those that passed handshake)"""
         try:
-            available_miners = []
-            for uid in range(len(self.metagraph.hotkeys)):
-                if self.metagraph.axons[uid].is_serving:
-                    available_miners.append(uid)
-            return available_miners
+            # IMPORTANT: Only return miners that passed on-chain handshake
+            # This ensures we don't try to query unreachable miners
+            if hasattr(self, 'reachable_miners') and self.reachable_miners:
+                return self.reachable_miners
+            else:
+                # Fallback: if handshake hasn't run yet, return empty list
+                # This prevents selecting unreachable miners
+                bt.logging.warning("⚠️  No reachable_miners available - handshake may not have completed")
+                return []
         except Exception as e:
             bt.logging.error(f"❌ Error getting available miners: {str(e)}")
             return []
@@ -1657,6 +1843,56 @@ class Validator(BaseValidatorNeuron):
                 miner_responses = valid_responses
                 bt.logging.debug(f"   ✅ Validated {len(miner_responses)} valid responses out of {len(task.get('miner_responses', []))} total")
                 
+                # 🔒 DUPLICATE FILTERING: Remove duplicate responses from the same miner, keep only the best one
+                miner_responses_by_uid = {}
+                for response in miner_responses:
+                    miner_uid = response.get('miner_uid')
+                    if miner_uid is None:
+                        continue
+                    
+                    # Extract nested response for score calculation
+                    nested_response = response.get('response', {})
+                    if isinstance(nested_response, str):
+                        try:
+                            import json
+                            nested_response = json.loads(nested_response)
+                        except:
+                            nested_response = {}
+                    
+                    # Calculate a simple score to determine the "best" response
+                    processing_time = nested_response.get('processing_time') or response.get('processing_time', 10.0)
+                    accuracy_score = nested_response.get('accuracy_score') or response.get('accuracy_score', 0.0)
+                    speed_score = nested_response.get('speed_score') or response.get('speed_score', 0.0)
+                    combined_score = (accuracy_score * 0.7) + (speed_score * 0.3)
+                    
+                    # Keep the response with the highest score (or first one if no score)
+                    if miner_uid not in miner_responses_by_uid:
+                        miner_responses_by_uid[miner_uid] = {
+                            'response': response,
+                            'score': combined_score,
+                            'processing_time': processing_time
+                        }
+                    else:
+                        # Replace if this response has a better score
+                        existing = miner_responses_by_uid[miner_uid]
+                        if combined_score > existing['score'] or (combined_score == existing['score'] and processing_time < existing['processing_time']):
+                            miner_responses_by_uid[miner_uid] = {
+                                'response': response,
+                                'score': combined_score,
+                                'processing_time': processing_time
+                            }
+                
+                # Convert back to list, keeping only one response per miner
+                deduplicated_responses = [item['response'] for item in miner_responses_by_uid.values()]
+                
+                if len(deduplicated_responses) < len(miner_responses):
+                    duplicate_count = len(miner_responses) - len(deduplicated_responses)
+                    bt.logging.warning(f"   ⚠️ Filtered out {duplicate_count} duplicate response(s) from same miners (kept best response per miner)")
+                    bt.logging.debug(f"   📊 Before deduplication: {len(miner_responses)} responses, After: {len(deduplicated_responses)} responses")
+                    bt.logging.debug(f"   📊 Unique miners: {list(miner_responses_by_uid.keys())}")
+                
+                miner_responses = deduplicated_responses
+                
                 # Log input data summary
                 input_data = task.get('input_data')
                 if input_data:
@@ -1793,8 +2029,8 @@ class Validator(BaseValidatorNeuron):
                     bt.logging.info("=" * 80)
                     continue
                 
-                # CRITICAL: Filter out invalid miners before selecting top miners
-                # Only reward miners with valid responses
+                # CRITICAL: Filter out invalid miners - but reward ALL participating miners
+                # Only reward miners with valid responses (score > 0)
                 valid_miner_scores = {}
                 for miner_uid, score in task_scores.items():
                     # Verify miner is in valid_responses (has valid output)
@@ -1812,13 +2048,15 @@ class Validator(BaseValidatorNeuron):
                     bt.logging.info("=" * 80)
                     continue
                 
-                # Select top 10 VALID miners for this task based on performance
+                # Select top 10 miners based on score (higher processing time = higher score)
+                # Sort by score (descending) - miners with higher processing times will rank higher
                 top_miners = await self.select_top_miners_for_task(valid_miner_scores, max_miners=10)
-                bt.logging.debug(f"🏆 TOP MINERS FOR TASK {task_id}: {[(uid, f'{score:.2f}') for uid, score in top_miners[:3]]}")
+                bt.logging.debug(f"🏆 TOP {len(top_miners)} MINERS FOR TASK {task_id}: {[(uid, f'{score:.2f}') for uid, score in top_miners[:3]]}")
+                bt.logging.info(f"   📊 Rewarding top {len(top_miners)} miner(s) for task {task_id} (based on score including processing time)")
                 
-                # Update miner performance tracking with only top miners
+                # Update miner performance tracking for top miners only
                 # CRITICAL: Track hotkey+uid to handle UID reuse scenarios
-                bt.logging.debug(f"📈 UPDATING MINER PERFORMANCE (TOP {len(top_miners)} ONLY):")
+                bt.logging.debug(f"📈 UPDATING MINER PERFORMANCE (TOP {len(top_miners)} MINERS):")
                 for miner_uid, score in top_miners:
                     # Get hotkey from metagraph for miner identity tracking (use cache if available)
                     try:
@@ -1877,8 +2115,8 @@ class Validator(BaseValidatorNeuron):
                     miner_performance[miner_uid]['task_count'] += 1
                     miner_performance[miner_uid]['task_scores'][task_id] = score
                     
-                    # Record ranking position for this task
-                    ranking_position = next(i for i, (uid, _) in enumerate(top_miners, 1) if uid == miner_uid)
+                    # Record ranking position for this task (based on score, higher = better)
+                    ranking_position = next((i for i, (uid, _) in enumerate(top_miners, 1) if uid == miner_uid), len(top_miners) + 1)
                     miner_performance[miner_uid]['top_rankings'][task_id] = ranking_position
                     
                     bt.logging.debug(f"   Miner {miner_uid}: Score={score:.2f}, Rank=#{ranking_position}, Total={miner_performance[miner_uid]['total_score']:.2f}, Tasks={miner_performance[miner_uid]['task_count']}")
@@ -2247,24 +2485,26 @@ class Validator(BaseValidatorNeuron):
                 quality_score = self.calculate_quality_score(miner_response, task_type)
                 
                 # Task type-specific scoring weights
+                # Processing time (speed_score) now rewards HIGHER processing time
+                # Higher weight for processing time to reward miners who spend more effort
                 if task_type == 'transcription':
-                    # Transcription: accuracy is most important
-                    weights = {'accuracy': 0.65, 'speed': 0.25, 'quality': 0.10}
+                    # Transcription: processing time and accuracy are important
+                    weights = {'accuracy': 0.50, 'speed': 0.40, 'quality': 0.10}
                 elif task_type == 'video_transcription':
-                    # Video transcription: accuracy is most important
-                    weights = {'accuracy': 0.65, 'speed': 0.25, 'quality': 0.10}
+                    # Video transcription: processing time and accuracy are important
+                    weights = {'accuracy': 0.50, 'speed': 0.40, 'quality': 0.10}
                 elif task_type == 'tts':
-                    # TTS: quality and accuracy are important
-                    weights = {'accuracy': 0.50, 'speed': 0.20, 'quality': 0.30}
+                    # TTS: quality, processing time, and accuracy are important
+                    weights = {'accuracy': 0.40, 'speed': 0.40, 'quality': 0.20}
                 elif task_type == 'summarization':
-                    # Summarization: accuracy and quality are important
-                    weights = {'accuracy': 0.60, 'speed': 0.20, 'quality': 0.20}
+                    # Summarization: processing time, accuracy and quality are important
+                    weights = {'accuracy': 0.45, 'speed': 0.35, 'quality': 0.20}
                 elif task_type in ['text_translation', 'document_translation']:
-                    # Translation: accuracy is most important
-                    weights = {'accuracy': 0.70, 'speed': 0.20, 'quality': 0.10}
+                    # Translation: processing time and accuracy are important
+                    weights = {'accuracy': 0.55, 'speed': 0.35, 'quality': 0.10}
                 else:
-                    # Default weights
-                    weights = {'accuracy': 0.60, 'speed': 0.25, 'quality': 0.15}
+                    # Default weights: emphasize processing time
+                    weights = {'accuracy': 0.50, 'speed': 0.35, 'quality': 0.15}
                 
                 # Combined score with task type-specific weights
                 combined_score = (

@@ -301,6 +301,61 @@ class Miner(BaseMinerNeuron):
         except Exception as e:
             bt.logging.error(f"❌ Error summarizing result: {e}")
             return {"error": str(e)}
+    
+    def _print_task_result(self, task_id: str, task_type: str, result: dict):
+        """Print task result/response in a clear, readable format"""
+        try:
+            if task_type == "transcription" or task_type == "video_transcription":
+                transcript = result.get("transcript", "")
+                confidence = result.get("confidence", 0.0)
+                bt.logging.info(f"   Task ID:     {task_id}")
+                bt.logging.info(f"   Type:        {task_type.upper()}")
+                bt.logging.info(f"   Transcript:  {transcript[:200]}{'...' if len(transcript) > 200 else ''}")
+                bt.logging.info(f"   Length:      {len(transcript)} characters")
+                if confidence > 0:
+                    bt.logging.info(f"   Confidence:  {confidence:.2%}")
+                    
+            elif task_type == "tts":
+                output_data = result.get("output_data", {})
+                audio_file = output_data.get("audio_file", {}) if isinstance(output_data, dict) else {}
+                bt.logging.info(f"   Task ID:     {task_id}")
+                bt.logging.info(f"   Type:        {task_type.upper()}")
+                if audio_file:
+                    bt.logging.info(f"   Audio File:  {audio_file.get('file_name', 'N/A')}")
+                    bt.logging.info(f"   File Size:   {audio_file.get('file_size', 0):,} bytes")
+                    bt.logging.info(f"   Storage:     {audio_file.get('storage_location', 'N/A')}")
+                else:
+                    bt.logging.info(f"   Output:      {str(output_data)[:200]}{'...' if len(str(output_data)) > 200 else ''}")
+                    
+            elif task_type == "summarization":
+                summary = result.get("summary", "")
+                text_length = result.get("text_length", 0)
+                bt.logging.info(f"   Task ID:     {task_id}")
+                bt.logging.info(f"   Type:        {task_type.upper()}")
+                bt.logging.info(f"   Summary:     {summary[:200]}{'...' if len(summary) > 200 else ''}")
+                bt.logging.info(f"   Summary Len: {len(summary)} characters")
+                if text_length > 0:
+                    bt.logging.info(f"   Original:    {text_length} characters")
+                    
+            elif task_type == "text_translation" or task_type == "document_translation":
+                translated_text = result.get("translated_text", "")
+                source_lang = result.get("source_language", "unknown")
+                target_lang = result.get("target_language", "unknown")
+                bt.logging.info(f"   Task ID:     {task_id}")
+                bt.logging.info(f"   Type:        {task_type.upper()}")
+                bt.logging.info(f"   Languages:   {source_lang} → {target_lang}")
+                bt.logging.info(f"   Translated:  {translated_text[:200]}{'...' if len(translated_text) > 200 else ''}")
+                bt.logging.info(f"   Length:      {len(translated_text)} characters")
+            else:
+                # Generic result printing
+                bt.logging.info(f"   Task ID:     {task_id}")
+                bt.logging.info(f"   Type:        {task_type.upper()}")
+                bt.logging.info(f"   Result:      {str(result)[:300]}{'...' if len(str(result)) > 300 else ''}")
+                
+        except Exception as e:
+            bt.logging.error(f"❌ Error printing task result: {e}")
+            bt.logging.info(f"   Task ID:     {task_id}")
+            bt.logging.info(f"   Result:      {str(result)[:300]}")
 
     def _log_metrics_summary(self):
         """Log current metrics summary"""
@@ -492,7 +547,10 @@ Report generated automatically by Bittensor Miner
             with open(start_log_file, 'w') as f:
                 json.dump(start_log, f, indent=2)
             
-            # Professional console output
+            # Professional console output with clear task boundary markers
+            bt.logging.info("")
+            bt.logging.info("=" * 80)
+            bt.logging.info(f"*********** TASK ID: {task_id} ******")
             bt.logging.info("=" * 80)
             bt.logging.info(f"🚀 TASK STARTED - Processing Task")
             bt.logging.info("=" * 80)
@@ -598,6 +656,9 @@ Report generated automatically by Bittensor Miner
                 bt.logging.error(f"   ERROR: {error}")
             
             bt.logging.info("=" * 80)
+            bt.logging.info(f"******* TASK END: {task_id} ******")
+            bt.logging.info("=" * 80)
+            bt.logging.info("")
             
         except Exception as e:
             bt.logging.error(f"❌ Error logging task completion: {e}")
@@ -1226,12 +1287,15 @@ Report generated automatically by Bittensor Miner
                             "status": "completed_broken_file"
                         }
                         
-                        # Log the broken file completion
-                        miner_uid = self.uid if hasattr(self, 'uid') else 0
-                        self.log_task_completion(task_id, task_type, miner_uid, 0.0, True, broken_file_result, "File marked as completed due to being broken/empty")
-                        
                         # Submit the broken file result to proxy
-                        await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, broken_file_result)
+                        miner_uid = self.uid if hasattr(self, 'uid') else 0
+                        submission_success = await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, broken_file_result)
+                        
+                        # Log the broken file completion AFTER submission
+                        if submission_success:
+                            self.log_task_completion(task_id, task_type, miner_uid, 0.0, True, broken_file_result, "File marked as completed due to being broken/empty")
+                        else:
+                            self.log_task_completion(task_id, task_type, miner_uid, 0.0, False, broken_file_result, "Failed to submit broken file result")
                         
                         # Log the response
                         self.log_response(task_id, task_type, miner_uid, broken_file_result, 0.0, 0, True, "Broken file handled gracefully")
@@ -1255,12 +1319,15 @@ Report generated automatically by Bittensor Miner
                                 "status": "completed_broken_file"
                             }
                             
-                            # Log the suspicious file completion
-                            miner_uid = self.uid if hasattr(self, 'uid') else 0
-                            self.log_task_completion(task_id, task_type, miner_uid, 0.0, True, suspicious_file_result, "File marked as completed due to being suspiciously small")
-                            
                             # Submit the suspicious file result to proxy
-                            await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, suspicious_file_result)
+                            miner_uid = self.uid if hasattr(self, 'uid') else 0
+                            submission_success = await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, suspicious_file_result)
+                            
+                            # Log the suspicious file completion AFTER submission
+                            if submission_success:
+                                self.log_task_completion(task_id, task_type, miner_uid, 0.0, True, suspicious_file_result, "File marked as completed due to being suspiciously small")
+                            else:
+                                self.log_task_completion(task_id, task_type, miner_uid, 0.0, False, suspicious_file_result, "Failed to submit suspicious file result")
                             
                             # Log the response
                             self.log_response(task_id, task_type, miner_uid, suspicious_file_result, 0.0, input_size, True, "Suspiciously small file handled gracefully")
@@ -1346,10 +1413,16 @@ Report generated automatically by Bittensor Miner
                         self.log_task_completion(task_id, task_type, miner_uid, processing_time, False, result, error_msg)
                         return
                     
-                    # Log successful task completion
-                    self.log_task_completion(task_id, task_type, miner_uid, processing_time, True, result)
-                    
                     bt.logging.info(f"✅ Task {task_id} processed successfully by {task_type} pipeline in {processing_time:.2f}s")
+                    
+                    # Print response/results clearly between task start and end
+                    bt.logging.info("")
+                    bt.logging.info("─" * 80)
+                    bt.logging.info("📊 TASK RESULT / RESPONSE:")
+                    bt.logging.info("─" * 80)
+                    self._print_task_result(task_id, task_type, result)
+                    bt.logging.info("─" * 80)
+                    bt.logging.info("")
                     
                     # Submit result back to proxy and wait for completion
                     submission_success = await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, result)
@@ -1359,6 +1432,9 @@ Report generated automatically by Bittensor Miner
                         bt.logging.error(f"❌ {error_msg}")
                         self.log_task_completion(task_id, task_type, miner_uid, processing_time, False, result, error_msg)
                         return
+                    
+                    # Log successful task completion AFTER successful submission
+                    self.log_task_completion(task_id, task_type, miner_uid, processing_time, True, result)
                     
                     # Log final response
                     self.log_response(task_id, task_type, miner_uid, result, processing_time, input_size, True)
@@ -1816,14 +1892,29 @@ Report generated automatically by Bittensor Miner
                 self.log_task_completion(task_id, "summarization", miner_uid, processing_time, False, result, error_msg)
                 return
             
-            # Log successful task completion
-            miner_uid = self.uid if hasattr(self, 'uid') else 0
-            self.log_task_completion(task_id, "summarization", miner_uid, processing_time, True, result)
-            
             bt.logging.info(f"✅ Task {task_id} processed successfully by summarization pipeline in {processing_time:.2f}s")
             
+            # Print response/results clearly
+            bt.logging.info("")
+            bt.logging.info("─" * 80)
+            bt.logging.info("📊 TASK RESULT / RESPONSE:")
+            bt.logging.info("─" * 80)
+            self._print_task_result(task_id, "summarization", result)
+            bt.logging.info("─" * 80)
+            bt.logging.info("")
+            
             # Submit result back to proxy
-            await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, result)
+            miner_uid = self.uid if hasattr(self, 'uid') else 0
+            submission_success = await self.submit_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/response", task_id, result)
+            
+            if not submission_success:
+                error_msg = f"Failed to submit result for task {task_id}"
+                bt.logging.error(f"❌ {error_msg}")
+                self.log_task_completion(task_id, "summarization", miner_uid, processing_time, False, result, error_msg)
+                return
+            
+            # Log successful task completion AFTER successful submission
+            self.log_task_completion(task_id, "summarization", miner_uid, processing_time, True, result)
             
             # Log final response
             self.log_response(task_id, "summarization", miner_uid, result, processing_time, 0, True)
@@ -1914,14 +2005,55 @@ Report generated automatically by Bittensor Miner
                 self.log_task_completion(task_id, "tts", miner_uid, processing_time, False, result, error_msg)
                 return
             
-            # Log successful task completion
-            miner_uid = self.uid if hasattr(self, 'uid') else 0
-            self.log_task_completion(task_id, "tts", miner_uid, processing_time, True, result)
-            
             bt.logging.info(f"✅ Task {task_id} processed successfully by TTS pipeline in {processing_time:.2f}s")
             
+            # Print response/results clearly
+            bt.logging.info("")
+            bt.logging.info("─" * 80)
+            bt.logging.info("📊 TASK RESULT / RESPONSE:")
+            bt.logging.info("─" * 80)
+            self._print_task_result(task_id, "tts", result)
+            bt.logging.info("─" * 80)
+            bt.logging.info("")
+            
             # Submit result back to proxy using TTS-specific endpoint
-            await self.submit_tts_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/tts/upload-audio", task_id, result)
+            miner_uid = self.uid if hasattr(self, 'uid') else 0
+            submission_success = await self.submit_tts_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/tts/upload-audio", task_id, result)
+            
+            if not submission_success:
+                # Even if submission returned False, the data might have been saved
+                # (proxy sometimes returns 500 during post-processing but data is saved)
+                # Wait a moment and check if we can verify the data was saved
+                bt.logging.info(f"   ⏳ Submission returned False, but checking if data was actually saved...")
+                import asyncio
+                await asyncio.sleep(3)  # Give proxy time to process
+                
+                # Try to verify via task check
+                try:
+                    verify_url = f"{self.proxy_server_url}/api/v1/tasks/{task_id}"
+                    headers = self._get_auth_headers()
+                    async with httpx.AsyncClient(timeout=10.0) as verify_client:
+                        verify_response = await verify_client.get(verify_url, headers=headers)
+                        if verify_response.status_code == 200:
+                            task_data = verify_response.json()
+                            miner_responses = task_data.get('miner_responses', [])
+                            for response_item in miner_responses:
+                                if response_item.get('miner_uid') == miner_uid:
+                                    bt.logging.info(f"   ✅ VERIFIED: Response was saved! Treating as success despite 500 error")
+                                    submission_success = True
+                                    break
+                except Exception as verify_error:
+                    bt.logging.debug(f"   Could not verify: {verify_error}")
+            
+            if not submission_success:
+                error_msg = f"Failed to submit TTS result for task {task_id}"
+                bt.logging.error(f"❌ {error_msg}")
+                bt.logging.warning(f"   Note: Data may still have been saved - check task status later")
+                self.log_task_completion(task_id, "tts", miner_uid, processing_time, False, result, error_msg)
+                return
+            
+            # Log successful task completion AFTER successful submission
+            self.log_task_completion(task_id, "tts", miner_uid, processing_time, True, result)
             
             # Log final response
             self.log_response(task_id, "tts", miner_uid, result, processing_time, 0, True)
@@ -2124,12 +2256,85 @@ Report generated automatically by Bittensor Miner
                     raise Exception(f"Failed to download speaker audio: HTTP {speaker_response.status_code}")
                 speaker_audio_data = speaker_response.content
             
-            # Save speaker audio to temporary file
+            bt.logging.info(f"✅ Speaker audio downloaded: {len(speaker_audio_data)} bytes")
+            
+            # Validate and preprocess speaker audio for XTTS v2
+            # XTTS v2 requires: mono channel, proper sample rate (typically 22050Hz or 24000Hz)
+            bt.logging.info(f"🔍 Validating and preprocessing speaker audio...")
+            try:
+                import soundfile as sf
+                import numpy as np
+                import librosa
+                
+                # Load audio to check format
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_speaker:
+                    temp_speaker.write(speaker_audio_data)
+                    temp_speaker_path = temp_speaker.name
+                
+                # Load audio file to check properties
+                audio_data, original_sr = sf.read(temp_speaker_path)
+                
+                # Log original properties
+                bt.logging.info(f"   Original audio properties:")
+                bt.logging.info(f"      Sample rate: {original_sr} Hz")
+                bt.logging.info(f"      Channels: {len(audio_data.shape)} ({'mono' if len(audio_data.shape) == 1 else 'stereo'})")
+                bt.logging.info(f"      Duration: {len(audio_data) / original_sr:.2f}s")
+                bt.logging.info(f"      Data type: {audio_data.dtype}")
+                
+                # Convert to mono if stereo
+                if len(audio_data.shape) > 1:
+                    bt.logging.info(f"   Converting stereo to mono...")
+                    audio_data = np.mean(audio_data, axis=1)
+                
+                # Resample to 22050 Hz if needed (XTTS v2 works best with 22050 Hz)
+                target_sr = 22050
+                if original_sr != target_sr:
+                    bt.logging.info(f"   Resampling from {original_sr} Hz to {target_sr} Hz...")
+                    audio_data = librosa.resample(audio_data, orig_sr=original_sr, target_sr=target_sr)
+                    bt.logging.info(f"   ✅ Resampled to {target_sr} Hz")
+                
+                # Normalize audio to prevent clipping
+                max_val = np.max(np.abs(audio_data))
+                if max_val > 0:
+                    # Normalize to 0.95 to prevent clipping
+                    audio_data = audio_data / max_val * 0.95
+                    bt.logging.info(f"   ✅ Normalized audio (max was {max_val:.4f})")
+                
+                # Ensure audio is float32
+                if audio_data.dtype != np.float32:
+                    audio_data = audio_data.astype(np.float32)
+                
+                # Save preprocessed audio to final temporary file
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as speaker_file:
+                    speaker_wav_path = speaker_file.name
+                
+                # Save as WAV with proper format
+                sf.write(speaker_wav_path, audio_data, target_sr, format='WAV', subtype='PCM_16')
+                
+                # Clean up temporary file
+                if os.path.exists(temp_speaker_path):
+                    os.unlink(temp_speaker_path)
+                
+                # Verify the preprocessed file
+                final_audio, final_sr = sf.read(speaker_wav_path)
+                bt.logging.info(f"✅ Speaker audio preprocessed successfully:")
+                bt.logging.info(f"   Final sample rate: {final_sr} Hz")
+                bt.logging.info(f"   Final channels: {'mono' if len(final_audio.shape) == 1 else 'stereo'}")
+                bt.logging.info(f"   Final duration: {len(final_audio) / final_sr:.2f}s")
+                bt.logging.info(f"   File size: {os.path.getsize(speaker_wav_path):,} bytes")
+                
+            except Exception as preprocess_error:
+                bt.logging.error(f"❌ Error preprocessing speaker audio: {preprocess_error}")
+                bt.logging.warning(f"   Falling back to original file (may cause quality issues)")
+                import traceback
+                traceback.print_exc()
+                
+                # Fallback: save original file without preprocessing
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as speaker_file:
                 speaker_file.write(speaker_audio_data)
                 speaker_wav_path = speaker_file.name
             
-            bt.logging.info(f"✅ Speaker audio downloaded: {len(speaker_audio_data)} bytes")
+                bt.logging.warning(f"   ⚠️ Using original file without preprocessing")
             
             # Detect device (GPU or CPU)
             try:
@@ -2226,25 +2431,116 @@ Report generated automatically by Bittensor Miner
                 bt.logging.info(f"   Language: {source_language}")
                 bt.logging.info(f"   Output path: {output_path}")
                 
+                # Verify speaker WAV file exists and is valid
+                if not os.path.exists(speaker_wav_path):
+                    raise Exception(f"Speaker WAV file not found: {speaker_wav_path}")
+                
+                speaker_file_size = os.path.getsize(speaker_wav_path)
+                if speaker_file_size == 0:
+                    raise Exception(f"Speaker WAV file is empty: {speaker_wav_path}")
+                
+                bt.logging.info(f"   Speaker WAV file size: {speaker_file_size:,} bytes")
+                
+                # Verify the speaker WAV file can be read and has valid audio data
+                try:
+                    import soundfile as sf
+                    test_audio, test_sr = sf.read(speaker_wav_path)
+                    bt.logging.info(f"   ✅ Speaker WAV verified:")
+                    bt.logging.info(f"      Sample rate: {test_sr} Hz")
+                    bt.logging.info(f"      Channels: {'mono' if len(test_audio.shape) == 1 else 'stereo'}")
+                    bt.logging.info(f"      Duration: {len(test_audio) / test_sr:.2f}s")
+                    bt.logging.info(f"      Samples: {len(test_audio)}")
+                    if len(test_audio) < test_sr * 0.5:  # Less than 0.5 seconds
+                        bt.logging.warning(f"   ⚠️ Speaker WAV is very short ({len(test_audio) / test_sr:.2f}s), may affect voice cloning quality")
+                    if len(test_audio) > test_sr * 30:  # More than 30 seconds
+                        bt.logging.warning(f"   ⚠️ Speaker WAV is very long ({len(test_audio) / test_sr:.2f}s), XTTS v2 may only use the first portion")
+                except Exception as verify_error:
+                    bt.logging.warning(f"   ⚠️ Could not verify speaker WAV file: {verify_error}")
+                    bt.logging.warning(f"   Proceeding anyway, but voice cloning may fail")
+                
                 synthesis_start = time.time()
                 
                 # Add timeout protection for TTS generation (especially on CPU)
                 # XTTS v2 can take a long time on CPU, so we'll log progress
                 bt.logging.info(f"⏳ Starting TTS synthesis (this may take 30-60s on CPU)...")
+                bt.logging.info(f"   Using speaker WAV for voice cloning: {speaker_wav_path}")
                 
                 try:
+                    # XTTS v2 tts_to_file parameters:
+                    # - text: The text to synthesize
+                    # - file_path: Output file path
+                    # - speaker_wav: Path to speaker reference audio (must be WAV file)
+                    #   IMPORTANT: XTTS v2 will extract voice characteristics from this file
+                    # - language: Language code (e.g., 'en', 'es', 'fr')
+                    # Note: XTTS v2 automatically handles voice cloning from speaker_wav
+                    bt.logging.debug(f"   Calling tts_to_file with:")
+                    bt.logging.debug(f"      text: {text[:50]}...")
+                    bt.logging.debug(f"      speaker_wav: {speaker_wav_path}")
+                    bt.logging.debug(f"      language: {source_language.lower()}")
+                    
                     tts.tts_to_file(
                         text=text,
                         file_path=output_path,
-                        speaker_wav=speaker_wav_path,
-                        language=source_language
+                        speaker_wav=speaker_wav_path,  # This is the key parameter for voice cloning
+                        language=source_language.lower()  # Ensure lowercase language code
                     )
                     processing_time = time.time() - synthesis_start
                     bt.logging.info(f"✅ TTS synthesis completed in {processing_time:.2f}s")
                 except Exception as synthesis_error:
                     processing_time = time.time() - synthesis_start
-                    bt.logging.error(f"❌ TTS synthesis failed after {processing_time:.2f}s: {synthesis_error}")
-                    raise
+                    error_msg = str(synthesis_error)
+                    
+                    # Handle einops compatibility issue with torch.nn.parameter.Parameter
+                    if "einops" in error_msg.lower() or ("Parameter" in error_msg and "einops" in error_msg.lower()):
+                        bt.logging.warning(f"⚠️ TTS synthesis failed due to einops compatibility issue: {synthesis_error}")
+                        bt.logging.info(f"   Attempting alternative synthesis method (tts() instead of tts_to_file())...")
+                        
+                        # Try alternative: use tts() method directly and save manually
+                        # This avoids the einops issue in tts_to_file()
+                        try:
+                            import torch
+                            import numpy as np
+                            import soundfile as sf
+                            
+                            # Use tts() method directly (may avoid einops issue)
+                            bt.logging.debug(f"   Calling tts() with:")
+                            bt.logging.debug(f"      text: {text[:50]}...")
+                            bt.logging.debug(f"      speaker_wav: {speaker_wav_path}")
+                            bt.logging.debug(f"      language: {source_language.lower()}")
+                            
+                            audio_array = tts.tts(
+                                text=text,
+                                speaker_wav=speaker_wav_path,  # Voice cloning from speaker WAV
+                                language=source_language.lower()  # Ensure lowercase language code
+                            )
+                            
+                            # Convert to numpy array if needed
+                            if isinstance(audio_array, torch.Tensor):
+                                audio_array = audio_array.detach().cpu().numpy()
+                            elif not isinstance(audio_array, np.ndarray):
+                                audio_array = np.array(audio_array)
+                            
+                            # Ensure it's 1D array
+                            if len(audio_array.shape) > 1:
+                                audio_array = audio_array.flatten()
+                            
+                            # Get sample rate from synthesizer
+                            sample_rate = getattr(tts.synthesizer, 'output_sample_rate', 22050)
+                            
+                            # Save audio file manually
+                            sf.write(output_path, audio_array, sample_rate)
+                            
+                            processing_time = time.time() - synthesis_start
+                            bt.logging.info(f"✅ TTS synthesis completed using alternative method in {processing_time:.2f}s")
+                        except Exception as alt_error:
+                            bt.logging.error(f"❌ Alternative synthesis method also failed: {alt_error}")
+                            bt.logging.error(f"   Original error: {synthesis_error}")
+                            bt.logging.error(f"   This may be an einops version incompatibility issue")
+                            bt.logging.error(f"   Try: pip install --upgrade einops")
+                            raise synthesis_error
+                    else:
+                        bt.logging.error(f"❌ TTS synthesis failed after {processing_time:.2f}s: {synthesis_error}")
+                        raise
                 
                 # Read generated audio
                 if not os.path.exists(output_path):
@@ -2294,111 +2590,39 @@ Report generated automatically by Bittensor Miner
             import uuid
             audio_filename = f"{uuid.uuid4().hex[:8]}.wav"
             
-            # Store audio in R2 Storage via proxy server API
-            # Instead of initializing FileManager directly, upload via proxy API
-            try:
-                bt.logging.info(f"📤 Uploading TTS audio to proxy server...")
-                
-                # Upload audio file via proxy server API
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    headers = self._get_auth_headers()
-                    headers["Content-Type"] = "multipart/form-data"
-                    
-                    # Prepare multipart form data
-                    files = {
-                        'file': (audio_filename, audio_data, 'audio/wav')
-                    }
-                    data = {
-                        'file_type': 'tts',
-                        'task_id': task_data.get('task_id', 'unknown') if 'task_data' in locals() else 'unknown'
-                    }
-                    
-                    response = await client.post(
-                        f"{self.proxy_server_url}/api/v1/files/upload",
-                        headers=headers,
-                        files=files,
-                        data=data
-                    )
-                    response.raise_for_status()
-                    upload_result = response.json()
-                    
-                    if upload_result.get("success"):
-                        file_id = upload_result.get("file_id")
-                        public_url = upload_result.get("public_url")
-                        
-                        bt.logging.info(f"✅ Audio file uploaded to R2 via proxy: {file_id}")
-                        bt.logging.info(f"   File size: {len(audio_data)} bytes")
-                        if public_url:
-                            bt.logging.info(f"   Public URL: {public_url[:80]}...")
-                    else:
-                        raise Exception(f"Upload failed: {upload_result.get('error', 'Unknown error')}")
-                
-                # Return result in format expected by submit_tts_result_to_proxy
-                return {
-                    "audio_file": {
-                        "file_id": file_id,
-                        "filename": audio_filename,
-                        "file_size": len(audio_data),
-                        "file_type": "audio/wav",
-                        "public_url": public_url,  # R2 public URL
-                        "storage_location": "r2"
-                    },
-                    "output_data": {
-                        "audio_file": {
-                            "file_id": file_id,
-                            "filename": audio_filename,
-                            "file_size": len(audio_data),
-                            "file_type": "audio/wav",
-                            "public_url": public_url,
-                            "storage_location": "r2"
-                        }
-                    },
-                    "processing_time": processing_time + init_time,  # Include initialization time
-                    "text_length": len(text),
-                    "source_language": source_language,
-                    "detected_language": detected_language,
-                    "language_confidence": language_confidence,
-                    "processing_language": source_language,
-                    "word_count": len(text.split()),
-                    "model_id": tts_model_id,
-                    "voice_name": voice_info.get("voice_name"),
-                    "audio_duration": 0.0,  # Will be calculated by validator
-                    "sample_rate": 22050,   # Default, will be verified by validator
-                    "bit_depth": 16,        # Default, will be verified by validator
-                    "channels": 1           # Default, will be verified by validator
-                }
-                
-            except Exception as storage_error:
-                bt.logging.error(f"❌ Failed to upload to Firebase Cloud Storage: {storage_error}")
-                # Fallback to local storage if Firebase fails
-                audio_path = f"proxy_server/local_storage/tts_audio/{audio_filename}"
-                os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-                
-                with open(audio_path, "wb") as f:
-                    f.write(audio_data)
-                
-                bt.logging.info(f"✅ Audio file saved locally (fallback): {audio_path}")
-                bt.logging.info(f"   File size: {len(audio_data)} bytes")
-                
-                return {
-                    "audio_file": {
-                        "filename": audio_filename,
-                        "local_path": audio_path,
-                        "file_size": len(audio_data),
-                        "file_type": "audio/wav"
-                    },
-                    "processing_time": processing_time,
-                    "text_length": len(text),
-                    "source_language": source_language,
-                    "detected_language": detected_language,
-                    "language_confidence": language_confidence,
-                    "processing_language": processing_language,
-                    "word_count": len(text.split()),
-                    "audio_duration": 0.0,  # Will be calculated by validator
-                    "sample_rate": 22050,   # Default, will be verified by validator
-                    "bit_depth": 16,        # Default, will be verified by validator
-                    "channels": 1           # Default, will be verified by validator
-                }
+            # Save audio to local storage - submit_tts_result_to_proxy will handle upload
+            # This avoids trying to use non-existent /api/v1/files/upload endpoint
+            audio_path = f"proxy_server/local_storage/tts_audio/{audio_filename}"
+            os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+            
+            with open(audio_path, "wb") as f:
+                f.write(audio_data)
+            
+            bt.logging.info(f"✅ Audio file saved locally: {audio_path}")
+            bt.logging.info(f"   File size: {len(audio_data)} bytes")
+            bt.logging.info(f"   Will be uploaded by submit_tts_result_to_proxy")
+            
+            return {
+                "audio_file": {
+                    "filename": audio_filename,
+                    "local_path": audio_path,
+                    "file_size": len(audio_data),
+                    "file_type": "audio/wav"
+                },
+                "processing_time": processing_time + init_time,  # Include initialization time
+                "text_length": len(text),
+                "source_language": source_language,
+                "detected_language": detected_language,
+                "language_confidence": language_confidence,
+                "processing_language": source_language,
+                "word_count": len(text.split()),
+                "model_id": tts_model_id,
+                "voice_name": voice_info.get("voice_name"),
+                "audio_duration": 0.0,  # Will be calculated by validator
+                "sample_rate": 22050,   # Default, will be verified by validator
+                "bit_depth": 16,        # Default, will be verified by validator
+                "channels": 1           # Default, will be verified by validator
+            }
             
         except Exception as e:
             error_msg = str(e)
@@ -2560,14 +2784,29 @@ Report generated automatically by Bittensor Miner
                 self.log_task_completion(task_id, "text_translation", miner_uid, processing_time, False, result, error_msg)
                 return
             
-            # Log successful task completion
-            miner_uid = self.uid if hasattr(self, 'uid') else 0
-            self.log_task_completion(task_id, "text_translation", miner_uid, processing_time, True, result)
-            
             bt.logging.info(f"✅ Task {task_id} processed successfully by text translation pipeline in {processing_time:.2f}s")
             
+            # Print response/results clearly
+            bt.logging.info("")
+            bt.logging.info("─" * 80)
+            bt.logging.info("📊 TASK RESULT / RESPONSE:")
+            bt.logging.info("─" * 80)
+            self._print_task_result(task_id, "text_translation", result)
+            bt.logging.info("─" * 80)
+            bt.logging.info("")
+            
             # Submit result back to proxy using text translation-specific endpoint
-            await self.submit_text_translation_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/text-translation/upload-result", task_id, result)
+            miner_uid = self.uid if hasattr(self, 'uid') else 0
+            submission_success = await self.submit_text_translation_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/text-translation/upload-result", task_id, result)
+            
+            if not submission_success:
+                error_msg = f"Failed to submit text translation result for task {task_id}"
+                bt.logging.error(f"❌ {error_msg}")
+                self.log_task_completion(task_id, "text_translation", miner_uid, processing_time, False, result, error_msg)
+                return
+            
+            # Log successful task completion AFTER successful submission
+            self.log_task_completion(task_id, "text_translation", miner_uid, processing_time, True, result)
             
             # Log final response
             self.log_response(task_id, "text_translation", miner_uid, result, processing_time, 0, True)
@@ -2586,30 +2825,48 @@ Report generated automatically by Bittensor Miner
             task_id = task_data.get("task_id")
             bt.logging.info(f"📄 Processing document translation task {task_id} from proxy server")
             
-            # Extract document data
-            if 'input_file' in task_data and task_data['input_file']:
+            # Extract file_id - handle both old and new schema formats
+            file_id = None
+            if 'input_file' in task_data and isinstance(task_data['input_file'], dict):
+                # New enhanced schema format
                 input_file = task_data['input_file']
                 file_id = input_file.get('file_id')
-                
                 if not file_id:
                     bt.logging.error(f"❌ No file_id found in input_file for task {task_id}")
+                    bt.logging.debug(f"   Available input_file keys: {list(input_file.keys()) if input_file else 'None'}")
                     return
-                
-                # Download the document file from proxy
-                input_data = await self.download_file_from_proxy(f"{self.proxy_server_url}/api/v1/files/{file_id}/download")
-                
-                if input_data is None:
-                    bt.logging.error(f"❌ Failed to download document file for task {task_id}")
+            elif 'input_file_id' in task_data:
+                # Old schema format
+                file_id = task_data.get('input_file_id')
+                if not file_id:
+                    bt.logging.error(f"❌ input_file_id is empty for task {task_id}")
                     return
-                
-                # Now process the document translation
-                await self.process_document_translation_task(input_data, task_data)
             else:
-                bt.logging.error(f"❌ No input_file found in task data for document translation task {task_id}")
+                bt.logging.error(f"❌ No input_file or input_file_id found in task data for document translation task {task_id}")
+                bt.logging.debug(f"   Available task_data keys: {list(task_data.keys())}")
+                return
+            
+            bt.logging.info(f"📥 Downloading document file for task {task_id} (file_id: {file_id})")
+            
+            # Download the document file from proxy
+            input_data = await self.download_file_from_proxy(f"{self.proxy_server_url}/api/v1/files/{file_id}/download")
+            
+            if input_data is None:
+                bt.logging.error(f"❌ Failed to download document file for task {task_id}")
+                return
+            
+            input_size = len(input_data) if isinstance(input_data, bytes) else 0
+            bt.logging.info(f"✅ Downloaded {input_size} bytes for document translation task {task_id}")
+            
+            # Now process the document translation
+            await self.process_document_translation_task(input_data, task_data)
                 
         except Exception as e:
             error_msg = f"Error processing document translation task from proxy: {str(e)}"
             bt.logging.error(f"❌ {error_msg}")
+            import traceback
+            bt.logging.debug(f"   Traceback: {traceback.format_exc()}")
+            task_id = task_data.get("task_id", "unknown")
             miner_uid = self.uid if hasattr(self, 'uid') else 0
             self.log_response(task_id, "document_translation", miner_uid, {}, 0.0, 0, False, error_msg)
 
@@ -2623,8 +2880,8 @@ Report generated automatically by Bittensor Miner
             
             bt.logging.info(f"📄 Processing document translation task {task_id} from proxy server")
             
-            # Extract translation data
-            translation_data = await self.extract_document_translation_data(task_data)
+            # Extract translation data (pass file_data for filename detection if needed)
+            translation_data = await self.extract_document_translation_data(task_data, document_data)
             
             if not translation_data:
                 error_msg = f"Failed to extract document translation data for task {task_id}"
@@ -2646,14 +2903,29 @@ Report generated automatically by Bittensor Miner
                 self.log_task_completion(task_id, "document_translation", miner_uid, processing_time, False, result, error_msg)
                 return
             
-            # Log successful task completion
-            miner_uid = self.uid if hasattr(self, 'uid') else 0
-            self.log_task_completion(task_id, "document_translation", miner_uid, processing_time, True, result)
-            
             bt.logging.info(f"✅ Task {task_id} processed successfully by document translation pipeline in {processing_time:.2f}s")
             
+            # Print response/results clearly
+            bt.logging.info("")
+            bt.logging.info("─" * 80)
+            bt.logging.info("📊 TASK RESULT / RESPONSE:")
+            bt.logging.info("─" * 80)
+            self._print_task_result(task_id, "document_translation", result)
+            bt.logging.info("─" * 80)
+            bt.logging.info("")
+            
             # Submit result back to proxy using document translation-specific endpoint
-            await self.submit_document_translation_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/document-translation/upload-result", task_id, result)
+            miner_uid = self.uid if hasattr(self, 'uid') else 0
+            submission_success = await self.submit_document_translation_result_to_proxy(f"{self.proxy_server_url}/api/v1/miner/document-translation/upload-result", task_id, result)
+            
+            if not submission_success:
+                error_msg = f"Failed to submit document translation result for task {task_id}"
+                bt.logging.error(f"❌ {error_msg}")
+                self.log_task_completion(task_id, "document_translation", miner_uid, processing_time, False, result, error_msg)
+                return
+            
+            # Log successful task completion AFTER successful submission
+            self.log_task_completion(task_id, "document_translation", miner_uid, processing_time, True, result)
             
             # Log final response
             self.log_response(task_id, "document_translation", miner_uid, result, processing_time, len(document_data), True)
@@ -2709,47 +2981,110 @@ Report generated automatically by Bittensor Miner
             bt.logging.error(f"❌ Error extracting text translation data: {e}")
             return None
     
-    async def extract_document_translation_data(self, task_data: dict) -> Optional[dict]:
+    def _detect_file_type_from_content(self, file_data: bytes) -> str:
+        """Detect file type from file content using magic bytes"""
+        if not file_data or len(file_data) < 4:
+            return 'txt'  # Default to txt for small files
+        
+        # PDF: starts with %PDF
+        if file_data[:4] == b'%PDF':
+            return 'pdf'
+        
+        # DOCX: starts with PK (ZIP signature, DOCX is a ZIP file)
+        if file_data[:2] == b'PK':
+            # Check if it's a DOCX by looking for word/document.xml in the ZIP
+            if b'word/document.xml' in file_data[:1024] or b'[Content_Types].xml' in file_data[:1024]:
+                return 'docx'
+        
+        # TXT: Check if it's valid UTF-8 text
+        try:
+            file_data[:1024].decode('utf-8')
+            return 'txt'
+        except UnicodeDecodeError:
+            pass
+        
+        # Default to txt if we can't determine
+        return 'txt'
+    
+    async def extract_document_translation_data(self, task_data: dict, file_data: bytes = None) -> Optional[dict]:
         """Extract document translation data from task data"""
         try:
             task_id = task_data.get("task_id")
             
-            # Try to get data from task_data first
+            # Extract source_language and target_language directly from task_data (they should always be there)
+            source_language = task_data.get('source_language', 'en')
+            target_language = task_data.get('target_language', 'es')
+            
+            # Get filename from input_file if available
+            filename = None
+            file_id = None
+            
             if 'input_file' in task_data and task_data['input_file']:
-                input_file = task_data['input_file']
-                bt.logging.info(f"✅ Found document translation data in task_data for task {task_id}")
-                return {
-                    'filename': input_file.get('file_name', 'unknown'),
-                    'source_language': task_data.get('source_language', 'en'),
-                    'target_language': task_data.get('target_language', 'es')
-                }
+                if isinstance(task_data['input_file'], dict):
+                    filename = task_data['input_file'].get('file_name') or task_data['input_file'].get('original_filename')
+                    file_id = task_data['input_file'].get('file_id')
+                elif isinstance(task_data['input_file'], str):
+                    filename = task_data['input_file']
             
-            # If not in task_data, try to fetch from proxy API
-            bt.logging.info(f"🔍 Fetching document translation data from proxy API for task {task_id}")
+            if not file_id and 'input_file_id' in task_data:
+                file_id = task_data.get('input_file_id')
             
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                headers = self._get_auth_headers()
-                response = await client.get(f"{self.proxy_server_url}/api/v1/miner/document-translation/{task_id}", headers=headers)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get('success') and 'file_metadata' in data:
-                        file_metadata = data['file_metadata']
-                        bt.logging.info(f"✅ Retrieved document translation data from proxy API for task {task_id}")
-                        return {
-                            'filename': file_metadata.get('file_name', 'unknown'),
-                            'source_language': data['task_metadata'].get('source_language', 'en'),
-                            'target_language': data['task_metadata'].get('target_language', 'es')
-                        }
+            # If we don't have a filename, try to fetch it from the API
+            if not filename and file_id:
+                bt.logging.info(f"🔍 Fetching file metadata from API for file_id: {file_id}")
+                try:
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        headers = self._get_auth_headers()
+                        response = await client.get(
+                            f"{self.proxy_server_url}/api/v1/files/{file_id}",
+                            headers=headers
+                        )
+                        if response.status_code == 200:
+                            file_metadata = response.json()
+                            if isinstance(file_metadata, dict):
+                                if file_metadata.get('success') and file_metadata.get('file'):
+                                    filename = file_metadata['file'].get('original_filename') or file_metadata['file'].get('file_name')
+                                elif file_metadata.get('file'):
+                                    filename = file_metadata['file'].get('original_filename') or file_metadata['file'].get('file_name')
+                            
+                            if filename:
+                                bt.logging.info(f"✅ Retrieved filename from API: {filename}")
+                except Exception as api_error:
+                    bt.logging.debug(f"⚠️ Could not fetch filename from API: {api_error}")
+            
+            # If still no filename, try to detect from file content
+            if not filename or (filename and '.' not in filename):
+                if file_data:
+                    detected_type = self._detect_file_type_from_content(file_data)
+                    if file_id:
+                        filename = f"file_{file_id[:8]}.{detected_type}"
                     else:
-                        bt.logging.warning(f"⚠️ No file metadata found in proxy API response for task {task_id}")
-                        return None
+                        filename = f"document.{detected_type}"
+                    bt.logging.info(f"🔍 Detected file type from content: {detected_type}")
+                    bt.logging.info(f"   Generated filename: {filename}")
                 else:
-                    bt.logging.error(f"❌ Failed to fetch document translation data from proxy API: {response.status_code}")
-                    return None
+                    # Last resort: use a default with txt extension
+                    if file_id:
+                        filename = f"file_{file_id[:8]}.txt"
+                    else:
+                        filename = "document.txt"
+                    bt.logging.warning(f"⚠️ No file data available for detection, using default: {filename}")
+            
+            bt.logging.info(f"✅ Extracted document translation data from task_data for task {task_id}")
+            bt.logging.debug(f"   Filename: {filename}")
+            bt.logging.debug(f"   Source language: {source_language}")
+            bt.logging.debug(f"   Target language: {target_language}")
+            
+            return {
+                'filename': filename,
+                'source_language': source_language,
+                'target_language': target_language
+            }
                         
         except Exception as e:
             bt.logging.error(f"❌ Error extracting document translation data: {e}")
+            import traceback
+            bt.logging.debug(f"   Traceback: {traceback.format_exc()}")
             return None
     
     async def process_text_translation(self, translation_data: dict, model_id: Optional[str] = None) -> dict:
@@ -2855,25 +3190,34 @@ Report generated automatically by Bittensor Miner
                 "error": str(e)
             }
     
-    async def submit_text_translation_result_to_proxy(self, callback_url: str, task_id: str, result: dict):
-        """Submit text translation result to proxy server"""
+    async def submit_text_translation_result_to_proxy(self, callback_url: str, task_id: str, result: dict) -> bool:
+        """Submit text translation result to proxy server
+        
+        Returns:
+            bool: True if submission was successful, False otherwise
+        """
         try:
             # Get miner UID from Bittensor
             miner_uid = self.uid if hasattr(self, 'uid') else 0
             
-            # Prepare form data
+            # Use the same format as transcription: result dict directly as response_data
+            # Calculate scores separately (not inside response_data)
+            processing_time = result.get('processing_time', 0.0)
+            accuracy_score = 0.95  # Mock confidence for translation
+            speed_score = self.calculate_speed_score(processing_time)
+            
+            # Prepare form data matching transcription format
             form_data = {
                 'task_id': task_id,
-                'miner_uid': miner_uid,
-                'translated_text': result.get('translated_text', ''),
-                'processing_time': result.get('processing_time', 0.0),
-                'accuracy_score': 0.95,  # Mock confidence for translation
-                'speed_score': max(0.5, 1.0 - (result.get('processing_time', 0.0) / 10.0)),
-                'source_language': result.get('source_language', 'en'),
-                'target_language': result.get('target_language', 'es')
+                'miner_uid': str(miner_uid),
+                'response_data': json.dumps(result),  # Result dict directly, same as transcription
+                'processing_time': processing_time,  # Number, not string (matching transcription)
+                'accuracy_score': accuracy_score,  # Number, not string (matching transcription)
+                'speed_score': speed_score  # Number, not string (matching transcription)
             }
             
             bt.logging.info(f"📤 Submitting text translation result to proxy server for task {task_id}")
+            bt.logging.debug(f"   Response data: {json.dumps(result, indent=2)}")
             
             async with httpx.AsyncClient(timeout=10.0) as client:
                 headers = self._get_auth_headers()
@@ -2881,32 +3225,84 @@ Report generated automatically by Bittensor Miner
                 
                 if response.status_code == 200:
                     bt.logging.info(f"✅ Text translation result submitted successfully for task {task_id}")
+                    return True
                 else:
-                    bt.logging.warning(f"⚠️ Failed to submit text translation result: {response.status_code}")
+                    error_msg = f"Failed to submit text translation result: HTTP {response.status_code}"
+                    bt.logging.warning(f"⚠️ {error_msg}")
+                    bt.logging.warning(f"   Response body: {response.text}")
+                    
+                    # Try to parse error details if available
+                    try:
+                        error_data = response.json()
+                        if isinstance(error_data, dict):
+                            detail = error_data.get('detail', '')
+                            if detail:
+                                bt.logging.warning(f"   Error detail: {detail}")
+                    except:
+                        pass
+                    
+                    # Verify if data was actually saved (similar to TTS)
+                    bt.logging.info(f"   🔍 Verifying if data was actually saved despite the error...")
+                    import asyncio
+                    await asyncio.sleep(2)
+                    
+                    try:
+                        verify_url = f"{self.proxy_server_url}/api/v1/tasks/{task_id}"
+                        headers = self._get_auth_headers()
+                        
+                        async with httpx.AsyncClient(timeout=10.0) as verify_client:
+                            verify_response = await verify_client.get(verify_url, headers=headers)
+                            
+                            if verify_response.status_code == 200:
+                                task_data = verify_response.json()
+                                miner_responses = task_data.get('miner_responses', [])
+                                
+                                for response_item in miner_responses:
+                                    resp_miner_uid = response_item.get('miner_uid')
+                                    if resp_miner_uid == miner_uid:
+                                        bt.logging.info(f"   ✅ VERIFIED: Our response was saved successfully!")
+                                        bt.logging.info(f"   ✅ The error was likely a post-processing issue, but data is safe")
+                                        return True
+                    except Exception as verify_error:
+                        bt.logging.debug(f"   Could not verify data save status: {verify_error}")
+                    
+                    return False
                     
         except Exception as e:
             bt.logging.error(f"❌ Error submitting text translation result: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
     
-    async def submit_document_translation_result_to_proxy(self, callback_url: str, task_id: str, result: dict):
-        """Submit document translation result to proxy server"""
+    async def submit_document_translation_result_to_proxy(self, callback_url: str, task_id: str, result: dict) -> bool:
+        """Submit document translation result to proxy server
+        Uses the same format as transcription: result dict as response_data, with separate accuracy_score/speed_score
+        
+        Returns:
+            bool: True if submission was successful, False otherwise
+        """
         try:
             # Get miner UID from Bittensor
             miner_uid = self.uid if hasattr(self, 'uid') else 0
             
-            # Prepare form data
+            # Use the same format as transcription: result dict directly as response_data
+            # Calculate scores separately (not inside response_data)
+            processing_time = result.get('processing_time', 0.0)
+            accuracy_score = 0.95  # Mock confidence for translation
+            speed_score = self.calculate_speed_score(processing_time)
+            
+            # Prepare form data matching transcription format
             form_data = {
                 'task_id': task_id,
-                'miner_uid': miner_uid,
-                'translated_text': result.get('translated_text', ''),
-                'processing_time': result.get('processing_time', 0.0),
-                'accuracy_score': 0.95,  # Mock confidence for translation
-                'speed_score': max(0.5, 1.0 - (result.get('processing_time', 0.0) / 10.0)),
-                'source_language': result.get('source_language', 'en'),
-                'target_language': result.get('target_language', 'es'),
-                'metadata': json.dumps(result.get('metadata', {}))
+                'miner_uid': str(miner_uid),
+                'response_data': json.dumps(result),  # Result dict directly, same as transcription
+                'processing_time': processing_time,  # Number, not string (matching transcription)
+                'accuracy_score': accuracy_score,  # Number, not string (matching transcription)
+                'speed_score': speed_score  # Number, not string (matching transcription)
             }
             
             bt.logging.info(f"📤 Submitting document translation result to proxy server for task {task_id}")
+            bt.logging.debug(f"   Response data: {json.dumps(result, indent=2)}")
             
             async with httpx.AsyncClient(timeout=10.0) as client:
                 headers = self._get_auth_headers()
@@ -2914,11 +3310,53 @@ Report generated automatically by Bittensor Miner
                 
                 if response.status_code == 200:
                     bt.logging.info(f"✅ Document translation result submitted successfully for task {task_id}")
+                    return True
                 else:
-                    bt.logging.warning(f"⚠️ Failed to submit document translation result: {response.status_code}")
+                    error_msg = f"Failed to submit document translation result: HTTP {response.status_code}"
+                    bt.logging.warning(f"⚠️ {error_msg}")
+                    bt.logging.warning(f"   Response body: {response.text}")
+                    
+                    # Try to parse error details if available
+                    try:
+                        error_data = response.json()
+                        if isinstance(error_data, dict):
+                            detail = error_data.get('detail', '')
+                            if detail:
+                                bt.logging.warning(f"   Error detail: {detail}")
+                    except:
+                        pass
+                    
+                    # Verify if data was actually saved
+                    bt.logging.info(f"   🔍 Verifying if data was actually saved despite the error...")
+                    import asyncio
+                    await asyncio.sleep(2)
+                    
+                    try:
+                        verify_url = f"{self.proxy_server_url}/api/v1/tasks/{task_id}"
+                        headers = self._get_auth_headers()
+                        
+                        async with httpx.AsyncClient(timeout=10.0) as verify_client:
+                            verify_response = await verify_client.get(verify_url, headers=headers)
+                            
+                            if verify_response.status_code == 200:
+                                task_data = verify_response.json()
+                                miner_responses = task_data.get('miner_responses', [])
+                                
+                                for response_item in miner_responses:
+                                    resp_miner_uid = response_item.get('miner_uid')
+                                    if resp_miner_uid == miner_uid:
+                                        bt.logging.info(f"   ✅ VERIFIED: Our response was saved successfully!")
+                                        return True
+                    except Exception as verify_error:
+                        bt.logging.debug(f"   Could not verify data save status: {verify_error}")
+                    
+                    return False
                     
         except Exception as e:
             bt.logging.error(f"❌ Error submitting document translation result: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
     
     async def submit_result_to_proxy(self, callback_url: str, task_id: str, result: dict) -> bool:
         """Submit task result back to proxy server
@@ -2961,13 +3399,14 @@ Report generated automatically by Bittensor Miner
             async with httpx.AsyncClient(timeout=10.0) as client:
                 headers = self._get_auth_headers()
                 # Convert to Form data as expected by proxy
+                # Format matches transcription: result dict as response_data, with separate accuracy_score/speed_score
                 form_data = {
                     'task_id': response_payload['task_id'],
-                    'miner_uid': response_payload['miner_uid'],
-                    'response_data': json.dumps(response_payload['response_data']),  # Use JSON serialization instead of str()
-                    'processing_time': response_payload['processing_time'],
-                    'accuracy_score': response_payload['accuracy_score'],
-                    'speed_score': response_payload['speed_score']
+                    'miner_uid': str(response_payload['miner_uid']),  # String for consistency
+                    'response_data': json.dumps(response_payload['response_data']),  # Result dict as JSON string
+                    'processing_time': response_payload['processing_time'],  # Number (matching transcription)
+                    'accuracy_score': response_payload['accuracy_score'],  # Number (matching transcription)
+                    'speed_score': response_payload['speed_score']  # Number (matching transcription)
                 }
                 
                 submit_start_time = time.time()
@@ -2975,6 +3414,36 @@ Report generated automatically by Bittensor Miner
                 submit_time = time.time() - submit_start_time
                 
                 if response.status_code == 200:
+                    # Try to parse response body to verify success
+                    try:
+                        response_json = response.json()
+                        # Check if response indicates success
+                        if isinstance(response_json, dict) and response_json.get("success") is False:
+                            error_msg = f"Failed to submit result for task {task_id}: {response_json.get('message', 'Unknown error')}"
+                            bt.logging.warning(f"⚠️ {error_msg}")
+                            bt.logging.warning(f"   Response body: {response.text}")
+                            
+                            # Log submission failure
+                            submission_log = {
+                                "timestamp": datetime.now().isoformat(),
+                                "event": "result_submission_failure",
+                                "task_id": task_id,
+                                "miner_uid": miner_uid,
+                                "submission_time": submit_time,
+                                "response_status": response.status_code,
+                                "response_body": response.text,
+                                "error": error_msg
+                            }
+                            
+                            submission_log_file = self.response_logs_dir / f"{task_id}_{miner_uid}_submission_failure.json"
+                            with open(submission_log_file, 'w') as f:
+                                json.dump(submission_log, f, indent=2, default=str)
+                            
+                            return False
+                    except (json.JSONDecodeError, ValueError):
+                        # If response is not JSON or can't be parsed, assume success for 200 status
+                        pass
+                    
                     bt.logging.info(f"✅ Result submitted successfully for task {task_id}")
                     bt.logging.info(f"   Submission time: {submit_time:.2f}s")
                     bt.logging.info(f"   Response status: {response.status_code}")
@@ -2993,12 +3462,14 @@ Report generated automatically by Bittensor Miner
                     submission_log_file = self.response_logs_dir / f"{task_id}_{miner_uid}_submission_success.json"
                     with open(submission_log_file, 'w') as f:
                         json.dump(submission_log, f, indent=2, default=str)
+                    
+                    # Return True to indicate successful submission
+                    return True
                         
                 else:
                     error_msg = f"Failed to submit result for task {task_id}: HTTP {response.status_code}"
                     bt.logging.warning(f"⚠️ {error_msg}")
                     bt.logging.warning(f"   Response body: {response.text}")
-                    return False
                     
                     # Log submission failure
                     submission_log = {
@@ -3015,6 +3486,8 @@ Report generated automatically by Bittensor Miner
                     submission_log_file = self.response_logs_dir / f"{task_id}_{miner_uid}_submission_failure.json"
                     with open(submission_log_file, 'w') as f:
                         json.dump(submission_log, f, indent=2, default=str)
+                    
+                    return False
                     
         except Exception as e:
             error_msg = f"Error submitting result: {str(e)}"
@@ -3274,8 +3747,12 @@ Report generated automatically by Bittensor Miner
             bt.logging.warning("⚠️ No language specified - using default 'en'")
             synapse.language = "en"
 
-    async def submit_tts_result_to_proxy(self, callback_url: str, task_id: str, result: dict):
-        """Submit TTS result to proxy server with audio file upload"""
+    async def submit_tts_result_to_proxy(self, callback_url: str, task_id: str, result: dict) -> bool:
+        """Submit TTS result to proxy server with audio file upload
+        
+        Returns:
+            bool: True if submission was successful, False otherwise
+        """
         try:
             # Get miner UID from Bittensor
             miner_uid = self.uid if hasattr(self, 'uid') else 0
@@ -3294,7 +3771,6 @@ Report generated automatically by Bittensor Miner
                 # Try to get from Firebase Cloud Storage first
                 try:
                     import sys
-                    import os
                     sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
                     
                     from proxy_server.managers.file_manager import FileManager
@@ -3341,12 +3817,52 @@ Report generated automatically by Bittensor Miner
                     'audio_file': (audio_file.get('filename'), audio_content, 'audio/wav')
                 }
                 
+                # Build response_data matching transcription format
+                # TTS needs nested structure for audio_file, but accuracy_score/speed_score should be separate fields
+                processing_time = result.get('processing_time', 0.0)
+                accuracy_score = 0.90  # Mock confidence for TTS
+                speed_score = self.calculate_speed_score(processing_time)
+                
+                # Build response_data - TTS needs output_data.audio_file structure, but keep it simple
+                # Remove accuracy_score and speed_score from response_data (they go as separate fields)
+                response_data_dict = {
+                    "output_data": {
+                        "audio_file": {
+                            # Basic file info - proxy will add file_id, checksum, timestamps, etc.
+                            "file_name": audio_file.get('filename'),
+                            "file_size": len(audio_content),
+                            "file_type": audio_file.get('file_type', 'audio/wav'),
+                            "storage_location": "local"  # Will be updated to "cloud_storage" by proxy
+                        },
+                        # Audio metadata
+                        "audio_duration": result.get('audio_duration', 0.0),
+                        "sample_rate": result.get('sample_rate', 22050),
+                        "bit_depth": result.get('bit_depth', 16),
+                        "channels": result.get('channels', 1)
+                    },
+                    "processing_time": processing_time,
+                    "model_id": result.get('model_id', 'unknown'),
+                    "text_length": result.get('text_length', 0),
+                    "source_language": result.get('source_language', 'en'),
+                    "detected_language": result.get('detected_language', 'en'),
+                    "language_confidence": result.get('language_confidence', 0.0),
+                    "word_count": result.get('word_count', 0),
+                    "voice_name": result.get('voice_name')
+                    # NOTE: accuracy_score and speed_score are NOT in response_data - they're separate fields
+                }
+                
+                # Remove None values from response_data
+                response_data_dict = {k: v for k, v in response_data_dict.items() if v is not None}
+                
+                # Prepare form data matching transcription format
+                # accuracy_score and speed_score are separate fields (not in response_data)
                 data = {
                     'task_id': task_id,
-                    'miner_uid': miner_uid,
-                    'processing_time': result.get('processing_time', 0.0),
-                    'accuracy_score': 0.90,  # Mock confidence for TTS
-                    'speed_score': self.calculate_speed_score(result.get('processing_time', 0.0))
+                    'miner_uid': str(miner_uid),
+                    'response_data': json.dumps(response_data_dict),  # JSON string
+                    'processing_time': processing_time,  # Number, not string (matching transcription)
+                    'accuracy_score': accuracy_score,  # Number, not string (matching transcription)
+                    'speed_score': speed_score  # Number, not string (matching transcription)
                 }
                 
                 submit_start_time = time.time()
@@ -3370,6 +3886,65 @@ Report generated automatically by Bittensor Miner
                     error_msg = f"Failed to submit TTS result for task {task_id}: HTTP {response.status_code}"
                     bt.logging.warning(f"⚠️ {error_msg}")
                     bt.logging.warning(f"   Response body: {response.text}")
+                    
+                    # Try to parse error details if available
+                    try:
+                        error_data = response.json()
+                        if isinstance(error_data, dict):
+                            detail = error_data.get('detail', '')
+                            if detail:
+                                bt.logging.warning(f"   Error detail: {detail}")
+                            # Log the full error response for debugging
+                            bt.logging.debug(f"   Full error response: {json.dumps(error_data, indent=2)}")
+                    except:
+                        pass
+                    
+                    # Even if we get a 500 error, check if the data was actually saved
+                    # (sometimes the proxy saves the data but returns an error during post-processing)
+                    bt.logging.info(f"   🔍 Verifying if data was actually saved despite the error...")
+                    
+                    # Wait a moment for the proxy to finish processing
+                    import asyncio
+                    await asyncio.sleep(2)
+                    
+                    # Try to verify by checking the task status via API
+                    try:
+                        verify_url = f"{self.proxy_server_url}/api/v1/tasks/{task_id}"
+                        headers = self._get_auth_headers()
+                        
+                        async with httpx.AsyncClient(timeout=10.0) as verify_client:
+                            verify_response = await verify_client.get(verify_url, headers=headers)
+                            
+                            if verify_response.status_code == 200:
+                                task_data = verify_response.json()
+                                miner_responses = task_data.get('miner_responses', [])
+                                
+                                # Check if our response is in the miner_responses
+                                our_response_found = False
+                                for response_item in miner_responses:
+                                    resp_miner_uid = response_item.get('miner_uid')
+                                    if resp_miner_uid == miner_uid:
+                                        our_response_found = True
+                                        bt.logging.info(f"   ✅ VERIFIED: Our response was saved successfully!")
+                                        bt.logging.info(f"   ✅ The 500 error was likely a post-processing issue, but data is safe")
+                                        bt.logging.info(f"   ✅ Returning success since data was actually saved")
+                                        return True
+                                
+                                if not our_response_found:
+                                    bt.logging.warning(f"   ⚠️ Our response not found in task data yet (may still be processing)")
+                            else:
+                                bt.logging.debug(f"   Could not verify via API: HTTP {verify_response.status_code}")
+                    except Exception as verify_error:
+                        bt.logging.debug(f"   Could not verify data save status: {verify_error}")
+                    
+                    # If verification failed or inconclusive, log but don't fail completely
+                    # The data might still be saved, just not immediately visible
+                    bt.logging.warning(f"   ⚠️ Could not verify data save status")
+                    bt.logging.info(f"   💡 Note: Data may have been saved despite the error")
+                    bt.logging.info(f"   💡 Check task status later: python3 check_task.py {task_id}")
+                    
+                    # For 500 errors, we'll return False but log that data might be saved
+                    # This allows the caller to decide how to handle it
                     return False
                     
         except Exception as e:

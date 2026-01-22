@@ -13,7 +13,8 @@ load_dotenv()
 
 # Configuration
 BASE_URL = "https://violet-proxy-bl4w.onrender.com"
-API_KEY = os.getenv("MINER_API_KEY") or os.getenv("VALIDATOR_API_KEY") or os.getenv("API_KEY")
+# Use provided API key
+API_KEY = "tQlbLPoTF7RRsvJjgCm_4kHiIg-xqoQ6l4utqW56sY0"
 
 # Task parameters
 TEXT = "I am Tobius the great man from Iganga and Tanzania Bukoba , kammpala , masaka . We sign great work and make it work all over the world"
@@ -34,7 +35,7 @@ def get_available_voices():
     }
     
     try:
-        response = requests.get(url, headers=headers, timeout=30)
+        response = requests.get(url, headers=headers, timeout=60)
         response.raise_for_status()
         
         data = response.json()
@@ -87,7 +88,7 @@ def create_tts_task(text, voice_name, model_id, source_language, priority):
     print(f"   Priority: {priority}")
     
     try:
-        response = requests.post(url, headers=headers, data=form_data, timeout=30)
+        response = requests.post(url, headers=headers, data=form_data, timeout=60)
         response.raise_for_status()
         
         data = response.json()
@@ -128,28 +129,31 @@ def main():
     voices = get_available_voices()
     
     # Step 2: Select a voice
-    voice_name = None
-    if voices:
-        # Use first available voice
-        selected_voice = voices[0]
-        voice_name = selected_voice.get('voice_name')
-        print(f"\n🎤 Selected Voice: {voice_name}")
-        print(f"   Display Name: {selected_voice.get('display_name', 'N/A')}")
-        print(f"   Language: {selected_voice.get('language', 'N/A')}")
-    else:
-        # Try common voice names or let the API use default
-        # The API will use the first available voice if voice_name is not provided
-        print("\n⚠️  Could not list voices (may need admin permissions)")
-        print("   Attempting to create task - API will use default voice if voice_name not provided")
-        print("   Or you can specify a voice_name as a command line argument")
-        
-        # Check for voice_name in command line args
-        if len(sys.argv) > 1:
-            voice_name = sys.argv[1]
-            print(f"   Using voice_name from command line: {voice_name}")
+    voice_name = "english_alice"  # Default voice name
+    
+    # Check for voice_name in command line args (overrides default)
+    if len(sys.argv) > 1:
+        voice_name = sys.argv[1]
+        print(f"\n🎤 Using voice_name from command line: {voice_name}")
+    elif voices:
+        # Check if english_alice is in the available voices
+        english_alice_voice = next((v for v in voices if v.get('voice_name') == 'english_alice'), None)
+        if english_alice_voice:
+            voice_name = "english_alice"
+            print(f"\n🎤 Selected Voice: {voice_name}")
+            print(f"   Display Name: {english_alice_voice.get('display_name', 'N/A')}")
+            print(f"   Language: {english_alice_voice.get('language', 'N/A')}")
         else:
-            # Try to create without voice_name - API will use default
-            print("   Creating task without voice_name - API will select default voice")
+            # Use first available voice if english_alice not found
+            selected_voice = voices[0]
+            voice_name = selected_voice.get('voice_name')
+            print(f"\n🎤 english_alice not found, using first available voice: {voice_name}")
+            print(f"   Display Name: {selected_voice.get('display_name', 'N/A')}")
+            print(f"   Language: {selected_voice.get('language', 'N/A')}")
+    else:
+        # Use default english_alice even if we can't list voices
+        print(f"\n🎤 Using default voice: {voice_name}")
+        print("   (Could not list voices - may need admin permissions)")
     
     # Step 3: Create TTS task
     task_id = create_tts_task(

@@ -330,7 +330,7 @@ class MinerTracker:
         if required_count is None:
             required_count = self.min_miners_per_task
         
-        available_miners = self.get_available_miners(task_type, required_count)
+        available_miners = self.get_available_miners(task_type, min_count=required_count)
         
         if len(available_miners) < required_count:
             bt.logging.warning(f"⚠️  Insufficient miners: {len(available_miners)} < {required_count}")

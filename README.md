@@ -27,9 +27,11 @@ Violet subnet enables a decentralized ecosystem where miners provide computation
 - **Network**: Stable internet connection (100+ Mbps)
 
 ### Software Dependencies
-- Python 3.12+
+- **Python 3.10** (Required - Coqui TTS does not support Python 3.12)
 - CUDA 11.8+ (for GPU acceleration)
 - Bittensor CLI (`pip install bittensor-cli`)
+
+**⚠️ Important:** Coqui TTS (used for text-to-speech) requires Python 3.9-3.11. Python 3.12 is NOT supported. You MUST use Python 3.10 in a virtual environment.
 
 ## 🚀 Quick Start
 
@@ -40,29 +42,52 @@ git clone https://github.com/hivetrainai/violet.git
 cd violet
 ```
 
-### Step 2: Create Virtual Environment
+### Step 2: Create Python 3.10 Virtual Environment
 
-**Important:** Always create and activate a virtual environment before installing dependencies:
+**⚠️ CRITICAL:** Coqui TTS requires Python 3.10. You MUST create a Python 3.10 virtual environment before installing dependencies.
 
 ```bash
-# Create virtual environment
-python -m venv venv
+# Check if Python 3.10 is available
+python3.10 --version
+
+# If Python 3.10 is not installed, install it first:
+# On macOS (using Homebrew):
+# brew install python@3.10
+# On Ubuntu/Debian:
+# sudo apt-get install python3.10 python3.10-venv
+
+# Create Python 3.10 virtual environment
+python3.10 -m venv venv_py310
 
 # Activate virtual environment
 # On Linux/macOS:
-source venv/bin/activate
+source venv_py310/bin/activate
 # On Windows:
-venv\Scripts\activate
+venv_py310\Scripts\activate
+
+# Verify Python version (should show 3.10.x)
+python --version
 ```
 
 ### Step 3: Install Dependencies
 
+**⚠️ IMPORTANT:** Ensure you are in the Python 3.10 virtual environment before installing:
+
 ```bash
+# Verify you're in Python 3.10 virtual environment
+python --version  # Should show Python 3.10.x
+
+# Upgrade pip and setuptools
+pip install --upgrade pip setuptools wheel
+
 # Install the Violet package in development mode
 pip install -e .
 
 # Install additional requirements
 pip install -r requirements.txt
+
+# Note: If you encounter numpy/numba version conflicts, ensure numpy < 1.25.0
+# pip install "numpy>=1.24.0,<1.25.0" --force-reinstall
 ```
 
 ### Step 4: Set Up Environment Variables
@@ -129,6 +154,18 @@ btcli subnet register --netuid 292 --subtensor.network test --wallet.name <your_
 
 ### Step 7: Run the Miner
 
+**⚠️ IMPORTANT:** Before running the miner, ensure you are in the Python 3.10 virtual environment:
+
+```bash
+# Activate Python 3.10 virtual environment
+source venv_py310/bin/activate  # Linux/macOS
+# or
+venv_py310\Scripts\activate  # Windows
+
+# Verify you're using Python 3.10
+python --version  # Should show Python 3.10.x
+```
+
 **Mainnet:**
 ```bash
 python neurons/miner.py \
@@ -158,6 +195,18 @@ python neurons/miner.py \
 ```
 
 ### Step 8: Run the Validator
+
+**⚠️ IMPORTANT:** Before running the validator, ensure you are in the Python 3.10 virtual environment:
+
+```bash
+# Activate Python 3.10 virtual environment
+source venv_py310/bin/activate  # Linux/macOS
+# or
+venv_py310\Scripts\activate  # Windows
+
+# Verify you're using Python 3.10
+python --version  # Should show Python 3.10.x
+```
 
 **Mainnet:**
 ```bash

@@ -2773,14 +2773,18 @@ Report generated automatically by Bittensor Miner
         try:
             task_id = task_data.get("task_id")
             
+            # Get source and target languages from task_data first (they should always be there for translation tasks)
+            source_language = task_data.get('source_language', 'en')
+            target_language = task_data.get('target_language', 'es')
+            
             # Try to get data from task_data first
             if 'input_text' in task_data and task_data['input_text']:
                 text_content = task_data['input_text']
                 bt.logging.info(f"✅ Found text translation data in task_data for task {task_id}")
                 return {
                     'text': text_content.get('text', ''),
-                    'source_language': text_content.get('source_language', 'en'),
-                    'target_language': text_content.get('target_language', 'es')
+                    'source_language': text_content.get('source_language', source_language),
+                    'target_language': text_content.get('target_language', target_language)
                 }
             
             # If not in task_data, try to fetch from proxy API
@@ -2797,8 +2801,8 @@ Report generated automatically by Bittensor Miner
                         bt.logging.info(f"✅ Retrieved text translation data from proxy API for task {task_id}")
                         return {
                             'text': text_content.get('text', ''),
-                            'source_language': text_content.get('source_language', 'en'),
-                            'target_language': text_content.get('target_language', 'es')
+                            'source_language': text_content.get('source_language', source_language),
+                            'target_language': text_content.get('target_language', target_language)
                         }
                     else:
                         bt.logging.warning(f"⚠️ No text content found in proxy API response for task {task_id}")
@@ -3030,26 +3034,37 @@ Report generated automatically by Bittensor Miner
             # Get miner UID from Bittensor
             miner_uid = self.uid if hasattr(self, 'uid') else 0
             
-            # Use the same format as transcription: result dict directly as response_data
-            # Calculate scores separately (not inside response_data)
+            # Extract translated_text and other fields from result
+            translated_text = result.get('translated_text', '')
+            if not translated_text or not translated_text.strip():
+                bt.logging.error(f"❌ No translated_text found in result for task {task_id}")
+                return False
+            
             processing_time = result.get('processing_time', 0.0)
+            source_language = result.get('source_language', '')
+            target_language = result.get('target_language', '')
             accuracy_score = 0.95  # Mock confidence for translation
             speed_score = self.calculate_speed_score(processing_time)
             
-            # Prepare form data matching transcription format
+            # Prepare form data matching the proxy server's expected format
+            # The endpoint expects: translated_text, processing_time, accuracy_score, speed_score, source_language, target_language
             form_data = {
                 'task_id': task_id,
                 'miner_uid': str(miner_uid),
-                'response_data': json.dumps(result),  # Result dict directly, same as transcription
-                'processing_time': processing_time,  # Number, not string (matching transcription)
-                'accuracy_score': accuracy_score,  # Number, not string (matching transcription)
-                'speed_score': speed_score  # Number, not string (matching transcription)
+                'translated_text': translated_text,  # Direct form field, not in response_data
+                'processing_time': str(processing_time),  # String format for form data
+                'accuracy_score': str(accuracy_score),
+                'speed_score': str(speed_score),
+                'source_language': source_language,
+                'target_language': target_language
             }
             
             bt.logging.info(f"📤 Submitting text translation result to proxy server for task {task_id}")
-            bt.logging.debug(f"   Response data: {json.dumps(result, indent=2)}")
+            bt.logging.debug(f"   Translated text length: {len(translated_text)} characters")
+            bt.logging.debug(f"   From {source_language} to {target_language}")
+            bt.logging.debug(f"   Processing time: {processing_time:.2f}s")
             
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 headers = self._get_auth_headers()
                 response = await client.post(callback_url, headers=headers, data=form_data)
                 

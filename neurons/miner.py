@@ -3198,19 +3198,41 @@ Report generated automatically by Bittensor Miner
             # Get miner UID from Bittensor
             miner_uid = self.uid if hasattr(self, 'uid') else 0
             
+            # Validate result before submission
+            if not result:
+                bt.logging.error(f"❌ Cannot submit empty result for task {task_id}")
+                return False
+            
             # Extract processing_time from result (if present) for use at top level
             processing_time = result.get("processing_time", 0.0)
             
             # For summarization tasks, ensure the result format matches what proxy expects
             # Proxy expects: response_data with output_data containing the actual result
             if "summary" in result:
+                # Validate summary exists and is not empty
+                summary = result.get("summary", "")
+                if not summary or not summary.strip():
+                    bt.logging.error(f"❌ Cannot submit empty summary for task {task_id}")
+                    return False
+                
                 # For summarization, create clean result dict without processing_time at top level
                 # (processing_time will be sent separately in form_data)
+                # The proxy will wrap this in output_data, so we send it directly
                 clean_result = {k: v for k, v in result.items() if k != "processing_time"}
                 response_data_to_send = clean_result
+                
+                bt.logging.debug(f"📝 Summarization result prepared:")
+                bt.logging.debug(f"   Summary length: {len(summary)} chars")
+                bt.logging.debug(f"   Summary preview: {summary[:100]}...")
+                bt.logging.debug(f"   Response data keys: {list(clean_result.keys())}")
             else:
                 # For other task types, send result as-is
                 response_data_to_send = result
+            
+            # Validate response_data_to_send is not empty
+            if not response_data_to_send:
+                bt.logging.error(f"❌ Cannot submit empty response_data for task {task_id}")
+                return False
             
             # Prepare response payload based on task type
             response_payload = {
@@ -3240,6 +3262,15 @@ Report generated automatically by Bittensor Miner
             bt.logging.info(f"   Accuracy Score: {response_payload['accuracy_score']:.2f}")
             bt.logging.info(f"   Speed Score: {response_payload['speed_score']:.2f}")
             
+            # Validate response_data_to_send can be serialized to JSON
+            try:
+                test_json = json.dumps(response_data_to_send)
+                bt.logging.debug(f"✅ Response data is valid JSON ({len(test_json)} chars)")
+            except (TypeError, ValueError) as json_error:
+                bt.logging.error(f"❌ Response data cannot be serialized to JSON: {json_error}")
+                bt.logging.error(f"   Response data: {str(response_data_to_send)[:500]}")
+                return False
+            
             async with httpx.AsyncClient(timeout=10.0) as client:
                 headers = self._get_auth_headers()
                 # Convert to Form data as expected by proxy
@@ -3253,9 +3284,26 @@ Report generated automatically by Bittensor Miner
                     'speed_score': response_payload['speed_score']  # Number (matching transcription)
                 }
                 
+                # Log the form data being sent (for debugging)
+                bt.logging.debug(f"🔍 Form data being sent:")
+                bt.logging.debug(f"   task_id: {form_data['task_id']}")
+                bt.logging.debug(f"   miner_uid: {form_data['miner_uid']}")
+                bt.logging.debug(f"   response_data length: {len(form_data['response_data'])} chars")
+                bt.logging.debug(f"   response_data preview: {form_data['response_data'][:200]}...")
+                bt.logging.debug(f"   processing_time: {form_data['processing_time']}")
+                bt.logging.debug(f"   accuracy_score: {form_data['accuracy_score']}")
+                bt.logging.debug(f"   speed_score: {form_data['speed_score']}")
+                
                 submit_start_time = time.time()
                 response = await client.post(callback_url, headers=headers, data=form_data)
                 submit_time = time.time() - submit_start_time
+                
+                # Log response details for debugging
+                bt.logging.debug(f"📡 Proxy server response:")
+                bt.logging.debug(f"   Status Code: {response.status_code}")
+                bt.logging.debug(f"   Response Headers: {dict(response.headers)}")
+                if response.status_code != 200:
+                    bt.logging.debug(f"   Response Body: {response.text[:500]}")
                 
                 if response.status_code == 200:
                     # Try to parse response body to verify success

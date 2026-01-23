@@ -112,28 +112,44 @@ class TranslationPipeline:
                     self.translation_pipeline = None
             else:
                 # For other models (T5, mBART, etc.), use AutoModel
-                self.tokenizer = AutoTokenizer.from_pretrained(model_name, **hf_token_kwargs)
-                self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name, **hf_token_kwargs)
-                self.model.to(self.device)
-                self.model.eval()
-                logger.info(f"✅ Translation model loaded successfully on {self.device}: {model_name}")
-                
-                # Try to use pipeline for easier inference (but not for Marian models)
                 try:
-                    # Only use pipeline for non-Marian models
-                    if "opus-mt" not in model_name.lower() and "marian" not in model_name.lower():
-                        self.translation_pipeline = pipeline(
-                            "translation", 
-                            model=model_name, 
-                            device=0 if self.device == "cuda" else -1,
-                            token=hf_token_kwargs.get("token") if hf_token_kwargs else None
-                        )
-                        logger.info("✅ Translation pipeline initialized successfully")
-                    else:
+                    # Load tokenizer first
+                    self.tokenizer = AutoTokenizer.from_pretrained(model_name, **hf_token_kwargs)
+                    
+                    # For mBART models, set src_lang and tgt_lang if available
+                    if "mbart" in model_name.lower():
+                        # mBART uses language codes like "en_XX", "es_XX", etc.
+                        # We'll set these dynamically during translation
+                        logger.info(f"📝 mBART model detected: {model_name}")
+                    
+                    # Load model
+                    self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name, **hf_token_kwargs)
+                    self.model.to(self.device)
+                    self.model.eval()
+                    logger.info(f"✅ Translation model loaded successfully on {self.device}: {model_name}")
+                    
+                    # Try to use pipeline for easier inference (but not for Marian models or mBART)
+                    try:
+                        # Only use pipeline for T5 models (not Marian, not mBART)
+                        if ("opus-mt" not in model_name.lower() and 
+                            "marian" not in model_name.lower() and 
+                            "mbart" not in model_name.lower()):
+                            self.translation_pipeline = pipeline(
+                                "translation", 
+                                model=model_name, 
+                                device=0 if self.device == "cuda" else -1,
+                                token=hf_token_kwargs.get("token") if hf_token_kwargs else None
+                            )
+                            logger.info("✅ Translation pipeline initialized successfully")
+                        else:
+                            self.translation_pipeline = None
+                            logger.info("ℹ️ Using manual inference (model-specific handling required)")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Pipeline initialization failed, using manual inference: {e}")
                         self.translation_pipeline = None
                 except Exception as e:
-                    logger.warning(f"⚠️ Pipeline initialization failed, using manual inference: {e}")
-                    self.translation_pipeline = None
+                    logger.error(f"❌ Failed to load model {model_name}: {e}")
+                    raise
                     
         except Exception as e:
             logger.error(f"❌ Failed to load model {model_name}: {e}")
@@ -247,22 +263,55 @@ class TranslationPipeline:
             
             # Manual inference
             # Handle different model types
-            if "t5" in self.model_name.lower():
+            if "mbart" in self.model_name.lower():
+                # mBART models need special handling with language codes
+                try:
+                    # mBART uses language codes like "en_XX", "es_XX", etc.
+                    mbart_lang_map = {
+                        "en": "en_XX", "es": "es_XX", "fr": "fr_XX", "de": "de_XX",
+                        "it": "it_XX", "pt": "pt_XX", "ru": "ru_XX", "ja": "ja_XX",
+                        "ko": "ko_XX", "zh": "zh_CN", "ar": "ar_XX", "hi": "hi_IN",
+                        "nl": "nl_XX", "pl": "pl_XX", "tr": "tr_XX", "vi": "vi_VN",
+                        "cs": "cs_CZ", "fi": "fi_FI", "ro": "ro_RO", "uk": "uk_UA"
+                    }
+                    src_lang_code = mbart_lang_map.get(source_language, f"{source_language}_XX")
+                    tgt_lang_code = mbart_lang_map.get(target_language, f"{target_language}_XX")
+                    
+                    # Set source language
+                    if hasattr(self.tokenizer, 'src_lang'):
+                        self.tokenizer.src_lang = src_lang_code
+                    
+                    # Encode text
+                    encoded = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+                    encoded = {k: v.to(self.device) for k, v in encoded.items()}
+                    
+                    # Get target language token ID
+                    forced_bos_token_id = None
+                    if hasattr(self.tokenizer, 'lang_code_to_id') and isinstance(self.tokenizer.lang_code_to_id, dict):
+                        forced_bos_token_id = self.tokenizer.lang_code_to_id.get(tgt_lang_code)
+                    
+                    # Generate translation
+                    with torch.no_grad():
+                        generated_tokens = self.model.generate(
+                            **encoded,
+                            forced_bos_token_id=forced_bos_token_id,
+                            max_length=512,
+                            num_beams=4,
+                            early_stopping=True
+                        )
+                    
+                    # Decode
+                    translated_text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+                    return translated_text
+                except Exception as mbart_error:
+                    logger.warning(f"⚠️ mBART-specific translation failed, using generic method: {mbart_error}")
+                    # Fall through to generic method
+                    input_text = text
+            elif "t5" in self.model_name.lower():
                 # T5 models need translation prefix
                 target_lang_name = self.language_codes.get(target_language, target_language)
                 prefix = f"translate {self.language_codes.get(source_language, source_language)} to {target_lang_name}: "
                 input_text = prefix + text
-            elif "mbart" in self.model_name.lower():
-                # mBART models need language codes in tokenizer
-                input_text = text
-                # Set src_lang and tgt_lang for mBART
-                try:
-                    # mBART uses language codes like "en_XX", "es_XX", etc.
-                    src_lang_code = f"{source_language}_XX" if len(source_language) == 2 else source_language
-                    tgt_lang_code = f"{target_language}_XX" if len(target_language) == 2 else target_language
-                    self.tokenizer.src_lang = src_lang_code
-                except:
-                    pass  # If setting src_lang fails, continue without it
             elif "opus-mt" in self.model_name.lower() or "marian" in self.model_name.lower():
                 # Marian models work directly - they're already configured for specific language pairs
                 input_text = text

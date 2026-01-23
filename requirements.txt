@@ -10,6 +10,7 @@ rich>=13
 # PDF processing for translation pipeline
 PyMuPDF>=1.23.0  # Provides 'fitz' module
 python-docx>=1.1.0  # For DOCX document processing
+sentencepiece>=0.1.99  # Required for Helsinki-NLP Marian models (translation)
 
 # TTS - Coqui TTS for text-to-speech
 # Note: Coqui TTS officially supports Python 3.9-3.11, not 3.12

@@ -80,14 +80,33 @@ python --version  # Should show Python 3.10.x
 # Upgrade pip and setuptools
 pip install --upgrade pip setuptools wheel
 
-# Install the Violet package in development mode
-pip install -e .
+# IMPORTANT: Handle numpy/bittensor conflict
+# bittensor==9.10.0 requires numpy>=2.0.1, but Coqui TTS requires numpy<1.25
+# Install in this specific order to resolve the conflict:
 
-# Install additional requirements
+# 1. Install numpy first (required for Coqui TTS/numba, despite coqui-tts declaring numpy>=1.26.0)
+pip install "numpy>=1.24.0,<1.25.0"
+
+# 2. Install bittensor without dependencies to avoid numpy conflict
+pip install --no-deps bittensor==9.10.0
+
+# 3. Install bittensor's dependencies (excluding numpy which is already installed)
+pip install aiohttp async-substrate-interface asyncstdlib bittensor-drand bittensor-wallet colorama fastapi msgpack-numpy-opentensor munch nest_asyncio netaddr packaging pycryptodome pydantic python-statemachine pyyaml requests retry scalecodec setuptools uvicorn wheel
+
+# 4. Install numba and llvmlite (required by coqui-tts, but install after numpy to avoid conflicts)
+pip install "numba>=0.58.0" "llvmlite>=0.40.0"
+
+# 5. Install coqui-tts without dependencies to avoid numpy/numba conflict
+#    (coqui-tts declares numpy>=1.26.0 and numba>=0.58.0, but we use numpy 1.24.x)
+pip install --no-deps coqui-tts>=0.27.0
+
+# 6. Install coqui-tts dependencies manually
+pip install coqui-tts-trainer>=0.3.0 coqpit-config>=0.2.0 einops>=0.6.0 encodec>=0.1.1 monotonic-alignment-search>=0.2.0 num2words>=0.5.14 pysbd>=0.3.4 inflect>=5.6.0 anyascii>=0.3.0 matplotlib>=3.8.4 "gruut[de,es,fr]>=2.4.0" ko-speech-tools>=0.1.0 torchcodec
+
+# 7. Install remaining requirements (bittensor and coqui-tts are commented out in requirements.txt)
 pip install -r requirements.txt
 
-# Note: If you encounter numpy/numba version conflicts, ensure numpy < 1.25.0
-# pip install "numpy>=1.24.0,<1.25.0" --force-reinstall
+# Note: Skip "pip install -e ." to avoid additional conflicts with setup.py
 ```
 
 ### Step 4: Set Up Environment Variables

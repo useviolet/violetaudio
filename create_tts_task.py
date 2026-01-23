@@ -17,7 +17,7 @@ BASE_URL = "https://violet-proxy-bl4w.onrender.com"
 API_KEY = "tQlbLPoTF7RRsvJjgCm_4kHiIg-xqoQ6l4utqW56sY0"
 
 # Task parameters
-TEXT = "I am Tobius the great man from Iganga and Tanzania Bukoba , kammpala , masaka . We sign great work and make it work all over the world"
+TEXT = "Good morning, how are you doing today? I am doing great, thank you for asking. I am a software engineer and I am working on a project to create a TTS system."
 MODEL_ID = "tts_models/multilingual/multi-dataset/xtts_v2"
 SOURCE_LANGUAGE = "en"
 PRIORITY = "normal"

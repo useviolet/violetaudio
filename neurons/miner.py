@@ -3198,13 +3198,27 @@ Report generated automatically by Bittensor Miner
             # Get miner UID from Bittensor
             miner_uid = self.uid if hasattr(self, 'uid') else 0
             
+            # Extract processing_time from result (if present) for use at top level
+            processing_time = result.get("processing_time", 0.0)
+            
+            # For summarization tasks, ensure the result format matches what proxy expects
+            # Proxy expects: response_data with output_data containing the actual result
+            if "summary" in result:
+                # For summarization, create clean result dict without processing_time at top level
+                # (processing_time will be sent separately in form_data)
+                clean_result = {k: v for k, v in result.items() if k != "processing_time"}
+                response_data_to_send = clean_result
+            else:
+                # For other task types, send result as-is
+                response_data_to_send = result
+            
             # Prepare response payload based on task type
             response_payload = {
                 "task_id": task_id,
                 "miner_uid": miner_uid,
-                "response_data": result,
-                "processing_time": result.get("processing_time", 0.0),
-                "speed_score": self.calculate_speed_score(result.get("processing_time", 0.0))
+                "response_data": response_data_to_send,
+                "processing_time": processing_time,
+                "speed_score": self.calculate_speed_score(processing_time)
             }
             
             # Add task-specific metrics

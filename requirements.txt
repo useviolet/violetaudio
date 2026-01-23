@@ -6,7 +6,7 @@ pydantic>=2.5.0
 python-multipart>=0.0.6
 starlette>=0.30.0
 rich>=13
-
+sentencepiece>=0.1.99
 # PDF processing for translation pipeline
 PyMuPDF>=1.23.0  # Provides 'fitz' module
 python-docx>=1.1.0  # For DOCX document processing

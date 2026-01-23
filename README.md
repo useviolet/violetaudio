@@ -109,7 +109,19 @@ pip install -r requirements.txt
 # Note: Skip "pip install -e ." to avoid additional conflicts with setup.py
 ```
 
-### Step 4: Set Up Environment Variables
+### Step 4: Install System Dependencies
+
+Install FFmpeg and related libraries (required for audio/video processing):
+
+```bash
+# On Ubuntu/Debian:
+sudo apt install -y ffmpeg libavutil-dev libavcodec-dev libavformat-dev libavdevice-dev
+
+# On macOS (using Homebrew):
+# brew install ffmpeg
+```
+
+### Step 5: Set Up Environment Variables
 
 Create a `.env` file in the project root directory with the following required variables:
 
@@ -140,7 +152,7 @@ PROXY_SERVER_URL=https://violet-proxy-bl4w.onrender.com
 
 **Important:** Never commit your `.env` file to version control. It contains sensitive credentials.
 
-### Step 5: Create Wallets
+### Step 6: Create Wallets
 
 Create a coldkey and hotkey for your subnet wallet:
 
@@ -155,7 +167,7 @@ btcli wallet new_coldkey --wallet.name <your_wallet_name>
 btcli wallet new_hotkey --wallet.name <your_wallet_name> --wallet.hotkey default
 ```
 
-### Step 6: Register on the Subnet
+### Step 7: Register on the Subnet
 
 Register as a miner or validator on the subnet:
 
@@ -171,7 +183,7 @@ btcli subnet register --netuid 292 --subtensor.network test --wallet.name <your_
 
 **Note:** Registration requires 0.005 TAO for mainnet or test tokens for testnet.
 
-### Step 7: Run the Miner
+### Step 8: Run the Miner
 
 **⚠️ IMPORTANT:** Before running the miner, ensure you are in the Python 3.10 virtual environment:
 
@@ -213,7 +225,7 @@ python neurons/miner.py \
   --axon.external_port <PORT>
 ```
 
-### Step 8: Run the Validator
+### Step 9: Run the Validator
 
 **⚠️ IMPORTANT:** Before running the validator, ensure you are in the Python 3.10 virtual environment:
 

@@ -159,6 +159,18 @@ class TTSPipeline:
         else:
             logger.warning(f"⚠️ Model may not be multilingual, language parameter may be ignored")
         
+        # Detect model capabilities
+        self.supports_voice_cloning = self._detect_voice_cloning_support()
+        self.is_multi_speaker = hasattr(self.tts, 'speakers') and self.tts.speakers is not None and len(self.tts.speakers) > 0
+        
+        if self.supports_voice_cloning:
+            logger.info(f"✅ Model {self.model_name} supports voice cloning with speaker_wav")
+        else:
+            logger.info(f"ℹ️  Model {self.model_name} does not support voice cloning - will use preset speakers or default voice")
+        
+        if self.is_multi_speaker:
+            logger.info(f"✅ Model {self.model_name} supports multiple speakers: {len(self.tts.speakers)} available")
+        
         # Production settings
         self.max_text_length = 5000  # Maximum characters per synthesis
         self.chunk_overlap = 100     # Characters overlap between chunks
@@ -171,6 +183,28 @@ class TTSPipeline:
             'memory_usage_samples': []
         }
     
+    def _detect_voice_cloning_support(self) -> bool:
+        """
+        Detect if the current model supports voice cloning with speaker_wav.
+        
+        Returns:
+            True if model supports voice cloning, False otherwise
+        """
+        model_lower = self.model_name.lower()
+        
+        # XTTS models explicitly support voice cloning
+        if "xtts" in model_lower:
+            return True
+        
+        # YourTTS technically supports it but may not work well in practice
+        # We'll mark it as not supporting to avoid poor quality results
+        if "your_tts" in model_lower:
+            return False
+        
+        # Tacotron2-DDC and VITS are single or fixed multi-speaker models
+        # They don't support voice cloning
+        return False
+    
     def synthesize(self, text: str, language: str = "en", speaker: Optional[str] = None, speaker_wav: Optional[str] = None) -> Tuple[bytes, float]:
         """
         Synthesize text to speech.
@@ -179,7 +213,7 @@ class TTSPipeline:
             text: Input text to synthesize
             language: Language code (e.g., 'en', 'es', 'fr')
             speaker: Speaker name (if model supports multiple speakers)
-            speaker_wav: Path to speaker reference audio file for voice cloning (e.g., XTTS v2)
+            speaker_wav: Path to speaker reference audio file for voice cloning (XTTS models only)
             
         Returns:
             Tuple of (audio_bytes, processing_time)
@@ -187,20 +221,10 @@ class TTSPipeline:
         start_time = time.time()
         
         try:
-            # If speaker_wav is provided, use tts_to_file() method for voice cloning
-            # Check for both None and empty string
-            if speaker_wav and isinstance(speaker_wav, str) and speaker_wav.strip():
-                speaker_wav = speaker_wav.strip()  # Remove any whitespace
+            # Handle voice cloning for XTTS models
+            if speaker_wav and isinstance(speaker_wav, str) and speaker_wav.strip() and self.supports_voice_cloning:
+                speaker_wav = speaker_wav.strip()
                 logger.info(f"🎤 Using speaker WAV for voice cloning: {speaker_wav}")
-                
-                # CRITICAL: Voice cloning requires XTTS models (xtts_v2, xtts_v1, etc.)
-                # your_tts and other models don't support voice cloning properly
-                if "xtts" not in self.model_name.lower():
-                    error_msg = f"Voice cloning requires an XTTS model, but current model is {self.model_name}. " \
-                               f"your_tts and other models don't support speaker_wav properly and will produce " \
-                               f"poor quality or babbling audio. Please use xtts_v2 or xtts_v1 for voice cloning."
-                    logger.error(f"❌ {error_msg}")
-                    raise Exception(error_msg)
                 
                 # Validate speaker_wav file exists
                 if not os.path.exists(speaker_wav):
@@ -215,7 +239,7 @@ class TTSPipeline:
                     raise Exception(f"Speaker WAV path is not a file: {speaker_wav}")
                 
                 logger.debug(f"✅ Speaker WAV file validated: {speaker_wav}")
-                logger.info(f"✅ Using XTTS model {self.model_name} for voice cloning (required for speaker_wav)")
+                logger.info(f"✅ Using XTTS model {self.model_name} for voice cloning")
                 
                 # Create temporary file for output
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
@@ -229,7 +253,7 @@ class TTSPipeline:
                         "speaker_wav": speaker_wav
                     }
                     
-                    # Add language if model is multilingual (use lowercase directly)
+                    # Add language if model is multilingual
                     if self.is_multilingual:
                         tts_params["language"] = language.lower()
                         logger.debug(f"🎵 Using language: {language.lower()} for TTS synthesis")
@@ -261,30 +285,39 @@ class TTSPipeline:
                     if os.path.exists(output_path):
                         os.unlink(output_path)
             
-            # Otherwise, use standard tts() method (no speaker_wav)
+            # Handle non-voice-cloning models (or when speaker_wav is not provided)
             else:
-                logger.debug(f"Using default voice (no speaker_wav provided)")
+                # If speaker_wav was provided but model doesn't support it, log a warning and continue
+                if speaker_wav and isinstance(speaker_wav, str) and speaker_wav.strip():
+                    logger.warning(f"⚠️ Model {self.model_name} does not support voice cloning with speaker_wav.")
+                    logger.warning(f"   Ignoring speaker_wav parameter and using preset speaker or default voice instead.")
+                    logger.info(f"   For voice cloning, please use an XTTS model (xtts_v2 or xtts_v1)")
+                
+                # Use standard synthesis without voice cloning
+                logger.debug(f"Using standard TTS synthesis (model: {self.model_name})")
                 
                 # Prepare synthesis parameters
                 synthesis_params = {"text": text}
                 
-                # Add language if model is multilingual (use lowercase for consistency)
+                # Add language if model is multilingual
                 if self.is_multilingual:
-                    # Use lowercase directly for consistency with voice cloning path
                     synthesis_params["language"] = language.lower()
                     logger.debug(f"🎵 Using language: {language.lower()} for TTS synthesis")
                 else:
-                    logger.warning(f"⚠️ Model is not multilingual, ignoring language parameter: {language}")
+                    logger.debug(f"ℹ️  Model is not multilingual, language parameter may be ignored: {language}")
                 
-                # Add speaker if specified and supported
-                if speaker and hasattr(self.tts, 'speakers') and speaker in self.tts.speakers:
-                    synthesis_params["speaker"] = speaker
-                    logger.debug(f"🎤 Using speaker: {speaker}")
-                elif hasattr(self.tts, 'speakers') and self.tts.speakers:
-                    # Auto-select first available speaker if none specified
-                    default_speaker = self.tts.speakers[0]
-                    synthesis_params["speaker"] = default_speaker
-                    logger.debug(f"🎤 Auto-selected speaker: {default_speaker}")
+                # Handle speaker selection for multi-speaker models
+                if self.is_multi_speaker:
+                    if speaker and speaker in self.tts.speakers:
+                        synthesis_params["speaker"] = speaker
+                        logger.info(f"🎤 Using specified speaker: {speaker}")
+                    else:
+                        # Auto-select first available speaker
+                        default_speaker = self.tts.speakers[0]
+                        synthesis_params["speaker"] = default_speaker
+                        logger.info(f"🎤 Auto-selected speaker: {default_speaker} (from {len(self.tts.speakers)} available)")
+                elif speaker:
+                    logger.warning(f"⚠️ Speaker parameter '{speaker}' provided but model {self.model_name} is not multi-speaker. Ignoring speaker parameter.")
                 
                 logger.debug(f"🔧 TTS synthesis parameters: {synthesis_params}")
                 
@@ -301,7 +334,7 @@ class TTSPipeline:
                 # Update statistics
                 self._update_stats(len(text), processing_time)
                 
-                logger.info(f"✅ TTS synthesis completed in {processing_time:.2f}s (default voice)")
+                logger.info(f"✅ TTS synthesis completed in {processing_time:.2f}s (model: {self.model_name})")
                 
                 return audio_bytes.read(), processing_time
             

@@ -75,8 +75,8 @@ def get_file_info_from_db(file_id: str):
         print(f"⚠️  Error querying database: {e}")
         return None
 
-def get_audio_from_task(task_id: str):
-    """Get audio file_id from task"""
+def get_audio_from_task(task_id: str, get_all: bool = False):
+    """Get audio file_id(s) from task"""
     database_url = get_database_url()
     
     try:
@@ -102,21 +102,27 @@ def get_audio_from_task(task_id: str):
             if task and task[0]:
                 miner_responses = task[0]
                 if isinstance(miner_responses, list) and len(miner_responses) > 0:
-                    # Get first response
-                    response = miner_responses[0]
-                    if isinstance(response, dict):
-                        response_data = response.get('response', {}).get('response_data', {})
-                        output_data = response_data.get('output_data', {})
-                        audio_file = output_data.get('audio_file', {})
-                        file_id = audio_file.get('file_id')
-                        return file_id
+                    file_ids = []
+                    for response in miner_responses:
+                        if isinstance(response, dict):
+                            response_data = response.get('response', {}).get('response_data', {})
+                            output_data = response_data.get('output_data', {})
+                            audio_file = output_data.get('audio_file', {})
+                            file_id = audio_file.get('file_id')
+                            if file_id:
+                                file_ids.append(file_id)
+                    
+                    if get_all:
+                        return file_ids
+                    elif len(file_ids) > 0:
+                        return file_ids[0]  # Return first for backward compatibility
             
-            return None
+            return None if not get_all else []
         
         engine.dispose()
     except Exception as e:
         print(f"⚠️  Error querying task: {e}")
-        return None
+        return None if not get_all else []
 
 def download_audio(file_id: str, output_path: str = None):
     """Download audio file by file_id"""
@@ -195,17 +201,87 @@ def download_audio(file_id: str, output_path: str = None):
     print(f"\n❌ Failed to download from all available sources")
     return None
 
+def get_audio_links_from_task(task_id: str):
+    """Get all audio file links from a task"""
+    database_url = get_database_url()
+    
+    try:
+        engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+            connect_args={
+                "connect_timeout": 10,
+                "sslmode": "require"
+            }
+        )
+        
+        with engine.connect() as conn:
+            query = text("""
+                SELECT miner_responses
+                FROM tasks
+                WHERE task_id = :task_id
+            """)
+            
+            result = conn.execute(query, {'task_id': task_id})
+            task = result.fetchone()
+            
+            if not task or not task[0]:
+                return []
+            
+            miner_responses = task[0]
+            links = []
+            
+            if isinstance(miner_responses, list):
+                for response in miner_responses:
+                    if isinstance(response, dict):
+                        audio_file = response.get('response', {}).get('response_data', {}).get('output_data', {}).get('audio_file', {})
+                        file_id = audio_file.get('file_id')
+                        file_name = audio_file.get('file_name', '')
+                        if file_id:
+                            url = f"{BASE_URL}/api/v1/tts/audio/{file_id}"
+                            # Store both URL and filename
+                            links.append({
+                                'url': url,
+                                'file_name': file_name if file_name else f"{file_id}.wav"
+                            })
+            
+            return links
+        
+        engine.dispose()
+    except Exception as e:
+        print(f"⚠️  Error querying task: {e}")
+        return []
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 download_audio.py <file_id|task_id> [output_path]")
+        print("Usage: python3 download_audio.py <file_id|task_id> [output_path|--links]")
         print("\nExamples:")
         print("  python3 download_audio.py 7ae4e379-2013-4608-8c84-588fbc01d381")
         print("  python3 download_audio.py 7e145dda-40bb-4cf3-a8c7-7db8ce99d277 output.wav")
+        print("  python3 download_audio.py <task_id> --links  # Get all audio links from task")
         print("\nIf you provide a task_id, the script will extract the file_id from the task's miner responses")
         sys.exit(1)
     
     identifier = sys.argv[1]
     output_path = sys.argv[2] if len(sys.argv) > 2 else None
+    
+    # Check if user wants just links
+    if output_path == '--links':
+        links = get_audio_links_from_task(identifier)
+        if links:
+            print("\n📥 Audio File Links (.wav files):")
+            print()
+            for link_info in links:
+                if isinstance(link_info, dict):
+                    print(link_info['url'])
+                    if link_info.get('file_name'):
+                        print(f"  # {link_info['file_name']}")
+                else:
+                    # Backward compatibility
+                    print(link_info)
+        else:
+            print(f"❌ No audio files found for task: {identifier}")
+        return
     
     # Check if it's a task_id (UUID format) or file_id
     # Try to get file_id from task first

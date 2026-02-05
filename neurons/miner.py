@@ -2258,163 +2258,45 @@ Report generated automatically by Bittensor Miner
             
             bt.logging.info(f"✅ Speaker audio downloaded: {len(speaker_audio_data)} bytes")
             
-            # Validate and preprocess speaker audio for XTTS v2
-            # XTTS v2 requires: mono channel, proper sample rate (typically 22050Hz or 24000Hz)
-            bt.logging.info(f"🔍 Validating and preprocessing speaker audio...")
-            try:
-                import soundfile as sf
-                import numpy as np
-                import librosa
-                
-                # Load audio to check format
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_speaker:
-                    temp_speaker.write(speaker_audio_data)
-                    temp_speaker_path = temp_speaker.name
-                
-                # Load audio file to check properties
-                audio_data, original_sr = sf.read(temp_speaker_path)
-                
-                # Log original properties
-                bt.logging.info(f"   Original audio properties:")
-                bt.logging.info(f"      Sample rate: {original_sr} Hz")
-                bt.logging.info(f"      Channels: {len(audio_data.shape)} ({'mono' if len(audio_data.shape) == 1 else 'stereo'})")
-                bt.logging.info(f"      Duration: {len(audio_data) / original_sr:.2f}s")
-                bt.logging.info(f"      Data type: {audio_data.dtype}")
-                
-                # Convert to mono if stereo
-                if len(audio_data.shape) > 1:
-                    bt.logging.info(f"   Converting stereo to mono...")
-                    audio_data = np.mean(audio_data, axis=1)
-                
-                # Resample to 22050 Hz if needed (XTTS v2 works best with 22050 Hz)
-                target_sr = 22050
-                if original_sr != target_sr:
-                    bt.logging.info(f"   Resampling from {original_sr} Hz to {target_sr} Hz...")
-                    audio_data = librosa.resample(audio_data, orig_sr=original_sr, target_sr=target_sr)
-                    bt.logging.info(f"   ✅ Resampled to {target_sr} Hz")
-                
-                # Normalize audio to prevent clipping
-                max_val = np.max(np.abs(audio_data))
-                if max_val > 0:
-                    # Normalize to 0.95 to prevent clipping
-                    audio_data = audio_data / max_val * 0.95
-                    bt.logging.info(f"   ✅ Normalized audio (max was {max_val:.4f})")
-                
-                # Ensure audio is float32
-                if audio_data.dtype != np.float32:
-                    audio_data = audio_data.astype(np.float32)
-                
-                # Save preprocessed audio to final temporary file
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as speaker_file:
-                    speaker_wav_path = speaker_file.name
-                
-                # Save as WAV with proper format
-                sf.write(speaker_wav_path, audio_data, target_sr, format='WAV', subtype='PCM_16')
-                
-                # Clean up temporary file
-                if os.path.exists(temp_speaker_path):
-                    os.unlink(temp_speaker_path)
-                
-                # Verify the preprocessed file
-                final_audio, final_sr = sf.read(speaker_wav_path)
-                bt.logging.info(f"✅ Speaker audio preprocessed successfully:")
-                bt.logging.info(f"   Final sample rate: {final_sr} Hz")
-                bt.logging.info(f"   Final channels: {'mono' if len(final_audio.shape) == 1 else 'stereo'}")
-                bt.logging.info(f"   Final duration: {len(final_audio) / final_sr:.2f}s")
-                bt.logging.info(f"   File size: {os.path.getsize(speaker_wav_path):,} bytes")
-                
-            except Exception as preprocess_error:
-                bt.logging.error(f"❌ Error preprocessing speaker audio: {preprocess_error}")
-                bt.logging.warning(f"   Falling back to original file (may cause quality issues)")
-                import traceback
-                traceback.print_exc()
-                
-                # Fallback: save original file without preprocessing
+            # Save downloaded audio directly to temporary WAV file (no preprocessing)
+            # The TTS library will handle the audio format internally
+            bt.logging.info(f"💾 Saving speaker audio to temporary WAV file...")
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as speaker_file:
                 speaker_file.write(speaker_audio_data)
                 speaker_wav_path = speaker_file.name
             
-                bt.logging.warning(f"   ⚠️ Using original file without preprocessing")
+            bt.logging.info(f"✅ Speaker audio saved to temporary file: {speaker_wav_path}")
+            bt.logging.info(f"   File size: {os.path.getsize(speaker_wav_path):,} bytes")
             
-            # Detect device (GPU or CPU)
+            # Optionally log audio properties (read-only, no conversion)
             try:
-                import torch
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-            except ImportError:
-                device = "cpu"
+                import soundfile as sf
+                audio_data, sample_rate = sf.read(speaker_wav_path)
+                bt.logging.info(f"   Audio properties:")
+                bt.logging.info(f"      Sample rate: {sample_rate} Hz")
+                bt.logging.info(f"      Channels: {'mono' if len(audio_data.shape) == 1 else 'stereo'}")
+                bt.logging.info(f"      Duration: {len(audio_data) / sample_rate:.2f}s")
+            except Exception as read_error:
+                bt.logging.debug(f"   Could not read audio properties: {read_error}")
+                # Continue anyway - TTS library will handle it
             
-            bt.logging.info(f"🔄 Initializing TTS with model: {tts_model_id}")
-            bt.logging.info(f"   Device: {device}")
+            # Use PipelineManager to get TTS pipeline (cached, properly initialized)
+            # This matches the test script approach and ensures consistent behavior
+            bt.logging.info(f"🔄 Getting TTS pipeline via PipelineManager for model: {tts_model_id}")
             start_time = time.time()
             
-            # Check transformers version (for logging only - compatibility shims are in place)
             try:
-                import transformers
-                transformers_version = transformers.__version__
-                bt.logging.info(f"   Transformers version: {transformers_version}")
-                bt.logging.debug(f"   Compatibility shims enabled for transformers 4.57.3+")
-            except Exception as e:
-                bt.logging.debug(f"   Could not check transformers version: {e}")
-            
-            # Try to use device parameter, fallback to gpu parameter
-            try:
-                import inspect
-                sig = inspect.signature(TTS.__init__)
-                if 'device' in sig.parameters:
-                    tts = TTS(tts_model_id, device=device)
-                else:
-                    # Fallback to gpu parameter if device not available
-                    tts = TTS(tts_model_id, gpu=(device == "cuda"))
-            except ImportError as import_error:
-                # Handle import errors (like LogitsWarper)
-                error_msg = str(import_error)
-                if "LogitsWarper" in error_msg or "transformers" in error_msg.lower():
-                    bt.logging.error(f"❌ Transformers compatibility error: {error_msg}")
-                    bt.logging.error(f"   This is likely due to transformers version incompatibility with Coqui TTS")
-                    bt.logging.error(f"   Solution: Downgrade transformers to <4.40.0: pip install 'transformers<4.40.0'")
-                    raise Exception(f"Transformers version incompatibility: {error_msg}. Please downgrade transformers to <4.40.0")
-                else:
-                    raise
-            except TypeError as type_error:
-                # Handle Python 3.12 compatibility errors
-                error_msg = str(type_error)
-                if "ForwardRef._evaluate()" in error_msg or "recursive_guard" in error_msg:
-                    bt.logging.error(f"❌ Python 3.12 compatibility error: {error_msg}")
-                    bt.logging.error(f"   This is a known issue with Python 3.12 + spacy/pydantic")
-                    bt.logging.error(f"   Solutions:")
-                    bt.logging.error(f"     1. Use Python 3.11 instead: python3.11 -m venv venv311")
-                    bt.logging.error(f"     2. Or upgrade pydantic to v2 (may break other dependencies)")
-                    bt.logging.error(f"     3. Or wait for spacy/pydantic updates")
-                    raise Exception(f"Python 3.12 compatibility error: {error_msg}. Consider using Python 3.11 for TTS tasks.")
-                else:
-                    raise
-            except Exception as e:
-                # Final fallback
-                error_msg = str(e)
-                if "LogitsWarper" in error_msg or "transformers" in error_msg.lower():
-                    bt.logging.error(f"❌ Transformers compatibility error during TTS initialization: {error_msg}")
-                    bt.logging.error(f"   Solution: Downgrade transformers: pip install 'transformers<4.40.0'")
-                    raise Exception(f"Transformers version incompatibility: {error_msg}. Please downgrade transformers to <4.40.0")
-                elif "ForwardRef._evaluate()" in error_msg or "recursive_guard" in error_msg:
-                    bt.logging.error(f"❌ Python 3.12 compatibility error: {error_msg}")
-                    bt.logging.error(f"   Solution: Use Python 3.11 for TTS tasks")
-                    raise Exception(f"Python 3.12 compatibility error: {error_msg}. Consider using Python 3.11.")
-                bt.logging.warning(f"⚠️ Could not use device parameter, using gpu: {e}")
-                try:
-                    tts = TTS(tts_model_id, gpu=(device == "cuda"))
-                except Exception as e2:
-                    error_msg2 = str(e2)
-                    if "ForwardRef._evaluate()" in error_msg2 or "recursive_guard" in error_msg2:
-                        bt.logging.error(f"❌ Python 3.12 compatibility error in fallback: {error_msg2}")
-                        raise Exception(f"Python 3.12 compatibility error: {error_msg2}. Consider using Python 3.11.")
-                    raise
-            
-            init_time = time.time() - start_time
-            bt.logging.info(f"✅ TTS initialized in {init_time:.2f}s on {device}")
-            
-            # Note: is_multi_speaker is a read-only property in TTS library
-            # We don't need to set it - XTTS v2 is multi-speaker by default
-            # The library will handle this internally when we call tts_to_file with speaker_wav
+                # Get TTS pipeline from PipelineManager (cached, properly initialized)
+                tts_pipeline = self.pipeline_manager.get_tts_pipeline(model_name=tts_model_id)
+                init_time = time.time() - start_time
+                bt.logging.info(f"✅ TTS pipeline obtained in {init_time:.2f}s")
+                bt.logging.info(f"   Model: {tts_pipeline.model_name}")
+                bt.logging.info(f"   Device: {tts_pipeline.device}")
+            except Exception as pipeline_error:
+                error_msg = str(pipeline_error)
+                bt.logging.error(f"❌ Failed to get TTS pipeline from PipelineManager: {error_msg}")
+                bt.logging.error(f"   This should not happen - PipelineManager handles initialization")
+                raise Exception(f"Failed to get TTS pipeline: {error_msg}")
             
             # Generate speech with voice cloning
             # Use try/finally to ensure TTS object and memory are cleaned up
@@ -2466,81 +2348,33 @@ Report generated automatically by Bittensor Miner
                 bt.logging.info(f"   Using speaker WAV for voice cloning: {speaker_wav_path}")
                 
                 try:
-                    # XTTS v2 tts_to_file parameters:
-                    # - text: The text to synthesize
-                    # - file_path: Output file path
-                    # - speaker_wav: Path to speaker reference audio (must be WAV file)
-                    #   IMPORTANT: XTTS v2 will extract voice characteristics from this file
-                    # - language: Language code (e.g., 'en', 'es', 'fr')
-                    # Note: XTTS v2 automatically handles voice cloning from speaker_wav
-                    bt.logging.debug(f"   Calling tts_to_file with:")
+                    # Use TTSPipeline.synthesize() method (same as test script)
+                    # This ensures consistent behavior and proper voice cloning
+                    bt.logging.debug(f"   Calling TTSPipeline.synthesize() with:")
                     bt.logging.debug(f"      text: {text[:50]}...")
                     bt.logging.debug(f"      speaker_wav: {speaker_wav_path}")
                     bt.logging.debug(f"      language: {source_language.lower()}")
                     
-                    tts.tts_to_file(
+                    # Use the pipeline's synthesize method (handles voice cloning properly)
+                    audio_bytes_result, processing_time = tts_pipeline.synthesize(
                         text=text,
-                        file_path=output_path,
-                        speaker_wav=speaker_wav_path,  # This is the key parameter for voice cloning
-                        language=source_language.lower()  # Ensure lowercase language code
+                        language=source_language.lower(),
+                        speaker_wav=speaker_wav_path  # This is the key parameter for voice cloning
                     )
+                    
+                    # Write the audio bytes to output file
+                    with open(output_path, 'wb') as f:
+                        f.write(audio_bytes_result)
+                    
                     processing_time = time.time() - synthesis_start
                     bt.logging.info(f"✅ TTS synthesis completed in {processing_time:.2f}s")
                 except Exception as synthesis_error:
                     processing_time = time.time() - synthesis_start
                     error_msg = str(synthesis_error)
-                    
-                    # Handle einops compatibility issue with torch.nn.parameter.Parameter
-                    if "einops" in error_msg.lower() or ("Parameter" in error_msg and "einops" in error_msg.lower()):
-                        bt.logging.warning(f"⚠️ TTS synthesis failed due to einops compatibility issue: {synthesis_error}")
-                        bt.logging.info(f"   Attempting alternative synthesis method (tts() instead of tts_to_file())...")
-                        
-                        # Try alternative: use tts() method directly and save manually
-                        # This avoids the einops issue in tts_to_file()
-                        try:
-                            import torch
-                            import numpy as np
-                            import soundfile as sf
-                            
-                            # Use tts() method directly (may avoid einops issue)
-                            bt.logging.debug(f"   Calling tts() with:")
-                            bt.logging.debug(f"      text: {text[:50]}...")
-                            bt.logging.debug(f"      speaker_wav: {speaker_wav_path}")
-                            bt.logging.debug(f"      language: {source_language.lower()}")
-                            
-                            audio_array = tts.tts(
-                                text=text,
-                                speaker_wav=speaker_wav_path,  # Voice cloning from speaker WAV
-                                language=source_language.lower()  # Ensure lowercase language code
-                            )
-                            
-                            # Convert to numpy array if needed
-                            if isinstance(audio_array, torch.Tensor):
-                                audio_array = audio_array.detach().cpu().numpy()
-                            elif not isinstance(audio_array, np.ndarray):
-                                audio_array = np.array(audio_array)
-                            
-                            # Ensure it's 1D array
-                            if len(audio_array.shape) > 1:
-                                audio_array = audio_array.flatten()
-                            
-                            # Get sample rate from synthesizer
-                            sample_rate = getattr(tts.synthesizer, 'output_sample_rate', 22050)
-                            
-                            # Save audio file manually
-                            sf.write(output_path, audio_array, sample_rate)
-                            
-                            processing_time = time.time() - synthesis_start
-                            bt.logging.info(f"✅ TTS synthesis completed using alternative method in {processing_time:.2f}s")
-                        except Exception as alt_error:
-                            bt.logging.error(f"❌ Alternative synthesis method also failed: {alt_error}")
-                            bt.logging.error(f"   Original error: {synthesis_error}")
-                            bt.logging.error(f"   This may be an einops version incompatibility issue")
-                            bt.logging.error(f"   Try: pip install --upgrade einops")
-                            raise synthesis_error
-                    else:
-                        bt.logging.error(f"❌ TTS synthesis failed after {processing_time:.2f}s: {synthesis_error}")
-                        raise
+                    bt.logging.error(f"❌ TTS synthesis failed: {error_msg}")
+                    import traceback
+                    bt.logging.debug(f"Traceback: {traceback.format_exc()}")
+                    raise Exception(f"TTS synthesis failed: {error_msg}")
                 
                 # Read generated audio
                 if not os.path.exists(output_path):
@@ -2554,28 +2388,24 @@ Report generated automatically by Bittensor Miner
                 
                 bt.logging.info(f"✅ Speech generated: {len(audio_data)} bytes in {processing_time:.2f}s")
             finally:
-                # Critical: Clean up TTS object and free memory to prevent memory corruption
+                # Clean up memory (TTS pipeline is cached by PipelineManager, don't delete it)
                 try:
-                    # Delete TTS object explicitly
-                    del tts
-                    tts = None
-                    
                     # Clear PyTorch cache if using GPU
-                    if device == "cuda":
-                        try:
-                            import torch
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                             torch.cuda.synchronize()
                             bt.logging.debug("   Cleared CUDA cache")
-                        except Exception as e:
-                            bt.logging.debug(f"   Could not clear CUDA cache: {e}")
+                    except Exception as e:
+                        bt.logging.debug(f"   Could not clear CUDA cache: {e}")
                     
                     # Force garbage collection
                     import gc
                     gc.collect()
                     bt.logging.debug("   Forced garbage collection")
                 except Exception as cleanup_error:
-                    bt.logging.warning(f"⚠️ Error during TTS cleanup: {cleanup_error}")
+                    bt.logging.warning(f"⚠️ Error during cleanup: {cleanup_error}")
             
             # Cleanup temporary files
             try:
@@ -2943,14 +2773,18 @@ Report generated automatically by Bittensor Miner
         try:
             task_id = task_data.get("task_id")
             
+            # Get source and target languages from task_data first (they should always be there for translation tasks)
+            source_language = task_data.get('source_language', 'en')
+            target_language = task_data.get('target_language', 'es')
+            
             # Try to get data from task_data first
             if 'input_text' in task_data and task_data['input_text']:
                 text_content = task_data['input_text']
                 bt.logging.info(f"✅ Found text translation data in task_data for task {task_id}")
                 return {
                     'text': text_content.get('text', ''),
-                    'source_language': text_content.get('source_language', 'en'),
-                    'target_language': text_content.get('target_language', 'es')
+                    'source_language': text_content.get('source_language', source_language),
+                    'target_language': text_content.get('target_language', target_language)
                 }
             
             # If not in task_data, try to fetch from proxy API
@@ -2967,8 +2801,8 @@ Report generated automatically by Bittensor Miner
                         bt.logging.info(f"✅ Retrieved text translation data from proxy API for task {task_id}")
                         return {
                             'text': text_content.get('text', ''),
-                            'source_language': text_content.get('source_language', 'en'),
-                            'target_language': text_content.get('target_language', 'es')
+                            'source_language': text_content.get('source_language', source_language),
+                            'target_language': text_content.get('target_language', target_language)
                         }
                     else:
                         bt.logging.warning(f"⚠️ No text content found in proxy API response for task {task_id}")
@@ -3200,26 +3034,37 @@ Report generated automatically by Bittensor Miner
             # Get miner UID from Bittensor
             miner_uid = self.uid if hasattr(self, 'uid') else 0
             
-            # Use the same format as transcription: result dict directly as response_data
-            # Calculate scores separately (not inside response_data)
+            # Extract translated_text and other fields from result
+            translated_text = result.get('translated_text', '')
+            if not translated_text or not translated_text.strip():
+                bt.logging.error(f"❌ No translated_text found in result for task {task_id}")
+                return False
+            
             processing_time = result.get('processing_time', 0.0)
+            source_language = result.get('source_language', '')
+            target_language = result.get('target_language', '')
             accuracy_score = 0.95  # Mock confidence for translation
             speed_score = self.calculate_speed_score(processing_time)
             
-            # Prepare form data matching transcription format
+            # Prepare form data matching the proxy server's expected format
+            # The endpoint expects: translated_text, processing_time, accuracy_score, speed_score, source_language, target_language
             form_data = {
                 'task_id': task_id,
                 'miner_uid': str(miner_uid),
-                'response_data': json.dumps(result),  # Result dict directly, same as transcription
-                'processing_time': processing_time,  # Number, not string (matching transcription)
-                'accuracy_score': accuracy_score,  # Number, not string (matching transcription)
-                'speed_score': speed_score  # Number, not string (matching transcription)
+                'translated_text': translated_text,  # Direct form field, not in response_data
+                'processing_time': str(processing_time),  # String format for form data
+                'accuracy_score': str(accuracy_score),
+                'speed_score': str(speed_score),
+                'source_language': source_language,
+                'target_language': target_language
             }
             
             bt.logging.info(f"📤 Submitting text translation result to proxy server for task {task_id}")
-            bt.logging.debug(f"   Response data: {json.dumps(result, indent=2)}")
+            bt.logging.debug(f"   Translated text length: {len(translated_text)} characters")
+            bt.logging.debug(f"   From {source_language} to {target_language}")
+            bt.logging.debug(f"   Processing time: {processing_time:.2f}s")
             
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 headers = self._get_auth_headers()
                 response = await client.post(callback_url, headers=headers, data=form_data)
                 
@@ -3368,13 +3213,49 @@ Report generated automatically by Bittensor Miner
             # Get miner UID from Bittensor
             miner_uid = self.uid if hasattr(self, 'uid') else 0
             
+            # Validate result before submission
+            if not result:
+                bt.logging.error(f"❌ Cannot submit empty result for task {task_id}")
+                return False
+            
+            # Extract processing_time from result (if present) for use at top level
+            processing_time = result.get("processing_time", 0.0)
+            
+            # For summarization tasks, ensure the result format matches what proxy expects
+            # Proxy expects: response_data with output_data containing the actual result
+            if "summary" in result:
+                # Validate summary exists and is not empty
+                summary = result.get("summary", "")
+                if not summary or not summary.strip():
+                    bt.logging.error(f"❌ Cannot submit empty summary for task {task_id}")
+                    return False
+                
+                # For summarization, create clean result dict without processing_time at top level
+                # (processing_time will be sent separately in form_data)
+                # The proxy will wrap this in output_data, so we send it directly
+                clean_result = {k: v for k, v in result.items() if k != "processing_time"}
+                response_data_to_send = clean_result
+                
+                bt.logging.debug(f"📝 Summarization result prepared:")
+                bt.logging.debug(f"   Summary length: {len(summary)} chars")
+                bt.logging.debug(f"   Summary preview: {summary[:100]}...")
+                bt.logging.debug(f"   Response data keys: {list(clean_result.keys())}")
+            else:
+                # For other task types, send result as-is
+                response_data_to_send = result
+            
+            # Validate response_data_to_send is not empty
+            if not response_data_to_send:
+                bt.logging.error(f"❌ Cannot submit empty response_data for task {task_id}")
+                return False
+            
             # Prepare response payload based on task type
             response_payload = {
                 "task_id": task_id,
                 "miner_uid": miner_uid,
-                "response_data": result,
-                "processing_time": result.get("processing_time", 0.0),
-                "speed_score": self.calculate_speed_score(result.get("processing_time", 0.0))
+                "response_data": response_data_to_send,
+                "processing_time": processing_time,
+                "speed_score": self.calculate_speed_score(processing_time)
             }
             
             # Add task-specific metrics
@@ -3396,6 +3277,15 @@ Report generated automatically by Bittensor Miner
             bt.logging.info(f"   Accuracy Score: {response_payload['accuracy_score']:.2f}")
             bt.logging.info(f"   Speed Score: {response_payload['speed_score']:.2f}")
             
+            # Validate response_data_to_send can be serialized to JSON
+            try:
+                test_json = json.dumps(response_data_to_send)
+                bt.logging.debug(f"✅ Response data is valid JSON ({len(test_json)} chars)")
+            except (TypeError, ValueError) as json_error:
+                bt.logging.error(f"❌ Response data cannot be serialized to JSON: {json_error}")
+                bt.logging.error(f"   Response data: {str(response_data_to_send)[:500]}")
+                return False
+            
             async with httpx.AsyncClient(timeout=10.0) as client:
                 headers = self._get_auth_headers()
                 # Convert to Form data as expected by proxy
@@ -3409,9 +3299,26 @@ Report generated automatically by Bittensor Miner
                     'speed_score': response_payload['speed_score']  # Number (matching transcription)
                 }
                 
+                # Log the form data being sent (for debugging)
+                bt.logging.debug(f"🔍 Form data being sent:")
+                bt.logging.debug(f"   task_id: {form_data['task_id']}")
+                bt.logging.debug(f"   miner_uid: {form_data['miner_uid']}")
+                bt.logging.debug(f"   response_data length: {len(form_data['response_data'])} chars")
+                bt.logging.debug(f"   response_data preview: {form_data['response_data'][:200]}...")
+                bt.logging.debug(f"   processing_time: {form_data['processing_time']}")
+                bt.logging.debug(f"   accuracy_score: {form_data['accuracy_score']}")
+                bt.logging.debug(f"   speed_score: {form_data['speed_score']}")
+                
                 submit_start_time = time.time()
                 response = await client.post(callback_url, headers=headers, data=form_data)
                 submit_time = time.time() - submit_start_time
+                
+                # Log response details for debugging
+                bt.logging.debug(f"📡 Proxy server response:")
+                bt.logging.debug(f"   Status Code: {response.status_code}")
+                bt.logging.debug(f"   Response Headers: {dict(response.headers)}")
+                if response.status_code != 200:
+                    bt.logging.debug(f"   Response Body: {response.text[:500]}")
                 
                 if response.status_code == 200:
                     # Try to parse response body to verify success
@@ -3617,8 +3524,27 @@ Report generated automatically by Bittensor Miner
         try:
             bt.logging.info(f"🎯 Processing on-chain {synapse.task_type} task...")
             
-            # Decode input data
-            input_bytes = base64.b64decode(synapse.input_data.encode('utf-8'))
+            # Check if input_data exists and is not empty
+            if not synapse.input_data:
+                bt.logging.warning(f"⚠️ No input_data provided for {synapse.task_type} task - returning empty response")
+                synapse.output_data = ""
+                synapse.error_message = "No input data provided"
+                synapse.processing_time = time.time() - start_time
+                return synapse
+            
+            # Decode input data with error handling
+            try:
+                input_bytes = base64.b64decode(synapse.input_data.encode('utf-8'))
+                if not input_bytes:
+                    raise ValueError("Decoded input_data is empty")
+            except Exception as decode_error:
+                bt.logging.error(f"❌ Failed to decode base64 input_data: {decode_error}")
+                bt.logging.error(f"   Input data length: {len(synapse.input_data) if synapse.input_data else 0}")
+                bt.logging.error(f"   Input data preview: {synapse.input_data[:100] if synapse.input_data else 'None'}...")
+                synapse.output_data = ""
+                synapse.error_message = f"Invalid input data encoding: {str(decode_error)}"
+                synapse.processing_time = time.time() - start_time
+                return synapse
             
             # Route to appropriate pipeline based on task type
             if synapse.task_type == "transcription":
@@ -3635,8 +3561,20 @@ Report generated automatically by Bittensor Miner
                     synapse.processing_time = time.time() - start_time
                     
             elif synapse.task_type == "tts":
-                # For TTS, input_data should be text
-                text = input_bytes.decode('utf-8')
+                # For TTS, input_data should be text - decode with error handling
+                try:
+                    text = input_bytes.decode('utf-8')
+                    if not text or not text.strip():
+                        raise ValueError("Empty text after decoding")
+                except (UnicodeDecodeError, ValueError) as text_error:
+                    bt.logging.error(f"❌ Failed to decode TTS input as UTF-8 text: {text_error}")
+                    bt.logging.error(f"   Input bytes length: {len(input_bytes)}")
+                    bt.logging.error(f"   First 20 bytes (hex): {input_bytes[:20].hex() if len(input_bytes) >= 20 else input_bytes.hex()}")
+                    synapse.output_data = ""
+                    synapse.error_message = f"Invalid text encoding for TTS: {str(text_error)}"
+                    synapse.processing_time = time.time() - start_time
+                    return synapse
+                
                 result = await self.process_tts_task({"text": text, "language": synapse.language})
                 if result and "output_data" in result:
                     synapse.output_data = result["output_data"]  # Already base64
@@ -3648,8 +3586,20 @@ Report generated automatically by Bittensor Miner
                     synapse.processing_time = time.time() - start_time
                     
             elif synapse.task_type == "summarization":
-                # For summarization, input_data should be text
-                text = input_bytes.decode('utf-8')
+                # For summarization, input_data should be text - decode with error handling
+                try:
+                    text = input_bytes.decode('utf-8')
+                    if not text or not text.strip():
+                        raise ValueError("Empty text after decoding")
+                except (UnicodeDecodeError, ValueError) as text_error:
+                    bt.logging.error(f"❌ Failed to decode summarization input as UTF-8 text: {text_error}")
+                    bt.logging.error(f"   Input bytes length: {len(input_bytes)}")
+                    bt.logging.error(f"   First 20 bytes (hex): {input_bytes[:20].hex() if len(input_bytes) >= 20 else input_bytes.hex()}")
+                    synapse.output_data = ""
+                    synapse.error_message = f"Invalid text encoding for summarization: {str(text_error)}"
+                    synapse.processing_time = time.time() - start_time
+                    return synapse
+                
                 result = await self.process_summarization_task({
                     "text": text,
                     "language": synapse.language

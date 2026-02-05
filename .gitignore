@@ -242,6 +242,7 @@ celerybeat.pid
 .venv
 env/
 venv/
+venv_py310/
 ENV/
 env.bak/
 venv.bak/
@@ -317,6 +318,7 @@ bittensor_subnet_template.egg-info/
 .venv
 env/
 venv/
+venv_py310/
 ENV/
 env.bak/
 venv.bak/

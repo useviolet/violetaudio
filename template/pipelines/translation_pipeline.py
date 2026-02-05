@@ -87,43 +87,85 @@ class TranslationPipeline:
         # Get HF token if available
         hf_token_kwargs = get_hf_token_dict()
         
-        # Model loading with multiple fallback options
-        fallback_models = [
-            "t5-small",  # Simple, reliable T5 model
-            "Helsinki-NLP/opus-mt-en-es",  # Marian model
-            "facebook/mbart-large-50-many-to-many-mmt"  # Multilingual model
-        ]
-        
-        for fallback_model in fallback_models:
+        # Try to load the requested model first
+        try:
+            logger.info(f"🔄 Loading translation model: {model_name}")
+            
+            # For Helsinki-NLP Marian models, use MarianMTModel
+            if "opus-mt" in model_name.lower() or "marian" in model_name.lower():
+                try:
+                    from transformers import MarianMTModel, MarianTokenizer
+                    self.tokenizer = MarianTokenizer.from_pretrained(model_name, **hf_token_kwargs)
+                    self.model = MarianMTModel.from_pretrained(model_name, **hf_token_kwargs)
+                    self.model.to(self.device)
+                    self.model.eval()  # Set to evaluation mode
+                    logger.info(f"✅ Marian model loaded successfully on {self.device}: {model_name}")
+                    self.translation_pipeline = None  # Use manual inference for Marian models
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to load as Marian model, trying AutoModel: {e}")
+                    # Fallback to AutoModel
+                    self.tokenizer = AutoTokenizer.from_pretrained(model_name, **hf_token_kwargs)
+                    self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name, **hf_token_kwargs)
+                    self.model.to(self.device)
+                    self.model.eval()
+                    logger.info(f"✅ Translation model loaded successfully on {self.device}: {model_name}")
+                    self.translation_pipeline = None
+            else:
+                # For other models (T5, mBART, etc.), use AutoModel
+                try:
+                    # Load tokenizer first
+                    self.tokenizer = AutoTokenizer.from_pretrained(model_name, **hf_token_kwargs)
+                    
+                    # For mBART models, set src_lang and tgt_lang if available
+                    if "mbart" in model_name.lower():
+                        # mBART uses language codes like "en_XX", "es_XX", etc.
+                        # We'll set these dynamically during translation
+                        logger.info(f"📝 mBART model detected: {model_name}")
+                    
+                    # Load model
+                    self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name, **hf_token_kwargs)
+                    self.model.to(self.device)
+                    self.model.eval()
+                    logger.info(f"✅ Translation model loaded successfully on {self.device}: {model_name}")
+                    
+                    # Try to use pipeline for easier inference (but not for Marian models or mBART)
+                    try:
+                        # Only use pipeline for T5 models (not Marian, not mBART)
+                        if ("opus-mt" not in model_name.lower() and 
+                            "marian" not in model_name.lower() and 
+                            "mbart" not in model_name.lower()):
+                            self.translation_pipeline = pipeline(
+                                "translation", 
+                                model=model_name, 
+                                device=0 if self.device == "cuda" else -1,
+                                token=hf_token_kwargs.get("token") if hf_token_kwargs else None
+                            )
+                            logger.info("✅ Translation pipeline initialized successfully")
+                        else:
+                            self.translation_pipeline = None
+                            logger.info("ℹ️ Using manual inference (model-specific handling required)")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Pipeline initialization failed, using manual inference: {e}")
+                        self.translation_pipeline = None
+                except Exception as e:
+                    logger.error(f"❌ Failed to load model {model_name}: {e}")
+                    raise
+                    
+        except Exception as e:
+            logger.error(f"❌ Failed to load model {model_name}: {e}")
+            # Fallback to t5-small if requested model fails
+            logger.warning(f"⚠️ Falling back to t5-small")
+            fallback_model = "t5-small"
             try:
-                logger.info(f"🔄 Loading translation model: {fallback_model}")
                 self.tokenizer = AutoTokenizer.from_pretrained(fallback_model, **hf_token_kwargs)
                 self.model = AutoModelForSeq2SeqLM.from_pretrained(fallback_model, **hf_token_kwargs)
                 self.model.to(self.device)
+                self.model.eval()
                 self.model_name = fallback_model
-                logger.info(f"✅ Translation model loaded successfully on {self.device}: {fallback_model}")
-                
-                # Try to use pipeline for easier inference
-                try:
-                    self.translation_pipeline = pipeline(
-                        "translation", 
-                        model=fallback_model, 
-                        device=0 if self.device == "cuda" else -1,
-                        token=hf_token_kwargs.get("token") if hf_token_kwargs else None
-                    )
-                    logger.info("✅ Translation pipeline initialized successfully")
-                    break
-                except Exception as e:
-                    logger.warning(f"⚠️ Pipeline initialization failed, using manual inference: {e}")
-                    self.translation_pipeline = None
-                    break
-                    
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to load model {fallback_model}: {e}")
-                continue
-        else:
-            # If all models failed, raise exception
-            raise Exception(f"Could not load any translation model from: {fallback_models}")
+                logger.info(f"✅ Fallback model loaded successfully on {self.device}: {fallback_model}")
+                self.translation_pipeline = None
+            except Exception as fallback_error:
+                raise Exception(f"Could not load translation model {model_name} or fallback {fallback_model}: {fallback_error}")
         
         # Production settings
         self.max_chunk_size = 1000  # Maximum characters per translation chunk
@@ -205,44 +247,108 @@ class TranslationPipeline:
     ) -> str:
         """Translate a single chunk of text"""
         try:
-            if self.translation_pipeline:
-                # Use pipeline if available
-                result = self.translation_pipeline(text)
-                return result[0]['translation_text']
+            if self.translation_pipeline and "opus-mt" not in self.model_name.lower():
+                # Use pipeline if available (but not for Marian models)
+                try:
+                    result = self.translation_pipeline(text)
+                    if isinstance(result, list) and len(result) > 0:
+                        if isinstance(result[0], dict):
+                            return result[0].get('translation_text', result[0].get('translated_text', ''))
+                        else:
+                            return str(result[0])
+                    return str(result) if result else ""
+                except Exception as pipeline_error:
+                    logger.warning(f"⚠️ Pipeline translation failed, using manual inference: {pipeline_error}")
+                    # Fall through to manual inference
+            
+            # Manual inference
+            # Handle different model types
+            if "mbart" in self.model_name.lower():
+                # mBART models need special handling with language codes
+                try:
+                    # mBART uses language codes like "en_XX", "es_XX", etc.
+                    mbart_lang_map = {
+                        "en": "en_XX", "es": "es_XX", "fr": "fr_XX", "de": "de_XX",
+                        "it": "it_XX", "pt": "pt_XX", "ru": "ru_XX", "ja": "ja_XX",
+                        "ko": "ko_XX", "zh": "zh_CN", "ar": "ar_XX", "hi": "hi_IN",
+                        "nl": "nl_XX", "pl": "pl_XX", "tr": "tr_XX", "vi": "vi_VN",
+                        "cs": "cs_CZ", "fi": "fi_FI", "ro": "ro_RO", "uk": "uk_UA"
+                    }
+                    src_lang_code = mbart_lang_map.get(source_language, f"{source_language}_XX")
+                    tgt_lang_code = mbart_lang_map.get(target_language, f"{target_language}_XX")
+                    
+                    # Set source language
+                    if hasattr(self.tokenizer, 'src_lang'):
+                        self.tokenizer.src_lang = src_lang_code
+                    
+                    # Encode text
+                    encoded = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+                    encoded = {k: v.to(self.device) for k, v in encoded.items()}
+                    
+                    # Get target language token ID
+                    forced_bos_token_id = None
+                    if hasattr(self.tokenizer, 'lang_code_to_id') and isinstance(self.tokenizer.lang_code_to_id, dict):
+                        forced_bos_token_id = self.tokenizer.lang_code_to_id.get(tgt_lang_code)
+                    
+                    # Generate translation
+                    with torch.no_grad():
+                        generated_tokens = self.model.generate(
+                            **encoded,
+                            forced_bos_token_id=forced_bos_token_id,
+                            max_length=512,
+                            num_beams=4,
+                            early_stopping=True
+                        )
+                    
+                    # Decode
+                    translated_text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+                    return translated_text
+                except Exception as mbart_error:
+                    logger.warning(f"⚠️ mBART-specific translation failed, using generic method: {mbart_error}")
+                    # Fall through to generic method
+                    input_text = text
+            elif "t5" in self.model_name.lower():
+                # T5 models need translation prefix
+                target_lang_name = self.language_codes.get(target_language, target_language)
+                prefix = f"translate {self.language_codes.get(source_language, source_language)} to {target_lang_name}: "
+                input_text = prefix + text
+            elif "opus-mt" in self.model_name.lower() or "marian" in self.model_name.lower():
+                # Marian models work directly - they're already configured for specific language pairs
+                input_text = text
             else:
-                # Manual inference with T5-style prefix
-                if "t5" in self.model_name.lower():
-                    # T5 models need translation prefix
-                    prefix = f"translate English to {target_language}: "
-                    input_text = prefix + text
-                elif "mbart" in self.model_name.lower():
-                    # mBART models need language codes
-                    input_text = text
-                else:
-                    # Marian models work directly
-                    input_text = text
-                
-                inputs = self.tokenizer(
-                    input_text, 
-                    return_tensors="pt", 
-                    max_length=512, 
-                    truncation=True,
-                    padding=True
-                ).to(self.device)
-                
+                # Default: use text as-is
+                input_text = text
+            
+            # Tokenize input
+            inputs = self.tokenizer(
+                input_text, 
+                return_tensors="pt", 
+                max_length=512, 
+                truncation=True,
+                padding=True
+            )
+            
+            # Move inputs to device
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            
+            # Generate translation
+            with torch.no_grad():  # Disable gradient computation for inference
                 outputs = self.model.generate(
                     **inputs,
                     max_length=512,
                     num_beams=4,
                     early_stopping=True,
-                    pad_token_id=self.tokenizer.eos_token_id
+                    pad_token_id=self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
                 )
-                
-                translated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                return translated_text
+            
+            # Decode output
+            translated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            return translated_text
                 
         except Exception as e:
             logger.error(f"❌ Chunk translation failed: {e}")
+            import traceback
+            logger.error(f"   Traceback: {traceback.format_exc()}")
             raise
     
     def _chunk_text(self, text: str, max_length: int) -> List[str]:

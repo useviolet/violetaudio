@@ -6,10 +6,11 @@ pydantic>=2.5.0
 python-multipart>=0.0.6
 starlette>=0.30.0
 rich>=13
-
+sentencepiece>=0.1.99
 # PDF processing for translation pipeline
 PyMuPDF>=1.23.0  # Provides 'fitz' module
 python-docx>=1.1.0  # For DOCX document processing
+sentencepiece>=0.1.99  # Required for Helsinki-NLP Marian models (translation)
 
 # TTS - Coqui TTS for text-to-speech
 # Note: Coqui TTS officially supports Python 3.9-3.11, not 3.12
@@ -22,19 +23,25 @@ google-cloud-storage>=2.10.0
 # Database and async
 asyncio-mqtt>=0.16.0
 aiofiles>=23.2.0
+python-dotenv
 
 # Machine Learning and Audio Processing
-torch>=2
-numpy>=2.0.1,<3.0.0  # Updated for bittensor 9.10.0 compatibility
+torch>=2.2.0
+torchaudio>=2.2.0
+numpy>=1.24.0,<1.25.0  # Coqui TTS 0.27.x declares numpy>=1.26.0 but works with 1.24.x in practice
 # Transformers version - using 4.57.3 (same as Colab)
 # Note: LogitsWarper was removed in transformers 4.40.0+, but we use compatibility shims
 # The miner and validator code include LogitsWarper compatibility shims for transformers 4.57.3+
 transformers>=4.57.3
 onnx>=1.20.0  # Required for torchvision compatibility with ml_dtypes
 ml_dtypes>=0.5.0  # Compatible with onnx 1.20.0+
-librosa>=0.10.0
+librosa>=0.11.0
 soundfile>=0.12.0
-scipy>=1.10.0
+scipy>=1.13.0
+# Install numba and llvmlite manually BEFORE running pip install -r requirements.txt (see README step 4)
+# This avoids dependency resolution conflicts. If already installed, pip will skip them.
+numba>=0.58.0  # Required by coqui-tts>=0.27.0 and librosa>=0.11.0
+llvmlite>=0.40.0  # Required for numba (version will be determined by numba)
 
 # HTTP and Networking
 requests>=2.31.0
@@ -56,8 +63,32 @@ python-dateutil>=2.8.0  # For date parsing in proxy server
 
 # Weights & Biases for monitoring
 wandb>=0.15.0
-librosa
+
+# TTS Dependencies (Coqui TTS and related packages)
+# IMPORTANT: Coqui TTS requires Python 3.9-3.11, not 3.12
+# Use Python 3.10 virtual environment for best compatibility
+# NOTE: Install coqui-tts separately with --no-deps to avoid numpy conflict:
+#   pip install --no-deps coqui-tts>=0.27.0
+#   Then install its dependencies manually (see README)
+# coqui-tts>=0.27.0
+coqui-tts-trainer>=0.3.0
+coqpit-config>=0.2.0
+einops>=0.6.0
+encodec>=0.1.1
+monotonic-alignment-search>=0.2.0
+num2words>=0.5.14
+pysbd>=0.3.4
+inflect>=5.6.0
+anyascii>=0.3.0
+matplotlib>=3.8.4
+gruut[de,es,fr]>=2.4.0
+ko-speech-tools>=0.1.0
 torchcodec
-coqui-tts
+
 # Bittensor (pinned to working version)
-bittensor==9.10.0
+# NOTE: Install bittensor separately to avoid numpy conflict:
+#   1. pip install "numpy>=1.24.0,<1.25.0"  (for Coqui TTS)
+#   2. pip install --no-deps bittensor==9.10.0
+#   3. pip install aiohttp async-substrate-interface asyncstdlib bittensor-drand bittensor-wallet colorama fastapi msgpack-numpy-opentensor munch nest_asyncio netaddr packaging pycryptodome pydantic python-statemachine pyyaml requests retry scalecodec setuptools uvicorn wheel
+# Then run: pip install -r requirements.txt (will skip bittensor as already installed)
+# bittensor==9.10.0

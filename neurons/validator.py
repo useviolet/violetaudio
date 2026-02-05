@@ -1075,7 +1075,7 @@ class Validator(BaseValidatorNeuron):
                 
                 # Filter miner tracker to only include reachable miners
                 # Get available miners from tracker, but filter by reachable_uids
-                available_from_tracker = self.miner_tracker.get_available_miners(task_type, required_count=3)
+                available_from_tracker = self.miner_tracker.get_available_miners(task_type, min_count=3)
                 # Only keep miners that are in reachable_uids
                 available_miners = [uid for uid in available_from_tracker if uid in reachable_uids]
                 

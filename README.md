@@ -51,9 +51,11 @@ Violet subnet enables a decentralized ecosystem where miners provide computation
 - **Network**: Stable internet connection (100+ Mbps)
 
 ### Software Dependencies
-- Python 3.12+
+- **Python 3.10** (Required - Coqui TTS does not support Python 3.12)
 - CUDA 11.8+ (for GPU acceleration)
 - Bittensor CLI (`pip install bittensor-cli`)
+
+**⚠️ Important:** Coqui TTS (used for text-to-speech) requires Python 3.9-3.11. Python 3.12 is NOT supported. You MUST use Python 3.10 in a virtual environment.
 
 ## 🚀 Quick Start
 
@@ -64,32 +66,86 @@ git clone https://github.com/hivetrainai/violet.git
 cd violet
 ```
 
-### Step 2: Create Virtual Environment
+### Step 2: Create Python 3.10 Virtual Environment
 
-**Important:** Always create and activate a virtual environment before installing dependencies:
+**⚠️ CRITICAL:** Coqui TTS requires Python 3.10. You MUST create a Python 3.10 virtual environment before installing dependencies.
 
 ```bash
-# Create virtual environment
-python -m venv venv
+# Check if Python 3.10 is available
+python3.10 --version
+
+# If Python 3.10 is not installed, install it first:
+# On macOS (using Homebrew):
+# brew install python@3.10
+# On Ubuntu/Debian:
+# sudo apt-get install python3.10 python3.10-venv
+
+# Create Python 3.10 virtual environment
+python3.10 -m venv venv_py310
 
 # Activate virtual environment
 # On Linux/macOS:
-source venv/bin/activate
+source venv_py310/bin/activate
 # On Windows:
-venv\Scripts\activate
+venv_py310\Scripts\activate
+
+# Verify Python version (should show 3.10.x)
+python --version
 ```
 
 ### Step 3: Install Dependencies
 
-```bash
-# Install the Violet package in development mode
-pip install -e .
+**⚠️ IMPORTANT:** Ensure you are in the Python 3.10 virtual environment before installing:
 
-# Install additional requirements
+```bash
+# Verify you're in Python 3.10 virtual environment
+python --version  # Should show Python 3.10.x
+
+# Upgrade pip and setuptools
+pip install --upgrade pip setuptools wheel
+
+# IMPORTANT: Handle numpy/bittensor conflict
+# bittensor==9.10.0 requires numpy>=2.0.1, but Coqui TTS requires numpy<1.25
+# Install in this specific order to resolve the conflict:
+
+# 1. Install numpy first (required for Coqui TTS/numba, despite coqui-tts declaring numpy>=1.26.0)
+pip install "numpy>=1.24.0,<1.25.0"
+
+# 2. Install bittensor without dependencies to avoid numpy conflict
+pip install --no-deps bittensor==9.10.0
+
+# 3. Install bittensor's dependencies (excluding numpy which is already installed)
+pip install aiohttp async-substrate-interface asyncstdlib bittensor-drand bittensor-wallet colorama fastapi msgpack-numpy-opentensor munch nest_asyncio netaddr packaging pycryptodome pydantic python-statemachine pyyaml requests retry scalecodec setuptools uvicorn wheel
+
+# 4. Install numba and llvmlite (required by coqui-tts, but install after numpy to avoid conflicts)
+pip install "numba>=0.58.0" "llvmlite>=0.40.0"
+
+# 5. Install coqui-tts without dependencies to avoid numpy/numba conflict
+#    (coqui-tts declares numpy>=1.26.0 and numba>=0.58.0, but we use numpy 1.24.x)
+pip install --no-deps coqui-tts>=0.27.0
+
+# 6. Install coqui-tts dependencies manually
+pip install coqui-tts-trainer>=0.3.0 coqpit-config>=0.2.0 einops>=0.6.0 encodec>=0.1.1 monotonic-alignment-search>=0.2.0 num2words>=0.5.14 pysbd>=0.3.4 inflect>=5.6.0 anyascii>=0.3.0 matplotlib>=3.8.4 "gruut[de,es,fr]>=2.4.0" ko-speech-tools>=0.1.0 torchcodec
+
+# 7. Install remaining requirements (bittensor and coqui-tts are commented out in requirements.txt)
 pip install -r requirements.txt
+
+# Note: Skip "pip install -e ." to avoid additional conflicts with setup.py
 ```
 
-### Step 4: Set Up Environment Variables
+### Step 4: Install System Dependencies
+
+Install FFmpeg and related libraries (required for audio/video processing):
+
+```bash
+# On Ubuntu/Debian:
+sudo apt install -y ffmpeg libavutil-dev libavcodec-dev libavformat-dev libavdevice-dev
+
+# On macOS (using Homebrew):
+# brew install ffmpeg
+```
+
+### Step 5: Set Up Environment Variables
 
 Create a `.env` file in the project root directory with the following required variables:
 
@@ -120,7 +176,7 @@ PROXY_SERVER_URL=https://violet-proxy-bl4w.onrender.com
 
 **Important:** Never commit your `.env` file to version control. It contains sensitive credentials.
 
-### Step 5: Create Wallets
+### Step 6: Create Wallets
 
 Create a coldkey and hotkey for your subnet wallet:
 
@@ -135,7 +191,7 @@ btcli wallet new_coldkey --wallet.name <your_wallet_name>
 btcli wallet new_hotkey --wallet.name <your_wallet_name> --wallet.hotkey default
 ```
 
-### Step 6: Register on the Subnet
+### Step 7: Register on the Subnet
 
 Register as a miner or validator on the subnet:
 
@@ -151,7 +207,19 @@ btcli subnet register --netuid 292 --subtensor.network test --wallet.name <your_
 
 **Note:** Registration requires 0.005 TAO for mainnet or test tokens for testnet.
 
-### Step 7: Run the Miner
+### Step 8: Run the Miner
+
+**⚠️ IMPORTANT:** Before running the miner, ensure you are in the Python 3.10 virtual environment:
+
+```bash
+# Activate Python 3.10 virtual environment
+source venv_py310/bin/activate  # Linux/macOS
+# or
+venv_py310\Scripts\activate  # Windows
+
+# Verify you're using Python 3.10
+python --version  # Should show Python 3.10.x
+```
 
 **Mainnet:**
 ```bash
@@ -181,7 +249,19 @@ python neurons/miner.py \
   --axon.external_port <PORT>
 ```
 
-### Step 8: Run the Validator
+### Step 9: Run the Validator
+
+**⚠️ IMPORTANT:** Before running the validator, ensure you are in the Python 3.10 virtual environment:
+
+```bash
+# Activate Python 3.10 virtual environment
+source venv_py310/bin/activate  # Linux/macOS
+# or
+venv_py310\Scripts\activate  # Windows
+
+# Verify you're using Python 3.10
+python --version  # Should show Python 3.10.x
+```
 
 **Mainnet:**
 ```bash

@@ -1,154 +1,139 @@
 #!/usr/bin/env python3
 """
-Script to create a transcription task in the database via proxy server API.
-Uploads the audio file first, then creates the task.
+Create transcription tasks using different Whisper models
 """
 
-import os
 import sys
-import httpx
-import json
-from pathlib import Path
+import os
+import requests
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
 # Configuration
-PROXY_SERVER_URL = "https://violet-proxy-bl4w.onrender.com"
-AUDIO_FILE_PATH = "/Users/user/Documents/Jarvis/violet/tests/chatterbox_test_output.wav"
-MODEL_ID = "openai/whisper-tiny"
+BASE_URL = "https://violet-proxy-bl4w.onrender.com"
+API_KEY = "tQlbLPoTF7RRsvJjgCm_4kHiIg-xqoQ6l4utqW56sY0"
+
+# Task parameters
+AUDIO_FILE_PATH = "/Users/user/Documents/Jarvis/violet/LJ037-0171.wav"
 SOURCE_LANGUAGE = "en"
+PRIORITY = "normal"
 
-# Get API key from environment
-API_KEY = os.getenv('VALIDATOR_API_KEY') or os.getenv('MINER_API_KEY')
+# Model IDs to test
+MODEL_IDS = [
+    "openai/whisper-large-v3",
+    "openai/whisper-medium",
+    "openai/whisper-small",
+    "openai/whisper-base",
+    "openai/whisper-tiny"
+]
 
-if not API_KEY:
-    print("❌ Error: API key not found!")
-    print("   Please set VALIDATOR_API_KEY or MINER_API_KEY in your .env file")
-    sys.exit(1)
-
-def get_headers():
-    """Get authentication headers"""
-    return {
+def create_transcription_task(audio_file_path, model_id, source_language, priority):
+    """Create a transcription task"""
+    print("\n" + "=" * 80)
+    print(f"  CREATING TRANSCRIPTION TASK - {model_id}")
+    print("=" * 80)
+    
+    url = f"{BASE_URL}/api/v1/transcription"
+    headers = {
         "X-API-Key": API_KEY
     }
-
-async def create_transcription_task_with_file(file_path: str, model_id: str, source_language: str = "en") -> dict:
-    """Create transcription task directly with file upload using /api/v1/transcription endpoint"""
-    print(f"\n📤 Creating transcription task with file: {file_path}")
     
-    if not os.path.exists(file_path):
-        print(f"❌ Error: File not found: {file_path}")
+    # Check if audio file exists
+    if not os.path.exists(audio_file_path):
+        print(f"❌ Audio file not found: {audio_file_path}")
         return None
     
-    file_size = os.path.getsize(file_path)
-    print(f"   File size: {file_size:,} bytes ({file_size / 1024:.2f} KB)")
-    print(f"   Model: {model_id}")
-    print(f"   Language: {source_language}")
-    
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            headers = get_headers()
+    # Prepare form data with file upload
+    with open(audio_file_path, 'rb') as audio_file:
+        files = {
+            'audio_file': (os.path.basename(audio_file_path), audio_file, 'audio/wav')
+        }
+        form_data = {
+            'source_language': source_language,
+            'model_id': model_id,
+            'priority': priority
+        }
+        
+        print(f"\n📝 Task Parameters:")
+        print(f"   Audio File: {os.path.basename(audio_file_path)}")
+        print(f"   File Size: {os.path.getsize(audio_file_path):,} bytes")
+        print(f"   Model ID: {model_id}")
+        print(f"   Source Language: {source_language}")
+        print(f"   Priority: {priority}")
+        
+        try:
+            response = requests.post(url, headers=headers, files=files, data=form_data, timeout=120)
+            response.raise_for_status()
             
-            # Read file
-            with open(file_path, 'rb') as f:
-                file_data = f.read()
-            
-            # Prepare multipart form data for transcription endpoint
-            files = {
-                'file': (os.path.basename(file_path), file_data, 'audio/wav')
-            }
-            data = {
-                'model_id': model_id,
-                'source_language': source_language,
-                'priority': 'normal',
-                'required_miner_count': '3',
-                'min_miner_count': '1',
-                'max_miner_count': '5'
-            }
-            
-            endpoint = f"{PROXY_SERVER_URL}/api/v1/transcription"
-            print(f"   Endpoint: {endpoint}")
-            print(f"   Sending request...")
-            
-            response = await client.post(
-                endpoint,
-                headers=headers,
-                files=files,
-                data=data
-            )
-            
-            if response.status_code in [200, 201]:
-                result = response.json()
-                task_id = result.get("task_id") or result.get("id")
-                file_id = result.get("file_id") or result.get("input_file_id")
-                
-                print(f"✅ Transcription task created successfully!")
+            data = response.json()
+            if data.get("success"):
+                task_id = data.get("task_id")
+                print(f"\n✅ Transcription task created successfully!")
                 print(f"   Task ID: {task_id}")
-                if file_id:
-                    print(f"   File ID: {file_id}")
-                
-                return {
-                    "task_id": task_id,
-                    "file_id": file_id,
-                    "file_size": file_size,
-                    "status": result.get("status", "created"),
-                    "result": result
-                }
+                print(f"   Status: {data.get('status', 'N/A')}")
+                print(f"\n   You can check the task status at:")
+                print(f"   {BASE_URL}/api/v1/transcription/{task_id}/result")
+                return task_id
             else:
-                print(f"❌ Task creation failed with status {response.status_code}")
-                print(f"   Response: {response.text}")
+                print(f"❌ Failed to create task: {data.get('message', 'Unknown error')}")
                 return None
                 
-    except httpx.TimeoutException:
-        print(f"❌ Request timeout - file may be too large")
-        return None
-    except Exception as e:
-        print(f"❌ Error creating task: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Error creating transcription task: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"   Status Code: {e.response.status_code}")
+                print(f"   Response: {e.response.text[:500]}")
+            return None
 
-
-async def main():
-    """Main function to upload file and create task"""
-    print("=" * 80)
-    print("🎯 Creating Transcription Task")
-    print("=" * 80)
-    print(f"Proxy Server: {PROXY_SERVER_URL}")
-    print(f"Audio File: {AUDIO_FILE_PATH}")
-    print(f"Model: {MODEL_ID}")
-    print(f"Language: {SOURCE_LANGUAGE}")
+def main():
+    """Main function"""
+    print("\n" + "=" * 80)
+    print("  TRANSCRIPTION TASK CREATION SCRIPT")
     print("=" * 80)
     
-    # Create transcription task directly with file
-    task_info = await create_transcription_task_with_file(
-        AUDIO_FILE_PATH,
-        MODEL_ID,
-        SOURCE_LANGUAGE
-    )
-    
-    if not task_info:
-        print("\n❌ Failed to create transcription task.")
+    if not API_KEY:
+        print("\n❌ Error: API_KEY not found")
         return
+    
+    print(f"\n🔑 Using API Key: {API_KEY[:20]}...")
+    print(f"🌐 Base URL: {BASE_URL}")
+    print(f"📁 Audio File: {AUDIO_FILE_PATH}")
+    
+    # Check if audio file exists
+    if not os.path.exists(AUDIO_FILE_PATH):
+        print(f"\n❌ Error: Audio file not found: {AUDIO_FILE_PATH}")
+        return
+    
+    print(f"\n✅ Audio file found: {os.path.getsize(AUDIO_FILE_PATH):,} bytes")
+    
+    # Create tasks for each model
+    task_ids = []
+    for model_id in MODEL_IDS:
+        task_id = create_transcription_task(
+            audio_file_path=AUDIO_FILE_PATH,
+            model_id=model_id,
+            source_language=SOURCE_LANGUAGE,
+            priority=PRIORITY
+        )
+        if task_id:
+            task_ids.append((model_id, task_id))
     
     # Summary
     print("\n" + "=" * 80)
-    print("✅ SUCCESS!")
+    print("  SUMMARY")
     print("=" * 80)
-    print(f"Task ID: {task_info['task_id']}")
-    if task_info.get('file_id'):
-        print(f"File ID: {task_info['file_id']}")
-    print(f"Model: {MODEL_ID}")
-    print(f"Language: {SOURCE_LANGUAGE}")
-    print(f"Status: {task_info.get('status', 'created')}")
-    print(f"File Size: {task_info['file_size']:,} bytes")
-    print("\nYou can check the task status using:")
-    print(f"  GET {PROXY_SERVER_URL}/api/v1/tasks/{task_info['task_id']}")
-    print("=" * 80)
+    
+    if task_ids:
+        print(f"\n✅ Successfully created {len(task_ids)} transcription task(s):\n")
+        for model_id, task_id in task_ids:
+            print(f"   {model_id}:")
+            print(f"      Task ID: {task_id}")
+            print(f"      Status URL: {BASE_URL}/api/v1/transcription/{task_id}/result")
+            print()
+    else:
+        print("\n❌ No tasks were created successfully")
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
-
+    main()

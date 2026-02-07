@@ -1802,17 +1802,34 @@ Report generated automatically by Bittensor Miner
                 bt.logging.warning(f"⚠️ Language '{language}' may not be fully supported, using anyway")
             
             bt.logging.info(f"🎵 Processing {len(audio_data)} bytes of audio data in language: {language}...")
-            
-            # Process audio data with specified language
-            transcribed_text, processing_time = pipeline.transcribe(
+
+            # Process audio data with specified language using timestamped transcription
+            # This provides real confidence scores per chunk
+            result = pipeline.transcribe_with_timestamps(
                 audio_data, language=language
             )
-            
-            bt.logging.info(f"✅ Transcription completed: {len(transcribed_text)} characters in {processing_time:.2f}s")
-            
+
+            transcribed_text = result.full_text
+            processing_time = result.processing_time
+
+            # Calculate average confidence from all chunks
+            if result.chunks and len(result.chunks) > 0:
+                avg_confidence = sum(chunk.confidence for chunk in result.chunks) / len(result.chunks)
+            else:
+                # Fallback confidence based on transcription quality heuristics
+                # Higher confidence for longer, cleaner transcriptions
+                text_length = len(transcribed_text.strip())
+                if text_length > 0:
+                    # Base confidence starts at 0.7, increases with text length (max 0.95)
+                    avg_confidence = min(0.95, 0.7 + (text_length / 1000) * 0.25)
+                else:
+                    avg_confidence = 0.0
+
+            bt.logging.info(f"✅ Transcription completed: {len(transcribed_text)} characters in {processing_time:.2f}s (confidence: {avg_confidence:.2f})")
+
             return {
                 "transcript": transcribed_text,
-                "confidence": 0.95,  # Mock confidence score
+                "confidence": round(avg_confidence, 3),
                 "processing_time": processing_time,
                 "language": language  # Return the actual language used
             }
@@ -2537,24 +2554,35 @@ Report generated automatically by Bittensor Miner
             if supported_languages and language not in supported_languages:
                 bt.logging.warning(f"⚠️ Language '{language}' may not be fully supported, using anyway")
             
-            # Transcribe the extracted audio
+            # Transcribe the extracted audio using timestamped transcription for real confidence scores
             bt.logging.info(f"🎵 Transcribing extracted audio...")
-            transcribed_text, processing_time = pipeline.transcribe(
+            result = pipeline.transcribe_with_timestamps(
                 audio_bytes, language=language
             )
-            
+
+            transcribed_text = result.full_text
+            processing_time = result.processing_time
+
             # Validate transcript is not empty
             if not transcribed_text or len(transcribed_text.strip()) == 0:
                 raise Exception(f"Transcription produced empty result. Audio may be silent or corrupted. Audio size: {len(audio_bytes)} bytes")
-            
-            bt.logging.info(f"✅ Transcription completed: {len(transcribed_text)} characters in {processing_time:.2f}s")
-            
-            # Calculate confidence score (mock for now)
-            confidence = 0.95
-            
+
+            # Calculate average confidence from all chunks
+            if result.chunks and len(result.chunks) > 0:
+                confidence = sum(chunk.confidence for chunk in result.chunks) / len(result.chunks)
+            else:
+                # Fallback confidence based on transcription quality heuristics
+                text_length = len(transcribed_text.strip())
+                if text_length > 0:
+                    confidence = min(0.95, 0.7 + (text_length / 1000) * 0.25)
+                else:
+                    confidence = 0.0
+
+            bt.logging.info(f"✅ Transcription completed: {len(transcribed_text)} characters in {processing_time:.2f}s (confidence: {confidence:.2f})")
+
             return {
                 "transcript": transcribed_text,
-                "confidence": confidence,
+                "confidence": round(confidence, 3),
                 "processing_time": processing_time,
                 "language": language,
                 "video_info": video_info,

@@ -83,9 +83,40 @@ def calculate_accuracy_score(response_text: str, expected_output: str, task_type
         return (overlap_score * 0.7) + (length_score * 0.3)
     
     elif task_type == "tts":
-        # For TTS, we'd need audio quality analysis
-        # For now, return a placeholder score
-        return 0.8  # Placeholder score
+        # For TTS, evaluate based on audio output characteristics
+        # response_text contains base64 encoded audio data
+        if not response_text or len(response_text) < 100:
+            # Audio data too small, likely failed synthesis
+            return 0.0
+
+        # Check if it's valid base64 encoded audio (minimum viable audio)
+        try:
+            import base64
+            audio_bytes = base64.b64decode(response_text)
+
+            # Minimum audio file size check (WAV header is 44 bytes, need actual audio data)
+            if len(audio_bytes) < 1000:
+                return 0.2  # Very short audio, likely incomplete
+
+            # Calculate score based on audio data size relative to expected text
+            # Average TTS produces ~100-200 bytes per character for WAV audio
+            expected_min_size = len(expected_output) * 50  # Conservative minimum
+            expected_max_size = len(expected_output) * 500  # Conservative maximum
+
+            if len(audio_bytes) < expected_min_size:
+                # Audio too short for the text length
+                size_ratio = len(audio_bytes) / expected_min_size
+                return max(0.3, min(0.7, size_ratio))
+            elif len(audio_bytes) > expected_max_size:
+                # Audio suspiciously large
+                return 0.7
+            else:
+                # Audio size is within expected range
+                return 0.85 + (0.15 * min(1.0, len(audio_bytes) / expected_max_size))
+
+        except Exception:
+            # Invalid base64 or other error
+            return 0.1
     
     else:
         return 0.0
@@ -316,8 +347,19 @@ def run_validator_pipeline(task_type: str, input_data: str, language: str = "en"
             return output_data, processing_time, pipeline.model_name
             
         elif task_type == "tts":
-            # For TTS, we'll use a placeholder since it requires audio comparison
-            return "audio_output_placeholder", 1.0, "tts_placeholder_model"
+            from template.pipelines.tts_pipeline import TTSPipeline
+
+            # Decode text data for TTS
+            text = dummy_task.decode_text(input_data)
+
+            # Run TTS pipeline
+            pipeline = TTSPipeline()
+            audio_bytes, processing_time = pipeline.synthesize(text, language=language)
+
+            # Encode audio output as base64 for comparison
+            import base64
+            output_data = base64.b64encode(audio_bytes).decode('utf-8')
+            return output_data, processing_time, "coqui/tts"
             
         else:
             return None, 0.0, "unknown_model"
